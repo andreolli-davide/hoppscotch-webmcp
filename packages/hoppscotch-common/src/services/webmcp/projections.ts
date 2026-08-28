@@ -21,6 +21,14 @@ const SENSITIVE_HEADER =
 const SENSITIVE_KEY = /(token|secret|password|api[-_]?key|signature|cookie)/i
 const TEXT_MIME = /^(text\/|application\/(json|[^;]+\+json|xml|[^;]+\+xml))/i
 
+const SUMMARY_ENDPOINT_CHARS = 128
+const SUMMARY_LIST_ITEMS = 2
+const SUMMARY_KEY_CHARS = 24
+const SUMMARY_VALUE_CHARS = 24
+const SUMMARY_MIME_CHARS = 64
+const SUMMARY_FAILURE_CHARS = 64
+const SUMMARY_DIAGNOSTIC_CHARS = 64
+
 export class SecretRedactor {
   private readonly values: string[]
 
@@ -57,7 +65,7 @@ const digest = async (bytes: Uint8Array) => {
 const encode = (text: string) => new TextEncoder().encode(text)
 
 const safeEndpoint = (endpoint: string, redactor: SecretRedactor) => {
-  const scrubbed = redactor.scrub(endpoint, 8192)
+  const scrubbed = redactor.scrub(endpoint, SUMMARY_ENDPOINT_CHARS)
   try {
     const parsed = new URL(scrubbed)
     if (parsed.username) parsed.username = "[REDACTED]"
@@ -87,11 +95,14 @@ const referencedVariables = (
     false
   )
 
-  return [...names].slice(0, 6).map((name) => {
+  return [...names].slice(0, SUMMARY_LIST_ITEMS).map((name) => {
     const variable = effective.find((candidate) => candidate.key === name)
     return {
-      name: redactor.scrub(name, 64),
-      source: redactor.scrub(variable?.sourceEnv ?? "unresolved", 64),
+      name: redactor.scrub(name, SUMMARY_KEY_CHARS),
+      source: redactor.scrub(
+        variable?.sourceEnv ?? "unresolved",
+        SUMMARY_KEY_CHARS
+      ),
       secret: variable?.secret ?? false,
       available: Boolean(variable?.currentValue || variable?.initialValue),
     }
@@ -109,7 +120,7 @@ const projectBody = async (
     return {
       contentType: body.contentType,
       kind: "binary",
-      name: file?.name ? redactor.scrub(file.name, 256) : undefined,
+      name: file?.name ? redactor.scrub(file.name, 64) : undefined,
       size: file?.size ?? 0,
       digest: file
         ? await digest(new Uint8Array(await file.arrayBuffer()))
@@ -121,31 +132,30 @@ const projectBody = async (
       contentType: body.contentType,
       kind: "multipart",
       parts: await Promise.all(
-        body.body.slice(0, 6).map(async (part, index) => {
+        body.body.slice(0, SUMMARY_LIST_ITEMS).map(async (part, index) => {
           if (!part.isFile) {
             return {
               index,
-              key: redactor.scrub(part.key, 64),
+              key: redactor.scrub(part.key, SUMMARY_KEY_CHARS),
               active: part.active,
               kind: "text",
               length: part.value.length,
-              preview: redactor.scrub(part.value, 96),
             }
           }
           const files = part.value as Array<Blob | null>
           return {
             index,
-            key: redactor.scrub(part.key, 64),
+            key: redactor.scrub(part.key, SUMMARY_KEY_CHARS),
             active: part.active,
             kind: "file",
-            files: files.slice(0, 10).map((file) =>
+            files: files.slice(0, SUMMARY_LIST_ITEMS).map((file) =>
               file
                 ? {
                     name:
                       file instanceof File
-                        ? redactor.scrub(file.name, 256)
+                        ? redactor.scrub(file.name, 64)
                         : undefined,
-                    type: redactor.scrub(file.type, 128),
+                    type: redactor.scrub(file.type, 32),
                     size: file.size,
                   }
                 : { size: 0 }
@@ -153,7 +163,7 @@ const projectBody = async (
           }
         })
       ),
-      truncated: body.body.length > 6,
+      truncated: body.body.length > SUMMARY_LIST_ITEMS,
     }
   }
 
@@ -162,8 +172,7 @@ const projectBody = async (
     contentType: body.contentType,
     kind: "text",
     length: body.body.length,
-    preview: redactor.scrub(body.body, 768),
-    truncated: body.body.length > 768,
+    truncated: body.body.length > 0,
     digest: await digest(bytes),
   }
 }
@@ -183,26 +192,26 @@ const projectResponse = async (
     )?.value
     const bytes = new Uint8Array(httpResponse.body)
     const textual = mime ? TEXT_MIME.test(mime) : true
-    const text = textual ? new TextDecoder().decode(bytes.slice(0, 3072)) : ""
     return {
       state: response.type,
       status: httpResponse.statusCode,
-      statusText: redactor.scrub(httpResponse.statusText, 128),
+      statusText: redactor.scrub(httpResponse.statusText, 64),
       durationMs: httpResponse.meta.responseDuration,
       sizeBytes: httpResponse.meta.responseSize,
-      mimeType: mime ? redactor.scrub(mime, 128) : undefined,
-      headers: httpResponse.headers.slice(0, 6).map(({ key, value }) => ({
-        key: redactor.scrub(key, 64),
-        value: SENSITIVE_HEADER.test(key)
-          ? "[REDACTED]"
-          : redactor.scrub(value, 64),
-      })),
-      headersTruncated: httpResponse.headers.length > 6,
+      mimeType: mime ? redactor.scrub(mime, 64) : undefined,
+      headers: httpResponse.headers
+        .slice(0, SUMMARY_LIST_ITEMS)
+        .map(({ key, value }) => ({
+          key: redactor.scrub(key, SUMMARY_KEY_CHARS),
+          value: SENSITIVE_HEADER.test(key)
+            ? "[REDACTED]"
+            : redactor.scrub(value, SUMMARY_VALUE_CHARS),
+        })),
+      headersTruncated: httpResponse.headers.length > SUMMARY_LIST_ITEMS,
       body: textual
         ? {
-            preview: redactor.scrub(text, 768),
             byteLength: bytes.byteLength,
-            truncated: bytes.byteLength > 3072 || text.length > 768,
+            readable: true,
             digest: await digest(bytes),
           }
         : { length: bytes.byteLength, digest: await digest(bytes) },
@@ -216,7 +225,7 @@ const projectResponse = async (
       : error instanceof Error
         ? error.message
         : "The request failed in the selected interceptor"
-  return { state: response.type, error: redactor.scrub(message, 512) }
+  return { state: response.type, error: redactor.scrub(message, 128) }
 }
 
 const flattenTests = (tests: HoppTestData[]): HoppTestData[] =>
@@ -237,8 +246,8 @@ const projectTests = (
     failed: allResults.filter(({ status }) => status !== "pass").length,
     failures: allResults
       .filter(({ status }) => status !== "pass")
-      .slice(0, 5)
-      .map(({ message }) => redactor.scrub(message, 128)),
+      .slice(0, 1)
+      .map(({ message }) => redactor.scrub(message, SUMMARY_FAILURE_CHARS)),
   }
 }
 
@@ -354,7 +363,14 @@ const diagnostics = (
       message: "The browser is offline.",
     })
   }
-  return results.slice(0, 4)
+  return results
+    .slice(0, SUMMARY_LIST_ITEMS)
+    .map(({ code, severity, location, message }) => ({
+      code,
+      severity,
+      location,
+      message: message.slice(0, SUMMARY_DIAGNOSTIC_CHARS),
+    }))
 }
 
 export const projectRESTExchange = async (
@@ -376,30 +392,36 @@ export const projectRESTExchange = async (
     request: {
       method: redactor.scrub(request.method, 32),
       endpoint: safeEndpoint(request.endpoint, redactor),
-      params: request.params.slice(0, 6).map(({ key, value, active }) => ({
-        key: redactor.scrub(key, 64),
-        value: SENSITIVE_KEY.test(key)
-          ? "[REDACTED]"
-          : redactor.scrub(value, 64),
-        active,
-      })),
-      paramsTruncated: request.params.length > 6,
-      headers: request.headers.slice(0, 6).map(({ key, value, active }) => ({
-        key: redactor.scrub(key, 64),
-        value: SENSITIVE_HEADER.test(key)
-          ? "[REDACTED]"
-          : redactor.scrub(value, 64),
-        active,
-      })),
-      headersTruncated: request.headers.length > 6,
+      params: request.params
+        .slice(0, SUMMARY_LIST_ITEMS)
+        .map(({ key, value, active }) => ({
+          key: redactor.scrub(key, SUMMARY_KEY_CHARS),
+          value: SENSITIVE_KEY.test(key)
+            ? "[REDACTED]"
+            : redactor.scrub(value, SUMMARY_VALUE_CHARS),
+          active,
+        })),
+      paramsTruncated: request.params.length > SUMMARY_LIST_ITEMS,
+      headers: request.headers
+        .slice(0, SUMMARY_LIST_ITEMS)
+        .map(({ key, value, active }) => ({
+          key: redactor.scrub(key, SUMMARY_KEY_CHARS),
+          value: SENSITIVE_HEADER.test(key)
+            ? "[REDACTED]"
+            : redactor.scrub(value, SUMMARY_VALUE_CHARS),
+          active,
+        })),
+      headersTruncated: request.headers.length > SUMMARY_LIST_ITEMS,
       auth: { type: request.auth.authType, active: request.auth.authActive },
       body: await projectBody(request, redactor),
     },
     environment: {
-      name: redactor.scrub(getCurrentEnvironment().name, 128),
+      name: redactor.scrub(getCurrentEnvironment().name, 64),
       referencedVariables: variables,
     },
-    execution: { interceptor: interceptor.getCurrentId() },
+    execution: {
+      interceptor: redactor.scrub(interceptor.getCurrentId() ?? "", 32),
+    },
     response: await projectResponse(document.response, redactor),
     tests: projectTests(document.testResults, redactor),
     diagnostics: diagnostics(
@@ -438,21 +460,22 @@ export const readRESTPayload = async (
           partIndex,
           mimeType: redactor.scrub(
             part.contentType ?? "application/octet-stream",
-            128
+            SUMMARY_MIME_CHARS
           ),
           kind: "file",
-          files: files.map((file) =>
+          files: files.slice(0, SUMMARY_LIST_ITEMS).map((file) =>
             file
               ? {
                   name:
                     file instanceof File
-                      ? redactor.scrub(file.name, 256)
+                      ? redactor.scrub(file.name, 64)
                       : undefined,
-                  type: redactor.scrub(file.type, 128),
+                  type: redactor.scrub(file.type, 32),
                   size: file.size,
                 }
               : { size: 0 }
           ),
+          truncated: files.length > SUMMARY_LIST_ITEMS,
         }
       }
       text = part.value
@@ -463,7 +486,7 @@ export const readRESTPayload = async (
         source,
         mimeType: body.contentType,
         kind: "binary",
-        name: file?.name ? redactor.scrub(file.name, 256) : undefined,
+        name: file?.name ? redactor.scrub(file.name, 64) : undefined,
         size: file?.size ?? 0,
         digest: file
           ? await digest(new Uint8Array(await file.arrayBuffer()))
@@ -492,7 +515,7 @@ export const readRESTPayload = async (
     if (!TEXT_MIME.test(mimeType as string)) {
       return {
         source,
-        mimeType: redactor.scrub(mimeType as string, 128),
+        mimeType: redactor.scrub(mimeType as string, SUMMARY_MIME_CHARS),
         kind: "binary",
         size: byteLength,
         digest: await digest(bytes),
@@ -502,7 +525,7 @@ export const readRESTPayload = async (
     const responseText = new TextDecoder().decode(responseWindow)
     return {
       source,
-      mimeType: redactor.scrub(mimeType as string, 128),
+      mimeType: redactor.scrub(mimeType as string, SUMMARY_MIME_CHARS),
       kind: "text",
       offset,
       offsetUnit: "byte",
@@ -522,7 +545,7 @@ export const readRESTPayload = async (
   return {
     source,
     partIndex,
-    mimeType: mimeType ? redactor.scrub(mimeType, 128) : null,
+    mimeType: mimeType ? redactor.scrub(mimeType, SUMMARY_MIME_CHARS) : null,
     kind: "text",
     offset,
     offsetUnit: "character",

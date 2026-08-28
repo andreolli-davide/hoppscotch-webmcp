@@ -43,14 +43,14 @@ describe("WebMCP REST input schemas", () => {
       readRESTPayloadParser.safeParse({
         source: "response",
         expectedRevision: "rest-response:2",
-        maxChars: 4096,
+        maxChars: 768,
       }).success
     ).toBe(true)
     expect(
       readRESTPayloadParser.safeParse({
         source: "response",
         expectedRevision: "rest-response:2",
-        maxChars: 4097,
+        maxChars: 769,
       }).success
     ).toBe(false)
     expect(

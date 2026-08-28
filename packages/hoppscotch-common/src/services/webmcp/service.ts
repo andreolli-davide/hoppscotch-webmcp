@@ -44,7 +44,9 @@ import {
 } from "./types"
 
 const MAX_INPUT_BYTES = 128 * 1024
-const MAX_OUTPUT_BYTES = 8 * 1024
+// Chrome recommends keeping each individual tool result near 1.5K characters.
+// Payload details are available through the bounded read_rest_payload tool.
+const MAX_OUTPUT_BYTES = 1536
 
 const isPlainData = (value: unknown): boolean => {
   if (value === null || typeof value !== "object") return true
@@ -137,13 +139,16 @@ export class WebMCPService extends Service {
   private base(scope: WebMCPRevisionScope) {
     const appContext = this.context.capture()
     const redactor = this.redactor()
-    appContext.mode = redactor.scrub(appContext.mode, 128)
+    appContext.mode = redactor.scrub(appContext.mode, 32)
     appContext.environment.name = redactor.scrub(
       appContext.environment.name,
-      128
+      64
     )
     if (appContext.workspace.name) {
-      appContext.workspace.name = redactor.scrub(appContext.workspace.name, 128)
+      appContext.workspace.name = redactor.scrub(appContext.workspace.name, 64)
+    }
+    if (appContext.workspace.role) {
+      appContext.workspace.role = redactor.scrub(appContext.workspace.role, 32)
     }
     return {
       protocolVersion: WEBMCP_PROTOCOL_VERSION,
@@ -236,7 +241,7 @@ export class WebMCPService extends Service {
         name: "inspect_app_context",
         title: "Inspect Hoppscotch context",
         description:
-          "Inspect the visible Hoppscotch surface, workspace, selected environment, active live artifact, and available capability packs without secret values.",
+          "Inspect the visible Hoppscotch surface, workspace, selected environment, active live artifact, and capability packs. Results use bounded, redacted projections.",
         inputSchema: emptyInputSchema,
         annotations: { readOnlyHint: true, untrustedContentHint: true },
         execute: async (input: Record<string, unknown>) => {
@@ -260,7 +265,7 @@ export class WebMCPService extends Service {
           name: "inspect_rest_exchange",
           title: "Inspect current REST exchange",
           description:
-            "Inspect the visible REST request and latest response with draft state, environment dependencies, interceptor and diagnostics. Recognized credentials are redacted.",
+            "Inspect the visible REST request and latest response as a bounded, redacted summary with draft state, environment dependencies, interceptor, diagnostics, and test outcomes.",
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) => {
@@ -280,7 +285,7 @@ export class WebMCPService extends Service {
           name: "read_rest_payload",
           title: "Read REST payload window",
           description:
-            "Read one revision-bound, bounded request or response payload window. Binary and file content returns metadata only, and recognized secrets are redacted.",
+            "Read a bounded, revision-bound window from the visible REST request or response. Text is redacted and binary or file content is represented by metadata.",
           inputSchema: readRESTPayloadInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) => {
@@ -339,7 +344,7 @@ export class WebMCPService extends Service {
           name: "edit_rest_request",
           title: "Edit current REST request",
           description:
-            "Apply a validated revision-bound patch to the visible REST draft. This marks the draft dirty, never saves it, and cannot change credentials or scripts.",
+            "Apply an allow-listed revision-bound patch to the visible REST draft. The updated draft is returned as unsaved state, while protected credential and script fields remain managed by the app.",
           inputSchema: editRESTRequestInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
@@ -352,7 +357,7 @@ export class WebMCPService extends Service {
           name: "execute_rest_request",
           title: "Execute current REST request",
           description:
-            "Execute the visible REST request through Hoppscotch's normal pipeline after app approval, then return its completed response and test outcome.",
+            "Execute the visible REST request through Hoppscotch's normal pipeline after app approval and return a bounded, redacted response and test outcome.",
           inputSchema: expectedRevisionSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (
