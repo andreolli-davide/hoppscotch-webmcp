@@ -9,6 +9,7 @@
     <ErrorPage v-if="errorInfo !== null" :error="errorInfo" />
     <RouterView v-else />
     <Toaster rich-colors />
+    <AppWebMCPActivity />
   </div>
 </template>
 

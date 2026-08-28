@@ -1,7 +1,9 @@
 /// <reference types="vite/client" />
+/// <reference types="webmcp-types" />
 
 // Environment Variables Intellisense
 interface ImportMetaEnv {
+  readonly VITE_ENABLE_WEBMCP?: "true" | "false"
   readonly VITE_GA_ID: string
 
   readonly VITE_GTM_ID: string

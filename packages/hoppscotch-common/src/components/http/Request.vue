@@ -238,17 +238,14 @@
 <script setup lang="ts">
 import { useI18n } from "@composables/i18n"
 import { useSetting } from "@composables/settings"
-import { useReadonlyStream, useStreamSubscriber } from "@composables/stream"
+import { useReadonlyStream } from "@composables/stream"
 import { useToast } from "@composables/toast"
 import { useVModel } from "@vueuse/core"
-import * as E from "fp-ts/Either"
-import { computed, ref, onUnmounted, watch } from "vue"
+import { computed, ref, onUnmounted } from "vue"
 import { defineActionHandler, invokeAction } from "~/helpers/actions"
 import { runMutation } from "~/helpers/backend/GQLClient"
 import { UpdateRequestDocument } from "~/helpers/backend/graphql"
 import { getPlatformSpecialKey as getSpecialKey } from "~/helpers/platformutils"
-import { runRESTRequest$ } from "~/helpers/RequestRunner"
-import { HoppRESTResponse } from "~/helpers/types/HoppRESTResponse"
 import { editRESTRequest } from "~/newstore/collections"
 import IconChevronDown from "~icons/lucide/chevron-down"
 import IconCode2 from "~icons/lucide/code-2"
@@ -267,13 +264,10 @@ import { HoppTab } from "~/services/tab"
 import { HoppRequestDocument } from "~/helpers/rest/document"
 import { RESTTabService } from "~/services/tab/rest"
 import { getMethodLabelColor } from "~/helpers/rest/labelColoring"
-import { WorkspaceService } from "~/services/workspace.service"
-import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { handleTokenValidation } from "~/helpers/handleTokenValidation"
+import { RESTRequestExecutionService } from "~/services/rest-request-execution.service"
 
 const t = useI18n()
-const interceptorService = useService(KernelInterceptorService)
-
 const methods = [
   "GET",
   "POST",
@@ -289,8 +283,6 @@ const methods = [
 
 const toast = useToast()
 
-const { subscribeToStream } = useStreamSubscriber()
-
 const props = defineProps<{ modelValue: HoppTab<HoppRequestDocument> }>()
 const emit = defineEmits(["update:modelValue"])
 
@@ -305,7 +297,8 @@ const newMethod = computed(() => {
 
 const curlText = ref("")
 
-const loading = ref(false)
+const executionService = useService(RESTRequestExecutionService)
+const loading = executionService.isRunning(tab.value.id)
 
 const isTabResponseLoading = computed(
   () => loading.value || tab.value.document.response?.type === "loading"
@@ -335,121 +328,24 @@ const inspectionService = useService(InspectionService)
 
 const tabs = useService(RESTTabService)
 
-const workspaceService = useService(WorkspaceService)
-
 const newSendRequest = async () => {
   if (newEndpoint.value === "" || /^\s+$/.test(newEndpoint.value)) {
     toast.error(`${t("empty.endpoint")}`)
     return
   }
-  ensureMethodInEndpoint()
-
-  tab.value.document.response = {
-    type: "loading",
-    req: tab.value.document.request,
-  }
-
-  // Clear test results to ensure loading state persists until new results arrive
-  // This prevents UI flicker where old results briefly appear before new ones
-  tab.value.document.testResults = null
-
-  loading.value = true
-
-  platform.analytics?.logEvent({
-    type: "HOPP_REQUEST_RUN",
-    platform: "rest",
-    strategy: interceptorService.current.value!.id,
-    workspaceType: workspaceService.currentWorkspace.value.type,
-  })
-
-  const [cancel, streamPromise] = runRESTRequest$(tab)
-  const streamResult = await streamPromise
-
-  tab.value.document.cancelFunction = cancel
-
-  if (E.isRight(streamResult)) {
-    subscribeToStream(
-      streamResult.right,
-      (responseState) => {
-        if (loading.value) {
-          updateRESTResponse(responseState)
-
-          // Network/extension/interceptor errors don't run test scripts, set empty results to clear loading
-          if (
-            responseState.type === "network_fail" ||
-            responseState.type === "extension_error" ||
-            responseState.type === "interceptor_error"
-          ) {
-            tab.value.document.testResults = {
-              description: "",
-              expectResults: [],
-              tests: [],
-              envDiff: {
-                global: { additions: [], deletions: [], updations: [] },
-                selected: { additions: [], deletions: [], updations: [] },
-              },
-              scriptError: false,
-              consoleEntries: [],
-            }
-          }
-        }
-      },
-      (error: unknown) => {
-        console.error("Stream error:", error)
-
-        // Set empty testResults to clear loading state
-        if (tab.value.document.testResults === null) {
-          tab.value.document.testResults = {
-            description: "",
-            expectResults: [],
-            tests: [],
-            envDiff: {
-              global: { additions: [], deletions: [], updations: [] },
-              selected: { additions: [], deletions: [], updations: [] },
-            },
-            scriptError: false,
-            consoleEntries: [],
-          }
-        }
-      },
-      () => {}
+  try {
+    const outcome = await executionService.send(tab, { initiator: "user" })
+    if (outcome.type === "script_failed") {
+      toast.error(`${t("error.script_fail")}`)
+    } else if (outcome.type === "failed") {
+      console.error("REST execution failed:", outcome.error)
+      toast.error(outcome.error.message)
+    }
+  } catch (error) {
+    console.error("REST execution could not start:", error)
+    toast.error(
+      error instanceof Error ? error.message : t("error.something_went_wrong")
     )
-  } else {
-    toast.error(`${t("error.script_fail")}`)
-    let error: Error
-    if (typeof streamResult.left === "string") {
-      error = { name: "RequestFailure", message: streamResult.left }
-    } else {
-      error = streamResult.left
-    }
-    updateRESTResponse({
-      type: "script_fail",
-      error,
-    })
-    tab.value.document.testResults = {
-      description: "",
-      expectResults: [],
-      tests: [],
-      envDiff: {
-        global: { additions: [], deletions: [], updations: [] },
-        selected: { additions: [], deletions: [], updations: [] },
-      },
-      scriptError: true,
-      consoleEntries: [],
-    }
-  }
-}
-
-const ensureMethodInEndpoint = () => {
-  const endpoint = newEndpoint.value.trim()
-  tab.value.document.request.endpoint = endpoint
-  if (!/^http[s]?:\/\//.test(endpoint) && !endpoint.startsWith("<<")) {
-    const domain = endpoint.split(/[/:#?]+/)[0]
-    if (domain === "localhost" || /([0-9]+\.)*[0-9]/.test(domain)) {
-      tab.value.document.request.endpoint = "http://" + endpoint
-    } else {
-      tab.value.document.request.endpoint = "https://" + endpoint
-    }
   }
 }
 
@@ -469,16 +365,6 @@ function isCURL(curl: string) {
 
 const currentTabID = tabs.currentTabID.value
 
-// Clear loading state when test results are set
-watch(
-  () => tab.value.document.testResults,
-  (newTestResults, oldTestResults) => {
-    if (oldTestResults === null && newTestResults !== null && loading.value) {
-      loading.value = false
-    }
-  }
-)
-
 onUnmounted(() => {
   //check if current tab id exist in the current tab id lists
   const isCurrentTabRemoved = !tabs
@@ -489,24 +375,7 @@ onUnmounted(() => {
 })
 
 const cancelRequest = () => {
-  tab.value.document.cancelFunction?.()
-  updateRESTResponse(null)
-
-  // Set empty testResults - watcher will clear loading
-  // Only set if null to avoid overwriting existing test results
-  if (tab.value.document.testResults === null) {
-    tab.value.document.testResults = {
-      description: "",
-      expectResults: [],
-      tests: [],
-      envDiff: {
-        global: { additions: [], deletions: [], updations: [] },
-        selected: { additions: [], deletions: [], updations: [] },
-      },
-      scriptError: false,
-      consoleEntries: [],
-    }
-  }
+  executionService.cancel(tab.value.id)
 }
 
 const updateMethod = (method: string) => {
@@ -520,10 +389,6 @@ const onSelectMethod = (e: Event | any) => {
 
 const clearContent = () => {
   tab.value.document.request = getDefaultRESTRequest()
-}
-
-const updateRESTResponse = (response: HoppRESTResponse | null) => {
-  tab.value.document.response = response
 }
 
 const currentUser = useReadonlyStream(

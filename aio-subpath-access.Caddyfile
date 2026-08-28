@@ -4,6 +4,10 @@
 }
 
 :{$HOPP_ALTERNATE_PORT:80} {
+	header {
+		Permissions-Policy "tools=(self)"
+		Origin-Agent-Cluster "?1"
+	}
 	# Serve the `selfhost-web` SPA by default
 	root * /site/selfhost-web
 	file_server

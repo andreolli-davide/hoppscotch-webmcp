@@ -20,6 +20,14 @@ import ImportMetaEnv from "@import-meta-env/unplugin"
 
 const ENV = loadEnv("development", path.resolve(__dirname, "../../"), ["VITE_"])
 
+const DEV_ALLOWED_HOSTS = (() => {
+  try {
+    return [new URL(ENV.VITE_BASE_URL).hostname]
+  } catch {
+    return []
+  }
+})()
+
 export default defineConfig({
   envPrefix: process.env.HOPP_ALLOW_RUNTIME_ENV ? "VITE_BUILDTIME_" : "VITE_",
   envDir: path.resolve(__dirname, "../../"),
@@ -31,9 +39,11 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    allowedHosts: DEV_ALLOWED_HOSTS,
   },
   preview: {
     port: 3000,
+    allowedHosts: DEV_ALLOWED_HOSTS,
   },
   publicDir: path.resolve(__dirname, "../hoppscotch-common/public"),
   build: {

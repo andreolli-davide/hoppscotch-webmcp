@@ -456,9 +456,20 @@ export function runRESTRequest$(
     | E.Left<"script_fail" | "cancellation">
     | E.Right<Observable<HoppRESTResponse>>
   >,
+  Promise<void>,
 ] {
   let cancelCalled = false
   let cancelFunc: (() => void) | null = null
+  let completionResolved = false
+  let resolveCompletion!: () => void
+  const completion = new Promise<void>((resolve) => {
+    resolveCompletion = resolve
+  })
+  const completeOnce = () => {
+    if (completionResolved) return
+    completionResolved = true
+    resolveCompletion()
+  }
 
   const cancel = () => {
     cancelCalled = true
@@ -514,10 +525,14 @@ export function runRESTRequest$(
     cookieJarEntries,
     inheritedPreRequestScripts
   ).then(async (preRequestScriptResult) => {
-    if (cancelCalled) return E.left("cancellation" as const)
+    if (cancelCalled) {
+      completeOnce()
+      return E.left("cancellation" as const)
+    }
 
     if (E.isLeft(preRequestScriptResult)) {
       console.error("[Pre-Request Script Error]", preRequestScriptResult.left)
+      completeOnce()
       return E.left("script_fail" as const)
     }
 
@@ -574,120 +589,150 @@ export function runRESTRequest$(
     const [stream, cancelRun] =
       await createRESTNetworkRequestStream(effectiveRequest)
     cancelFunc = cancelRun
+    let terminalProcessingStarted = false
+
+    stream.subscribe({
+      error: () => completeOnce(),
+      complete: () => {
+        if (!terminalProcessingStarted) completeOnce()
+      },
+    })
 
     const subscription = stream
       .pipe(filter((res) => res.type === "success" || res.type === "fail"))
       .subscribe(async (res) => {
         if (res.type === "success" || res.type === "fail") {
-          executedResponses$.next(res)
+          terminalProcessingStarted = true
+          try {
+            executedResponses$.next(res)
 
-          const postRequestScriptResult = await runPostRequestScript(
-            preRequestScriptResult.right.updatedEnvs,
-            res.req,
-            {
-              status: res.statusCode,
-              body: getTestableBody(res),
-              headers: res.headers,
-              statusText: res.statusText,
-              responseTime: res.meta.responseDuration,
-            },
-            preRequestScriptResult.right.updatedCookies ?? null,
-            inheritedTestScripts
-          )
-
-          if (E.isRight(postRequestScriptResult)) {
-            // set the response in the tab so that multiple tabs can run request simultaneously
-            tab.value.document.response = res
-
-            // Combine console entries from pre and post request scripts
-            const combinedResult = pipe(
-              postRequestScriptResult,
-              map((result) => ({
-                ...result,
-                consoleEntries: [
-                  ...(preRequestScriptResult.right.consoleEntries ?? []),
-                  ...(result.consoleEntries ?? []),
-                ],
-              }))
-            ) as E.Right<SandboxTestResult>
-
-            tab.value.document.testResults = translateToSandboxTestResults(
-              combinedResult.right,
-              initialGlobalEnvs,
-              initialSelectedEnvs
-            )
-
-            // Check if scripts actually modified environment variables
-            if (
-              hasEnvironmentChanges(
-                initialEnvsForComparison, // Initial environment when request started
-                postRequestScriptResult.right.envs // Final script environment after test script execution
-              )
-            ) {
-              updateEnvsAfterTestScript(
-                combinedResult,
-                initialEnvironmentIndex,
-                initialEnvName,
-                initialEnvsForComparison,
-                initialEnvID
-              )
-            }
-
-            const updatedCookies = postRequestScriptResult.right.updatedCookies
-
-            if (updatedCookies && cookieJarEntries !== null) {
-              // The script's `updatedCookies` is the post-script state of
-              // its pre-script view, so a set difference against the
-              // pre-script snapshot gives the actual mutations. Cookies
-              // the script returned identical to what it received get
-              // skipped because the response capture may have updated
-              // them in the jar in the interim and re-upserting the
-              // script's stale copy would overwrite that. Cookies the
-              // script omitted from its returned array are treated as
-              // deletes, restoring `hopp.cookies.delete` semantics.
-              //
-              // Skipped entirely when `cookieJarEntries` is null
-              // (cookies disabled on the platform). The previous
-              // `?? []` made the empty pre-script snapshot classify
-              // every script cookie as new and never as removed, so
-              // delete-by-omission silently broke on non-desktop.
-              await applyScriptCookieDelta(cookieJarEntries, updatedCookies)
-            }
-          } else {
-            console.error(
-              "[Post-Request Script Error]",
-              postRequestScriptResult.left
-            )
-
-            tab.value.document.testResults = {
-              description: "",
-              expectResults: [],
-              tests: [],
-              envDiff: {
-                global: {
-                  additions: [],
-                  deletions: [],
-                  updations: [],
-                },
-                selected: {
-                  additions: [],
-                  deletions: [],
-                  updations: [],
-                },
+            const postRequestScriptResult = await runPostRequestScript(
+              preRequestScriptResult.right.updatedEnvs,
+              res.req,
+              {
+                status: res.statusCode,
+                body: getTestableBody(res),
+                headers: res.headers,
+                statusText: res.statusText,
+                responseTime: res.meta.responseDuration,
               },
-              scriptError: true,
-              consoleEntries: [],
-            }
-          }
+              preRequestScriptResult.right.updatedCookies ?? null,
+              inheritedTestScripts
+            )
 
-          subscription.unsubscribe()
+            if (E.isRight(postRequestScriptResult)) {
+              // set the response in the tab so that multiple tabs can run request simultaneously
+              tab.value.document.response = res
+
+              // Combine console entries from pre and post request scripts
+              const combinedResult = pipe(
+                postRequestScriptResult,
+                map((result) => ({
+                  ...result,
+                  consoleEntries: [
+                    ...(preRequestScriptResult.right.consoleEntries ?? []),
+                    ...(result.consoleEntries ?? []),
+                  ],
+                }))
+              ) as E.Right<SandboxTestResult>
+
+              tab.value.document.testResults = translateToSandboxTestResults(
+                combinedResult.right,
+                initialGlobalEnvs,
+                initialSelectedEnvs
+              )
+
+              // Check if scripts actually modified environment variables
+              if (
+                hasEnvironmentChanges(
+                  initialEnvsForComparison, // Initial environment when request started
+                  postRequestScriptResult.right.envs // Final script environment after test script execution
+                )
+              ) {
+                updateEnvsAfterTestScript(
+                  combinedResult,
+                  initialEnvironmentIndex,
+                  initialEnvName,
+                  initialEnvsForComparison,
+                  initialEnvID
+                )
+              }
+
+              const updatedCookies =
+                postRequestScriptResult.right.updatedCookies
+
+              if (updatedCookies && cookieJarEntries !== null) {
+                // The script's `updatedCookies` is the post-script state of
+                // its pre-script view, so a set difference against the
+                // pre-script snapshot gives the actual mutations. Cookies
+                // the script returned identical to what it received get
+                // skipped because the response capture may have updated
+                // them in the jar in the interim and re-upserting the
+                // script's stale copy would overwrite that. Cookies the
+                // script omitted from its returned array are treated as
+                // deletes, restoring `hopp.cookies.delete` semantics.
+                //
+                // Skipped entirely when `cookieJarEntries` is null
+                // (cookies disabled on the platform). The previous
+                // `?? []` made the empty pre-script snapshot classify
+                // every script cookie as new and never as removed, so
+                // delete-by-omission silently broke on non-desktop.
+                await applyScriptCookieDelta(cookieJarEntries, updatedCookies)
+              }
+            } else {
+              console.error(
+                "[Post-Request Script Error]",
+                postRequestScriptResult.left
+              )
+
+              tab.value.document.testResults = {
+                description: "",
+                expectResults: [],
+                tests: [],
+                envDiff: {
+                  global: {
+                    additions: [],
+                    deletions: [],
+                    updations: [],
+                  },
+                  selected: {
+                    additions: [],
+                    deletions: [],
+                    updations: [],
+                  },
+                },
+                scriptError: true,
+                consoleEntries: [],
+              }
+            }
+          } catch (error) {
+            console.error("[REST Request Completion Error]", error)
+            if (tab.value.document.testResults === null) {
+              tab.value.document.testResults = {
+                description: "",
+                expectResults: [],
+                tests: [],
+                envDiff: {
+                  global: { additions: [], deletions: [], updations: [] },
+                  selected: { additions: [], deletions: [], updations: [] },
+                },
+                scriptError: true,
+                consoleEntries: [],
+              }
+            }
+          } finally {
+            subscription.unsubscribe()
+            completeOnce()
+          }
         }
       })
 
     return E.right(stream)
   })
 
-  return [cancel, res]
+  void res.catch(() => completeOnce())
+
+  return [cancel, res, completion]
 }
 
 function updateEnvsAfterTestScript(

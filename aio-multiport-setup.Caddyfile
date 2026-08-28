@@ -4,6 +4,10 @@
 }
 
 :3000 {
+	header {
+		Permissions-Policy "tools=(self)"
+		Origin-Agent-Cluster "?1"
+	}
 	try_files {path} /
 	root * /site/selfhost-web
 	file_server
