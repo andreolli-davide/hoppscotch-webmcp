@@ -206,6 +206,7 @@ export class ActiveAppContextService extends Service {
 
   public realtimeMode(): "websocket" | "socketio" | "sse" | "mqtt" | null {
     const path = this.router.value?.currentRoute.value.path ?? ""
+    if (path === "/realtime") return "websocket"
     if (!path.startsWith("/realtime/")) return null
     const mode = path.split("/")[2]
     return mode === "websocket" ||
@@ -213,7 +214,7 @@ export class ActiveAppContextService extends Service {
       mode === "sse" ||
       mode === "mqtt"
       ? mode
-      : null
+      : "websocket"
   }
 
   public captureVisibleREST(): VisibleRESTContext | null {
