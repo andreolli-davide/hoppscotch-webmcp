@@ -26,6 +26,7 @@ import {
   deleteCollectionParser,
   deleteFolderParser,
   deleteEnvironmentParser,
+  getSkillParser,
 } from "../schemas"
 
 describe("WebMCP REST input schemas", () => {
@@ -396,5 +397,19 @@ describe("WebMCP Live Artifact input schemas", () => {
         environmentIndex: 0,
       }).success
     ).toBe(false)
+  })
+
+  it("validates get_skill input schema", () => {
+    expect(getSkillParser.safeParse({}).success).toBe(true)
+    expect(
+      getSkillParser.safeParse({ name: "scripting-sandbox" }).success
+    ).toBe(true)
+    expect(getSkillParser.safeParse({ name: "list" }).success).toBe(true)
+    expect(getSkillParser.safeParse({ name: "a".repeat(129) }).success).toBe(
+      false
+    )
+    expect(getSkillParser.safeParse({ extraProp: "invalid" }).success).toBe(
+      false
+    )
   })
 })

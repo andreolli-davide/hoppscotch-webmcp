@@ -142,7 +142,10 @@ import {
   deleteFolderParser,
   deleteEnvironmentInputSchema,
   deleteEnvironmentParser,
+  getSkillInputSchema,
+  getSkillParser,
 } from "./schemas"
+import { findSkill, listSkills } from "./skills"
 import {
   applyJSONPointerOperations,
   diagnosticForError,
@@ -576,6 +579,19 @@ export class WebMCPService extends Service {
             })
             return this.result("app-context", { switched: true })
           },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "get_skill",
+          title: "Get Hoppscotch skill or documentation",
+          description:
+            "Retrieve reference documentation, rules, API signatures, and code examples for Hoppscotch capabilities (e.g. 'scripting-sandbox', 'variables-and-environments', 'test-assertions', 'auth-configuration'). Omit name or pass 'list' to view the index of all available skills.",
+          inputSchema: getSkillInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: false },
+          execute: async (input: Record<string, unknown>) =>
+            this.getSkill(input),
         },
         signal
       ),
@@ -1060,7 +1076,7 @@ export class WebMCPService extends Service {
           name: "edit_rest_variables",
           title: "Edit REST request variables",
           description:
-            "Replace bounded active-request variables in the visible REST draft and return its updated unsaved state.",
+            "Replace bounded active-request variables in the visible REST draft and return its updated unsaved state. Use get_skill({ name: 'variables-and-environments' }) for templating and cascade rules.",
           inputSchema: editRESTVariablesInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
@@ -1073,7 +1089,7 @@ export class WebMCPService extends Service {
           name: "edit_rest_scripts",
           title: "Edit REST request scripts",
           description:
-            "Store a bounded pre-request or post-request test script in the visible draft for a separately approved request execution.",
+            "Store a bounded pre-request or post-request test script in the visible draft for a separately approved request execution. Use get_skill({ name: 'scripting-sandbox' }) or get_skill({ name: 'test-assertions' }) for APIs and matchers.",
           inputSchema: editRESTScriptsInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
@@ -1086,7 +1102,7 @@ export class WebMCPService extends Service {
           name: "inspect_rest_scripting",
           title: "Inspect REST scripting",
           description:
-            "Inspect visible request and inherited JavaScript script-chain metadata and static diagnostics without disclosing source text.",
+            "Inspect visible request and inherited JavaScript script-chain metadata and static diagnostics without disclosing source text. Use get_skill({ name: 'scripting-sandbox' }) for sandbox API reference.",
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
@@ -4273,6 +4289,41 @@ export class WebMCPService extends Service {
       }
     }
     return result
+  }
+
+  private async getSkill(input: Record<string, unknown>) {
+    if (!this.validBoundary(input)) {
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    }
+    const parsed = getSkillParser.safeParse(input)
+    if (!parsed.success) {
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    }
+
+    if (!parsed.data.name || parsed.data.name.toLowerCase() === "list") {
+      return this.result("app-context", {
+        skills: listSkills(),
+      })
+    }
+
+    const skill = findSkill(parsed.data.name)
+    if (!skill) {
+      const available = listSkills()
+        .map((s) => `'${s.name}'`)
+        .join(", ")
+      return this.failure(
+        "INVALID_INPUT",
+        `Skill '${parsed.data.name}' not found. Available skills: ${available}.`,
+        "app-context"
+      )
+    }
+
+    return this.result("app-context", {
+      skill,
+    })
   }
 
   private async inspectRESTScripting() {

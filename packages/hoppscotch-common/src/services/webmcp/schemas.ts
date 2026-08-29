@@ -1350,3 +1350,22 @@ export const deleteEnvironmentInputSchema = {
   required: ["expectedRevision", "environmentIndex", "confirmationName"],
   additionalProperties: false,
 } as const
+
+export const getSkillParser = z
+  .object({
+    name: z.string().max(128).optional(),
+  })
+  .strict()
+
+export const getSkillInputSchema = {
+  type: "object",
+  properties: {
+    name: {
+      type: "string",
+      maxLength: 128,
+      description:
+        "Name of the skill to retrieve (e.g. 'scripting-sandbox', 'variables-and-environments', 'test-assertions', 'auth-configuration'). Omit or pass 'list' to view all available skills.",
+    },
+  },
+  additionalProperties: false,
+} as const
