@@ -32,6 +32,8 @@ import {
   editRESTRequest,
   saveGraphqlRequestAs,
   editGraphqlRequest,
+  removeRESTCollection,
+  removeRESTFolder,
   cascadeParentCollectionForProperties,
 } from "~/newstore/collections"
 import {
@@ -53,7 +55,10 @@ import {
 import {
   getSelectedEnvironmentIndex,
   setSelectedEnvironmentIndex,
+  deleteEnvironment,
+  environmentsStore,
 } from "~/newstore/environments"
+import { CurrentValueService } from "~/services/current-environment-value.service"
 
 import { WebMCPAdapter } from "./adapter"
 import { ActiveAppContextService, VisibleRESTContext } from "./context"
@@ -130,6 +135,12 @@ import {
   switchWorkspaceParser,
   runCollectionInputSchema,
   runCollectionParser,
+  deleteCollectionInputSchema,
+  deleteCollectionParser,
+  deleteFolderInputSchema,
+  deleteFolderParser,
+  deleteEnvironmentInputSchema,
+  deleteEnvironmentParser,
 } from "./schemas"
 import {
   applyJSONPointerOperations,
@@ -239,10 +250,12 @@ export class WebMCPService extends Service {
   private readonly gqlExecution = this.bind(GQLRequestExecutionService)
   private readonly realtime = this.bind(RealtimeSessionService)
   private readonly environments = this.bind(WebMCPEnvironmentService)
+  private readonly currentValues = this.bind(CurrentValueService)
   private readonly approval = this.bind(AgentActionApprovalService)
   private readonly activity = this.bind(AgentActivityService)
 
   private appController: AbortController | null = null
+  private durableOpsController: AbortController | null = null
   private restController: AbortController | null = null
   private gqlController: AbortController | null = null
   private realtimeController: AbortController | null = null
@@ -263,6 +276,10 @@ export class WebMCPService extends Service {
 
     this.appController = new AbortController()
     await this.registerAppPack(this.appController.signal)
+    if (import.meta.env.VITE_ENABLE_WEBMCP_DURABLE_OPS === "true") {
+      this.durableOpsController = new AbortController()
+      await this.registerDurableOpsPack(this.durableOpsController.signal)
+    }
     await this.syncCapabilityPacks()
     this.stopCapabilityWatch = watch(
       () => [
@@ -279,6 +296,8 @@ export class WebMCPService extends Service {
   public stop() {
     this.stopCapabilityWatch?.()
     this.stopCapabilityWatch = null
+    this.durableOpsController?.abort()
+    this.durableOpsController = null
     this.restController?.abort()
     this.restController = null
     this.gqlController?.abort()
@@ -555,6 +574,331 @@ export class WebMCPService extends Service {
               revision: this.context.revision("app-context"),
             })
             return this.result("app-context", { switched: true })
+          },
+        },
+        signal
+      ),
+    ])
+  }
+
+  private async registerDurableOpsPack(signal: AbortSignal) {
+    await Promise.all([
+      this.adapter.register(
+        {
+          name: "delete_collection",
+          title: "Delete collection",
+          description:
+            "Permanently delete a collection from user storage. Requires exact collection confirmation name.",
+          inputSchema: deleteCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = deleteCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const pathIndex = parseInt(parsed.data.collectionPath, 10)
+            const collection = restCollectionStore.value.state[pathIndex]
+            if (!collection) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Collection at path ${parsed.data.collectionPath} not found.`,
+                "app-context"
+              )
+            }
+
+            if (collection.name !== parsed.data.confirmationName) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Confirmation name '${parsed.data.confirmationName}' does not match collection name '${collection.name}'.`,
+                "app-context"
+              )
+            }
+
+            const envName = this.context.capture().environment.name
+            const workspaceType = this.context.capture().workspace.type
+
+            const approved = await this.approval.request(
+              {
+                action: "DELETE collection",
+                method: "DELETE",
+                target: collection.name,
+                environment: envName,
+                workspace: workspaceType,
+                grantKey: `delete-collection|${collection.name}|${envName}|${workspaceType}`,
+              },
+              executionSignal
+            )
+
+            if (!approved) {
+              this.activity.record({
+                tool: "delete_collection",
+                outcome: "denied",
+                summary: `Denied deleting collection '${collection.name}'`,
+                revision: this.context.revision("app-context"),
+              })
+              return this.failure(
+                "APPROVAL_DENIED",
+                "The user rejected deleting the collection.",
+                "app-context"
+              )
+            }
+
+            const deletedName = collection.name
+            removeRESTCollection(pathIndex, collection._ref_id || collection.id)
+
+            this.activity.record({
+              tool: "delete_collection",
+              outcome: "changed",
+              summary: `Permanently deleted collection '${deletedName}'`,
+              revision: this.context.revision("app-context"),
+            })
+
+            return this.result("app-context", {
+              success: true,
+              deletedCollection: deletedName,
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "delete_folder",
+          title: "Delete collection folder",
+          description:
+            "Permanently delete a subfolder from a collection. Requires exact folder confirmation name.",
+          inputSchema: deleteFolderInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = deleteFolderParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const target = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              parsed.data.folderPath.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Folder at path ${parsed.data.folderPath} not found.`,
+                "app-context"
+              )
+            }
+
+            if (target.name !== parsed.data.confirmationName) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Confirmation name '${parsed.data.confirmationName}' does not match folder name '${target.name}'.`,
+                "app-context"
+              )
+            }
+
+            const envName = this.context.capture().environment.name
+            const workspaceType = this.context.capture().workspace.type
+
+            const approved = await this.approval.request(
+              {
+                action: "DELETE folder",
+                method: "DELETE",
+                target: target.name,
+                environment: envName,
+                workspace: workspaceType,
+                grantKey: `delete-folder|${target.name}|${envName}|${workspaceType}`,
+              },
+              executionSignal
+            )
+
+            if (!approved) {
+              this.activity.record({
+                tool: "delete_folder",
+                outcome: "denied",
+                summary: `Denied deleting folder '${target.name}'`,
+                revision: this.context.revision("app-context"),
+              })
+              return this.failure(
+                "APPROVAL_DENIED",
+                "The user rejected deleting the folder.",
+                "app-context"
+              )
+            }
+
+            const deletedName = target.name
+            removeRESTFolder(parsed.data.folderPath, target.id)
+
+            this.activity.record({
+              tool: "delete_folder",
+              outcome: "changed",
+              summary: `Permanently deleted folder '${deletedName}'`,
+              revision: this.context.revision("app-context"),
+            })
+
+            return this.result("app-context", {
+              success: true,
+              deletedFolder: deletedName,
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "delete_environment",
+          title: "Delete environment",
+          description:
+            "Permanently delete a custom environment definition. Requires exact environment confirmation name.",
+          inputSchema: deleteEnvironmentInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = deleteEnvironmentParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const envs = environmentsStore.value.environments
+            const targetEnv = envs[parsed.data.environmentIndex]
+            if (!targetEnv) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Environment at index ${parsed.data.environmentIndex} not found.`,
+                "app-context"
+              )
+            }
+
+            if (targetEnv.name !== parsed.data.confirmationName) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Confirmation name '${parsed.data.confirmationName}' does not match environment name '${targetEnv.name}'.`,
+                "app-context"
+              )
+            }
+
+            const currentEnvName = this.context.capture().environment.name
+            const workspaceType = this.context.capture().workspace.type
+
+            const approved = await this.approval.request(
+              {
+                action: "DELETE environment",
+                method: "DELETE",
+                target: targetEnv.name,
+                environment: currentEnvName,
+                workspace: workspaceType,
+                grantKey: `delete-environment|${targetEnv.name}|${currentEnvName}|${workspaceType}`,
+              },
+              executionSignal
+            )
+
+            if (!approved) {
+              this.activity.record({
+                tool: "delete_environment",
+                outcome: "denied",
+                summary: `Denied deleting environment '${targetEnv.name}'`,
+                revision: this.context.revision("app-context"),
+              })
+              return this.failure(
+                "APPROVAL_DENIED",
+                "The user rejected deleting the environment.",
+                "app-context"
+              )
+            }
+
+            const deletedName = targetEnv.name
+            deleteEnvironment(parsed.data.environmentIndex, targetEnv.id)
+            if (targetEnv.id) {
+              this.currentValues.deleteEnvironment(targetEnv.id)
+            }
+
+            this.activity.record({
+              tool: "delete_environment",
+              outcome: "changed",
+              summary: `Permanently deleted environment '${deletedName}'`,
+              revision: this.context.revision("app-context"),
+            })
+
+            return this.result("app-context", {
+              success: true,
+              deletedEnvironment: deletedName,
+            })
           },
         },
         signal

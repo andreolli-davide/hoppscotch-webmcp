@@ -1098,3 +1098,61 @@ export const runCollectionInputSchema = {
   additionalProperties: false,
 } as const
 
+export const deleteCollectionParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    collectionPath: z.string().min(1).max(256),
+    confirmationName: z.string().min(1).max(256),
+  })
+  .strict()
+
+export const deleteCollectionInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    collectionPath: { type: "string", minLength: 1, maxLength: 256 },
+    confirmationName: { type: "string", minLength: 1, maxLength: 256 },
+  },
+  required: ["expectedRevision", "collectionPath", "confirmationName"],
+  additionalProperties: false,
+} as const
+
+export const deleteFolderParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    folderPath: z.string().min(1).max(256),
+    confirmationName: z.string().min(1).max(256),
+  })
+  .strict()
+
+export const deleteFolderInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    folderPath: { type: "string", minLength: 1, maxLength: 256 },
+    confirmationName: { type: "string", minLength: 1, maxLength: 256 },
+  },
+  required: ["expectedRevision", "folderPath", "confirmationName"],
+  additionalProperties: false,
+} as const
+
+export const deleteEnvironmentParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    environmentIndex: z.number().int().min(0),
+    confirmationName: z.string().min(1).max(256),
+  })
+  .strict()
+
+export const deleteEnvironmentInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    environmentIndex: { type: "integer", minimum: 0 },
+    confirmationName: { type: "string", minLength: 1, maxLength: 256 },
+  },
+  required: ["expectedRevision", "environmentIndex", "confirmationName"],
+  additionalProperties: false,
+} as const
+
+

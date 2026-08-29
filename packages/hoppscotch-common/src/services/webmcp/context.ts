@@ -307,13 +307,19 @@ export class ActiveAppContextService extends Service {
             : undefined,
       dirtyDocumentCount:
         this.restTabs.getDirtyTabsCount() + this.gqlTabs.getDirtyTabsCount(),
-      capabilityPacks: rest
-        ? ["app-context", "environment", "rest"]
-        : gql
-          ? ["app-context", "graphql"]
-          : realtimeMode
-            ? ["app-context", `realtime-${realtimeMode}`]
-            : ["app-context"],
+      capabilityPacks: (() => {
+        const packs = rest
+          ? ["app-context", "environment", "rest"]
+          : gql
+            ? ["app-context", "graphql"]
+            : realtimeMode
+              ? ["app-context", `realtime-${realtimeMode}`]
+              : ["app-context"]
+        if (import.meta.env.VITE_ENABLE_WEBMCP_DURABLE_OPS === "true") {
+          packs.push("durable-ops")
+        }
+        return packs
+      })(),
     }
   }
 

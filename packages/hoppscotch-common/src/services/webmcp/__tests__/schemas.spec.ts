@@ -23,6 +23,9 @@ import {
   loadHistoryEntryParser,
   switchWorkspaceParser,
   runCollectionParser,
+  deleteCollectionParser,
+  deleteFolderParser,
+  deleteEnvironmentParser,
 } from "../schemas"
 
 describe("WebMCP REST input schemas", () => {
@@ -329,5 +332,50 @@ describe("WebMCP Live Artifact input schemas", () => {
       }).success
     ).toBe(false)
   })
+
+  it("validates durable ops schemas and requires confirmationName", () => {
+    expect(
+      deleteCollectionParser.safeParse({
+        expectedRevision: "app-context:1",
+        collectionPath: "0",
+        confirmationName: "My Collection",
+      }).success
+    ).toBe(true)
+    expect(
+      deleteCollectionParser.safeParse({
+        expectedRevision: "app-context:1",
+        collectionPath: "0",
+      }).success
+    ).toBe(false)
+
+    expect(
+      deleteFolderParser.safeParse({
+        expectedRevision: "app-context:1",
+        folderPath: "0/1",
+        confirmationName: "Folder A",
+      }).success
+    ).toBe(true)
+    expect(
+      deleteFolderParser.safeParse({
+        expectedRevision: "app-context:1",
+        folderPath: "0/1",
+      }).success
+    ).toBe(false)
+
+    expect(
+      deleteEnvironmentParser.safeParse({
+        expectedRevision: "app-context:1",
+        environmentIndex: 0,
+        confirmationName: "Dev Env",
+      }).success
+    ).toBe(true)
+    expect(
+      deleteEnvironmentParser.safeParse({
+        expectedRevision: "app-context:1",
+        environmentIndex: 0,
+      }).success
+    ).toBe(false)
+  })
 })
+
 

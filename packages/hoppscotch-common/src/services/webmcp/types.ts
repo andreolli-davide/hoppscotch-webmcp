@@ -23,6 +23,7 @@ export type WebMCPErrorCode =
   | "SCRIPT_FAILED"
   | "EXECUTION_FAILED"
   | "DIRTY_TAB_UNSAVED_CHANGES"
+  | "DURABLE_OPS_DISABLED"
 
 /** A bounded, redacted diagnostic. Locations are source-relative when present. */
 export type WebMCPDiagnostic = {
