@@ -1725,6 +1725,7 @@ export class WebMCPService extends Service {
               rest.tab.document.request = reqToLoad
               rest.tab.document.isDirty = false
               rest.tab.document.saveContext = undefined
+              rest.tab.document.inheritedProperties = undefined
             }
             this.activity.record({
               tool: "load_history_entry",
@@ -2766,6 +2767,7 @@ export class WebMCPService extends Service {
               gql.tab.document.request = reqToLoad
               gql.tab.document.isDirty = false
               gql.tab.document.saveContext = undefined
+              gql.tab.document.inheritedProperties = undefined
             }
             this.activity.record({
               tool: "load_gql_history_entry",
