@@ -43,6 +43,7 @@ export const expectedRevisionSchema = {
 
 export const requestPatchSchema = z
   .object({
+    name: z.string().min(1).max(256).optional(),
     method: z
       .enum([
         "GET",
@@ -90,6 +91,11 @@ export const editRESTRequestInputSchema = {
       description:
         "Allow-listed draft fields to replace in the visible REST request.",
       properties: {
+        name: {
+          type: "string",
+          maxLength: 256,
+          description: "Name or title of the request/tab.",
+        },
         method: {
           type: "string",
           description: "HTTP method for the draft request.",
@@ -620,6 +626,153 @@ export const selectEnvironmentInputSchema = {
   additionalProperties: false,
 } as const
 
+export const createEnvironmentParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    name: z.string().trim().min(1).max(256),
+    scope: z.enum(["personal", "team"]).default("personal"),
+    variables: z
+      .array(
+        z.object({
+          key: z.string().trim().min(1).max(256),
+          value: z.string().max(8192),
+          secret: z.boolean().default(false),
+        })
+      )
+      .max(100)
+      .default([]),
+  })
+  .strict()
+
+export const createEnvironmentInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    name: {
+      type: "string",
+      minLength: 1,
+      maxLength: 256,
+      description: "Name of the new environment.",
+    },
+    scope: {
+      type: "string",
+      enum: ["personal", "team"],
+      default: "personal",
+      description: "Scope of the environment: 'personal' or 'team'.",
+    },
+    variables: {
+      type: "array",
+      maxItems: 100,
+      description: "Optional initial variables to populate in the environment.",
+      items: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            minLength: 1,
+            maxLength: 256,
+            description: "Variable name/key.",
+          },
+          value: {
+            type: "string",
+            maxLength: 8192,
+            description: "Variable value or secret credential.",
+          },
+          secret: {
+            type: "boolean",
+            default: false,
+            description: "Whether the variable is treated as a managed secret.",
+          },
+        },
+        required: ["key", "value"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["expectedRevision", "name"],
+  additionalProperties: false,
+} as const
+
+export const editEnvironmentVariablesParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    environmentHandle: z.string().min(1).max(128),
+    operations: z
+      .array(
+        z.discriminatedUnion("op", [
+          z.object({
+            op: z.literal("add"),
+            key: z.string().trim().min(1).max(256),
+            value: z.string().max(8192),
+            secret: z.boolean().default(false),
+          }),
+          z.object({
+            op: z.literal("update"),
+            key: z.string().trim().min(1).max(256),
+            value: z.string().max(8192),
+            secret: z.boolean().optional(),
+          }),
+          z.object({
+            op: z.literal("remove"),
+            key: z.string().trim().min(1).max(256),
+          }),
+        ])
+      )
+      .min(1)
+      .max(50),
+  })
+  .strict()
+
+export const editEnvironmentVariablesInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    environmentHandle: {
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+      description: "Opaque handle returned by list_environments.",
+    },
+    operations: {
+      type: "array",
+      minItems: 1,
+      maxItems: 50,
+      description:
+        "Batch mutation operations to perform on environment variables.",
+      items: {
+        type: "object",
+        properties: {
+          op: {
+            type: "string",
+            enum: ["add", "update", "remove"],
+            description: "The mutation operation to perform.",
+          },
+          key: {
+            type: "string",
+            minLength: 1,
+            maxLength: 256,
+            description: "Variable name/key.",
+          },
+          value: {
+            type: "string",
+            maxLength: 8192,
+            description: "Variable value (required for add and update).",
+          },
+          secret: {
+            type: "boolean",
+            description:
+              "Whether the variable is a secret. On update, cannot downgrade an existing secret to non-secret.",
+          },
+        },
+        required: ["op", "key"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["expectedRevision", "environmentHandle", "operations"],
+  additionalProperties: false,
+} as const
+
 const gqlHeader = z
   .object({
     key: z.string().max(256),
@@ -633,6 +786,7 @@ export const editGraphQLOperationParser = z
     expectedRevision: z.string().min(1).max(128),
     patch: z
       .object({
+        name: z.string().min(1).max(256).optional(),
         endpoint: z.string().max(8192).optional(),
         query: z.string().max(65536).optional(),
         variables: z.string().max(65536).optional(),
@@ -653,6 +807,11 @@ export const editGraphQLOperationInputSchema = {
     patch: {
       type: "object",
       properties: {
+        name: {
+          type: "string",
+          maxLength: 256,
+          description: "Name or title of the GraphQL request/tab.",
+        },
         endpoint: { type: "string", maxLength: 8192 },
         query: { type: "string", maxLength: 65536 },
         variables: { type: "string", maxLength: 65536 },

@@ -94,6 +94,10 @@ import {
   readRESTPayloadParser,
   selectEnvironmentInputSchema,
   selectEnvironmentParser,
+  createEnvironmentInputSchema,
+  createEnvironmentParser,
+  editEnvironmentVariablesInputSchema,
+  editEnvironmentVariablesParser,
   editGraphQLOperationInputSchema,
   editGraphQLOperationParser,
   graphqlPayloadInputSchema,
@@ -994,6 +998,32 @@ export class WebMCPService extends Service {
       ),
       this.adapter.register(
         {
+          name: "create_environment",
+          title: "Create an environment",
+          description:
+            "Create a personal or team environment with optional initial variables and secrets. Secrets and team environments require human confirmation.",
+          inputSchema: createEnvironmentInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) =>
+            this.createEnvironment(input, executionSignal),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_environment_variables",
+          title: "Edit environment variables and secrets",
+          description:
+            "Batch add, update, or remove variables and secrets in an environment using an opaque environment handle. Secret updates and team environments require human confirmation; secrets cannot be downgraded to non-secrets.",
+          inputSchema: editEnvironmentVariablesInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) =>
+            this.editEnvironmentVariables(input, executionSignal),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
           name: "inspect_rest_exchange",
           title: "Inspect current REST exchange",
           description:
@@ -1161,7 +1191,7 @@ export class WebMCPService extends Service {
           name: "edit_rest_request",
           title: "Edit current REST request",
           description:
-            "Apply an allow-listed revision-bound patch to the visible REST draft and return its updated unsaved state for request, URL, parameters, headers, and body fields.",
+            "Apply an allow-listed revision-bound patch to the visible REST draft and return its updated unsaved state for name, method, URL, parameters, headers, and body fields.",
           inputSchema: editRESTRequestInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
@@ -2134,7 +2164,7 @@ export class WebMCPService extends Service {
           name: "edit_graphql_operation",
           title: "Edit current GraphQL operation",
           description:
-            "Apply a bounded revision-bound patch to the visible GraphQL endpoint, document, variables, or headers without saving it.",
+            "Apply a bounded revision-bound patch to the visible GraphQL name, endpoint, document, variables, or headers without saving it.",
           inputSchema: editGraphQLOperationInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => this.editGraphQLOperation(input),
@@ -2879,6 +2909,8 @@ export class WebMCPService extends Service {
     }
     const original = cloneDeep(gql.tab.document.request)
     const candidate = { ...cloneDeep(original) }
+    if (parsed.data.patch.name !== undefined)
+      candidate.name = parsed.data.patch.name
     if (parsed.data.patch.endpoint !== undefined)
       candidate.url = parsed.data.patch.endpoint
     if (parsed.data.patch.query !== undefined)
@@ -3676,6 +3708,255 @@ export class WebMCPService extends Service {
     return this.result("app-context", { selected: true })
   }
 
+  private async createEnvironment(
+    input: Record<string, unknown>,
+    executionSignal?: AbortSignal
+  ) {
+    if (!this.validBoundary(input)) {
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    }
+    const parsed = createEnvironmentParser.safeParse(input)
+    if (!parsed.success) {
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    }
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (
+      !this.context.matches("app-context", parsed.data.expectedRevision) &&
+      !this.context.matches("rest-document", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The application context changed; inspect it again.",
+        "app-context",
+        true
+      )
+    }
+
+    const hasSecrets = parsed.data.variables.some((v) => v.secret)
+    const isTeam = parsed.data.scope === "team"
+    const currentEnvName = this.context.capture().environment.name
+    const workspaceType = this.context.capture().workspace.type
+
+    if (isTeam || hasSecrets) {
+      const approved = await this.approval.request(
+        {
+          action: isTeam
+            ? "CREATE team environment"
+            : "CREATE personal environment with secrets",
+          method: "CREATE",
+          target: parsed.data.name,
+          environment: currentEnvName,
+          workspace: workspaceType,
+          grantKey: `create-environment|${parsed.data.name}|${parsed.data.scope}|${workspaceType}`,
+          description: hasSecrets
+            ? `Create environment '${parsed.data.name}' containing secret variable(s)`
+            : `Create team environment '${parsed.data.name}' in team workspace`,
+        },
+        executionSignal ?? new AbortController().signal
+      )
+
+      if (!approved) {
+        this.activity.record({
+          tool: "create_environment",
+          outcome: "denied",
+          summary: `Denied creating environment '${parsed.data.name}'`,
+          revision: this.context.revision("app-context"),
+        })
+        return this.failure(
+          "APPROVAL_DENIED",
+          "The user rejected creating the environment.",
+          "app-context"
+        )
+      }
+    }
+
+    let created: {
+      id: string
+      name: string
+      handle: string
+      variableCount: number
+      secretVariableCount: number
+    }
+
+    if (parsed.data.scope === "personal") {
+      created = this.environments.createPersonal(
+        parsed.data.name,
+        parsed.data.variables
+      )
+    } else {
+      const res = await this.environments.createTeam(
+        parsed.data.name,
+        parsed.data.variables
+      )
+      if ("error" in res) {
+        if (res.error === "PERMISSION_DENIED") {
+          return this.failure(
+            "PERMISSION_DENIED",
+            "You do not have permission to create team environments.",
+            "app-context"
+          )
+        }
+        return this.failure(
+          "INVALID_INPUT",
+          `Failed to create team environment: ${res.error}`,
+          "app-context"
+        )
+      }
+      created = res
+    }
+
+    const resultingRevision = this.context.revision("app-context")
+    this.activity.record({
+      tool: "create_environment",
+      outcome: "changed",
+      summary: `Created ${parsed.data.scope} environment '${created.name}' with ${created.variableCount} variables`,
+      revision: resultingRevision,
+    })
+
+    return this.result("app-context", {
+      environmentHandle: created.handle,
+      name: this.redactor().scrub(created.name, 64),
+      scope: parsed.data.scope,
+      variableCount: created.variableCount,
+      secretVariableCount: created.secretVariableCount,
+      valuesOmitted: true,
+    })
+  }
+
+  private async editEnvironmentVariables(
+    input: Record<string, unknown>,
+    executionSignal?: AbortSignal
+  ) {
+    if (!this.validBoundary(input)) {
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    }
+    const parsed = editEnvironmentVariablesParser.safeParse(input)
+    if (!parsed.success) {
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    }
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (
+      !this.context.matches("app-context", parsed.data.expectedRevision) &&
+      !this.context.matches("rest-document", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The application context changed; inspect it again.",
+        "app-context",
+        true
+      )
+    }
+
+    const choice = await this.environments.resolveHandle(
+      parsed.data.environmentHandle
+    )
+    if (!choice || !choice.environment) {
+      return this.failure(
+        "ENVIRONMENT_NOT_FOUND",
+        "The environment handle is no longer available; list environments again.",
+        "app-context",
+        true
+      )
+    }
+
+    if (!choice.editable) {
+      return this.failure(
+        "PERMISSION_DENIED",
+        "You do not have permission to edit this environment.",
+        "app-context"
+      )
+    }
+
+    const hasSecretOps = parsed.data.operations.some(
+      (op) =>
+        (op.op === "add" && op.secret) ||
+        (op.op === "update" && op.secret) ||
+        (op.op === "update" &&
+          choice.environment?.variables.find((v) => v.key === op.key)?.secret)
+    )
+    const isTeam = choice.scope === "team"
+    const currentEnvName = this.context.capture().environment.name
+    const workspaceType = this.context.capture().workspace.type
+
+    if (isTeam || hasSecretOps) {
+      const keysAffected = parsed.data.operations.map((o) => o.key).join(", ")
+      const approved = await this.approval.request(
+        {
+          action: isTeam
+            ? "EDIT team environment variables"
+            : "EDIT environment secrets",
+          method: "UPDATE",
+          target: `${choice.environment.name} (${keysAffected})`,
+          environment: currentEnvName,
+          workspace: workspaceType,
+          grantKey: `edit-env-vars|${choice.environment.id}|${keysAffected}|${workspaceType}`,
+          description: isTeam
+            ? `Modify variables in team environment '${choice.environment.name}'`
+            : `Modify secret variable(s) in environment '${choice.environment.name}'`,
+        },
+        executionSignal ?? new AbortController().signal
+      )
+
+      if (!approved) {
+        this.activity.record({
+          tool: "edit_environment_variables",
+          outcome: "denied",
+          summary: `Denied editing variables in environment '${choice.environment.name}'`,
+          revision: this.context.revision("app-context"),
+        })
+        return this.failure(
+          "APPROVAL_DENIED",
+          "The user rejected editing the environment variables.",
+          "app-context"
+        )
+      }
+    }
+
+    const res = await this.environments.mutateVariables(
+      parsed.data.environmentHandle,
+      parsed.data.operations
+    )
+
+    if (!res.ok) {
+      if (res.code === "PERMISSION_DENIED") {
+        return this.failure("PERMISSION_DENIED", res.error, "app-context")
+      }
+      return this.failure("INVALID_INPUT", res.error, "app-context")
+    }
+
+    const resultingRevision = this.context.revision("app-context")
+    const envName = this.redactor().scrub(res.environmentName, 64)
+    this.activity.record(
+      {
+        tool: "edit_environment_variables",
+        outcome: "changed",
+        summary: `Updated variables [${res.updatedKeys.join(", ")}] in environment '${envName}'`,
+        revision: resultingRevision,
+      },
+      () => {
+        const undoResult = res.undo()
+        return typeof undoResult === "boolean" ? undoResult : true
+      }
+    )
+
+    return this.result("app-context", {
+      environmentHandle: parsed.data.environmentHandle,
+      environmentName: envName,
+      updatedKeys: res.updatedKeys.map((k) => this.redactor().scrub(k, 64)),
+      variableCount: res.variableCount,
+      secretVariableCount: res.secretVariableCount,
+      valuesOmitted: true,
+    })
+  }
+
   private async editRESTRequest(input: Record<string, unknown>) {
     if (!this.validBoundary(input)) {
       return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
@@ -3702,6 +3983,7 @@ export class WebMCPService extends Service {
     const originalDirty = rest.tab.document.isDirty
     const candidate = cloneDeep(rest.tab.document.request)
     const patch = parsed.data.patch as RESTRequestPatch
+    if (patch.name !== undefined) candidate.name = patch.name
     if (patch.method !== undefined) candidate.method = patch.method
     if (patch.endpoint !== undefined) candidate.endpoint = patch.endpoint
     if (patch.params !== undefined) {

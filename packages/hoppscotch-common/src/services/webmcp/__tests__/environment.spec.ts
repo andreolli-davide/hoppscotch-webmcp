@@ -106,4 +106,114 @@ describe("WebMCP environment context", () => {
     ])
     expect(JSON.stringify(inspected)).not.toContain("managed-secret")
   })
+
+  it("creates personal environment with plain and secret variables", () => {
+    const container = new TestContainer()
+    const service = container.bind(WebMCPEnvironmentService)
+    const secretService = container.bind(SecretEnvironmentService)
+
+    const created = service.createPersonal("Staging", [
+      { key: "BASE_URL", value: "https://staging.api.com", secret: false },
+      { key: "API_KEY", value: "staging-secret-key", secret: true },
+    ])
+
+    expect(created.name).toBe("Staging")
+    expect(created.variableCount).toBe(2)
+    expect(created.secretVariableCount).toBe(1)
+    expect(created.handle).toBeTruthy()
+
+    // Verify environmentsStore was updated
+    const envInStore = environmentsStore.value.environments.find(
+      (e) => e.id === created.id
+    )
+    expect(envInStore).toBeTruthy()
+    expect(envInStore?.name).toBe("Staging")
+    // Non-secret variable has initialValue on wire
+    expect(envInStore?.variables[0].key).toBe("BASE_URL")
+    expect(envInStore?.variables[0].initialValue).toBe(
+      "https://staging.api.com"
+    )
+    // Secret variable has blank initialValue on wire
+    expect(envInStore?.variables[1].key).toBe("API_KEY")
+    expect(envInStore?.variables[1].initialValue).toBe("")
+    expect(envInStore?.variables[1].secret).toBe(true)
+
+    // Secret is stored in SecretEnvironmentService
+    const storedSecret = secretService.getSecretEnvironmentVariableValue(
+      created.id,
+      1
+    )
+    expect(storedSecret?.value).toBe("staging-secret-key")
+  })
+
+  it("mutates variables with add, update, and remove operations and supports undo", async () => {
+    const container = new TestContainer()
+    const service = container.bind(WebMCPEnvironmentService)
+    const secretService = container.bind(SecretEnvironmentService)
+
+    const listed = await service.list()
+    const localChoice = listed.environments.find(({ name }) => name === "Local")
+    expect(localChoice).toBeTruthy()
+
+    // Mutate variables: add NEW_VAR, update API_TOKEN, remove IGNORED_SECRET
+    const mutateResult = await service.mutateVariables(localChoice!.handle, [
+      { op: "add", key: "NEW_VAR", value: "https://new.test", secret: false },
+      {
+        op: "update",
+        key: "API_TOKEN",
+        value: "updated-token-value",
+        secret: true,
+      },
+      { op: "remove", key: "IGNORED_SECRET" },
+    ])
+
+    expect(mutateResult.ok).toBe(true)
+    if (!mutateResult.ok) return
+
+    expect(mutateResult.updatedKeys).toEqual([
+      "NEW_VAR",
+      "API_TOKEN",
+      "IGNORED_SECRET",
+    ])
+    expect(mutateResult.variableCount).toBe(2)
+    expect(mutateResult.secretVariableCount).toBe(1)
+
+    // Check store state after mutation
+    const currentEnv = environmentsStore.value.environments[0]
+    expect(currentEnv.variables.map((v) => v.key)).toEqual([
+      "API_TOKEN",
+      "NEW_VAR",
+    ])
+    expect(
+      secretService.getSecretEnvironmentVariableValue(environment.id, 0)?.value
+    ).toBe("updated-token-value")
+
+    // Test Undo
+    const undoSuccess = mutateResult.undo()
+    expect(undoSuccess).toBe(true)
+
+    // Store state restored
+    const restoredEnv = environmentsStore.value.environments[0]
+    expect(restoredEnv.variables.map((v) => v.key)).toEqual([
+      "IGNORED_SECRET",
+      "API_TOKEN",
+    ])
+  })
+
+  it("blocks secret downgrade from secret: true to secret: false", async () => {
+    const container = new TestContainer()
+    const service = container.bind(WebMCPEnvironmentService)
+
+    const listed = await service.list()
+    const localChoice = listed.environments.find(({ name }) => name === "Local")
+
+    const res = await service.mutateVariables(localChoice!.handle, [
+      { op: "update", key: "API_TOKEN", value: "new-val", secret: false },
+    ])
+
+    expect(res.ok).toBe(false)
+    if (!res.ok) {
+      expect(res.error).toContain("Cannot convert secret variable")
+    }
+  })
 })

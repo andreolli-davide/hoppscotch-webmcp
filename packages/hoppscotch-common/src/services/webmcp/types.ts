@@ -24,6 +24,7 @@ export type WebMCPErrorCode =
   | "EXECUTION_FAILED"
   | "DIRTY_TAB_UNSAVED_CHANGES"
   | "DURABLE_OPS_DISABLED"
+  | "PERMISSION_DENIED"
 
 /** A bounded, redacted diagnostic. Locations are source-relative when present. */
 export type WebMCPDiagnostic = {
@@ -85,6 +86,7 @@ export type WebMCPToolResult<T extends object> =
   | WebMCPToolFailure
 
 export type RESTRequestPatch = {
+  name?: string
   method?:
     | "GET"
     | "POST"

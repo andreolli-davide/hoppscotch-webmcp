@@ -34,6 +34,7 @@ describe("WebMCP REST input schemas", () => {
       editRESTRequestParser.safeParse({
         expectedRevision: "rest-document:4",
         patch: {
+          name: "Get User Orders",
           method: "POST",
           endpoint: "https://example.test/orders",
           headers: [
@@ -53,6 +54,10 @@ describe("WebMCP REST input schemas", () => {
     expect(
       requestPatchSchema.safeParse({ endpoint: "x".repeat(8193) }).success
     ).toBe(false)
+    expect(
+      requestPatchSchema.safeParse({ name: "x".repeat(257) }).success
+    ).toBe(false)
+    expect(requestPatchSchema.safeParse({ name: "" }).success).toBe(false)
     expect(
       requestPatchSchema.safeParse({
         headers: [{ key: "x", value: "y", active: true, secret: true }],
@@ -144,9 +149,25 @@ describe("WebMCP GraphQL and realtime input schemas", () => {
     expect(
       editGraphQLOperationParser.safeParse({
         expectedRevision: "graphql-document:2",
-        patch: { query: "query Viewer { viewer { id } }", variables: "{}" },
+        patch: {
+          name: "Viewer Query",
+          query: "query Viewer { viewer { id } }",
+          variables: "{}",
+        },
       }).success
     ).toBe(true)
+    expect(
+      editGraphQLOperationParser.safeParse({
+        expectedRevision: "graphql-document:2",
+        patch: { name: "x".repeat(257) },
+      }).success
+    ).toBe(false)
+    expect(
+      editGraphQLOperationParser.safeParse({
+        expectedRevision: "graphql-document:2",
+        patch: { name: "" },
+      }).success
+    ).toBe(false)
     expect(
       editGraphQLOperationParser.safeParse({
         expectedRevision: "graphql-document:2",
