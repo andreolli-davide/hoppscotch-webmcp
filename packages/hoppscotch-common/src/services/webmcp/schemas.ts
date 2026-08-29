@@ -34,7 +34,7 @@ export const expectedRevisionSchema = {
       minLength: 1,
       maxLength: 128,
       description:
-        "Revision token returned by the latest inspection for the active REST document.",
+        "Revision token returned by the latest inspection for the active document or session.",
     },
   },
   required: ["expectedRevision"],
