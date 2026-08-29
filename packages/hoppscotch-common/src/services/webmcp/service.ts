@@ -3,6 +3,7 @@ import {
   HoppGQLRequest,
   HoppRESTRequest,
   getDefaultGQLRequest,
+  makeCollection,
 } from "@hoppscotch/data"
 import { Service } from "dioc"
 import { cloneDeep } from "lodash-es"
@@ -34,6 +35,8 @@ import {
   editGraphqlRequest,
   removeRESTCollection,
   removeRESTFolder,
+  addRESTCollection,
+  addRESTFolder,
   cascadeParentCollectionForProperties,
 } from "~/newstore/collections"
 import { restHistoryStore, graphqlHistoryStore } from "~/newstore/history"
@@ -142,6 +145,10 @@ import {
   deleteFolderParser,
   deleteEnvironmentInputSchema,
   deleteEnvironmentParser,
+  createCollectionInputSchema,
+  createCollectionParser,
+  createFolderInputSchema,
+  createFolderParser,
   getSkillInputSchema,
   getSkillParser,
 } from "./schemas"
@@ -830,6 +837,247 @@ export class WebMCPService extends Service {
             return this.result("app-context", {
               success: true,
               deletedFolder: deletedName,
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "create_collection",
+          title: "Create collection",
+          description:
+            "Create a new top-level REST collection. Use this when the collection list is empty or when the user asks to create a collection before saving requests.",
+          inputSchema: createCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: false },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = createCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const envName = this.context.capture().environment.name
+            const workspaceType = this.context.capture().workspace.type
+
+            const approved = await this.approval.request(
+              {
+                action: "CREATE collection",
+                method: "POST",
+                target: parsed.data.name,
+                environment: envName,
+                workspace: workspaceType,
+                allowSession: true,
+                grantKey: `create-collection|${envName}|${workspaceType}`,
+              },
+              executionSignal
+            )
+
+            if (!approved) {
+              this.activity.record({
+                tool: "create_collection",
+                outcome: "denied",
+                summary: `Denied creating collection '${parsed.data.name}'`,
+                revision: this.context.revision("app-context"),
+              })
+              return this.failure(
+                "APPROVAL_DENIED",
+                "The user rejected creating the collection.",
+                "app-context"
+              )
+            }
+
+            const newCollection = makeCollection({
+              name: parsed.data.name,
+              folders: [],
+              requests: [],
+              headers: [],
+              variables: [],
+              description: null,
+              preRequestScript: "",
+              testScript: "",
+              auth: { authType: "inherit", authActive: false },
+            })
+            addRESTCollection(newCollection)
+
+            const newIndex = restCollectionStore.value.state.length - 1
+
+            const activityId = this.activity.record(
+              {
+                tool: "create_collection",
+                outcome: "changed",
+                summary: `Created collection '${parsed.data.name}' at path ${newIndex}`,
+                revision: this.context.revision("app-context"),
+              },
+              () => {
+                removeRESTCollection(
+                  newIndex,
+                  newCollection._ref_id || newCollection.id
+                )
+                return true
+              }
+            )
+            void activityId
+
+            return this.result("app-context", {
+              success: true,
+              collectionPath: String(newIndex),
+              name: parsed.data.name,
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "create_folder",
+          title: "Create collection folder",
+          description:
+            "Create a new subfolder inside an existing collection or folder. The new folder's path will be collectionPath/N where N is the appended index.",
+          inputSchema: createFolderInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: false },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = createFolderParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const pathSegments = parsed.data.collectionPath
+              .split("/")
+              .map((x) => parseInt(x, 10))
+            if (
+              pathSegments.some((n) => isNaN(n) || n < 0) ||
+              !/^\d+(\/\d+)*$/.test(parsed.data.collectionPath)
+            ) {
+              return this.failure(
+                "INVALID_INPUT",
+                "Collection path must be a numeric index path (e.g. '0' or '0/1').",
+                "app-context"
+              )
+            }
+
+            const parent = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              pathSegments
+            )
+            if (!parent) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Collection/folder at path ${parsed.data.collectionPath} not found.`,
+                "app-context"
+              )
+            }
+
+            const envName = this.context.capture().environment.name
+            const workspaceType = this.context.capture().workspace.type
+
+            const approved = await this.approval.request(
+              {
+                action: "CREATE folder",
+                method: "POST",
+                target: `${parsed.data.name} inside ${parent.name}`,
+                environment: envName,
+                workspace: workspaceType,
+                allowSession: true,
+                grantKey: `create-folder|${envName}|${workspaceType}`,
+              },
+              executionSignal
+            )
+
+            if (!approved) {
+              this.activity.record({
+                tool: "create_folder",
+                outcome: "denied",
+                summary: `Denied creating folder '${parsed.data.name}' in '${parent.name}'`,
+                revision: this.context.revision("app-context"),
+              })
+              return this.failure(
+                "APPROVAL_DENIED",
+                "The user rejected creating the folder.",
+                "app-context"
+              )
+            }
+
+            addRESTFolder(parsed.data.name, parsed.data.collectionPath)
+
+            const updatedParent = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              pathSegments
+            )
+            const newFolderIndex = updatedParent
+              ? updatedParent.folders.length - 1
+              : 0
+            const newFolderPath = `${parsed.data.collectionPath}/${newFolderIndex}`
+
+            const activityId = this.activity.record(
+              {
+                tool: "create_folder",
+                outcome: "changed",
+                summary: `Created folder '${parsed.data.name}' at path ${newFolderPath}`,
+                revision: this.context.revision("app-context"),
+              },
+              () => {
+                removeRESTFolder(newFolderPath)
+                return true
+              }
+            )
+            void activityId
+
+            return this.result("app-context", {
+              success: true,
+              folderPath: newFolderPath,
+              name: parsed.data.name,
             })
           },
         },

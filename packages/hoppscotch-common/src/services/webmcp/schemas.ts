@@ -1351,6 +1351,58 @@ export const deleteEnvironmentInputSchema = {
   additionalProperties: false,
 } as const
 
+export const createCollectionParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    name: z.string().trim().min(1).max(256),
+  })
+  .strict()
+
+export const createCollectionInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    name: {
+      type: "string",
+      minLength: 1,
+      maxLength: 256,
+      description: "Name for the new top-level collection.",
+    },
+  },
+  required: ["expectedRevision", "name"],
+  additionalProperties: false,
+} as const
+
+export const createFolderParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    collectionPath: z.string().min(1).max(256),
+    name: z.string().trim().min(1).max(256),
+  })
+  .strict()
+
+export const createFolderInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    collectionPath: {
+      type: "string",
+      minLength: 1,
+      maxLength: 256,
+      description:
+        "Path of the parent collection or folder (e.g. '0' or '0/1') where the new subfolder will be created.",
+    },
+    name: {
+      type: "string",
+      minLength: 1,
+      maxLength: 256,
+      description: "Name for the new subfolder.",
+    },
+  },
+  required: ["expectedRevision", "collectionPath", "name"],
+  additionalProperties: false,
+} as const
+
 export const getSkillParser = z
   .object({
     name: z.string().max(128).optional(),
