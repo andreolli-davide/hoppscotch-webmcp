@@ -623,6 +623,14 @@ export class WebMCPService extends Service {
               )
             }
 
+            if (!/^\d+$/.test(parsed.data.collectionPath)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "Collection path must be a top-level collection index (e.g. '0'). For subfolders, use delete_folder.",
+                "app-context"
+              )
+            }
+
             const pathIndex = parseInt(parsed.data.collectionPath, 10)
             const collection = restCollectionStore.value.state[pathIndex]
             if (!collection) {
@@ -728,9 +736,24 @@ export class WebMCPService extends Service {
               )
             }
 
+            const pathSegments = parsed.data.folderPath
+              .split("/")
+              .map((x) => parseInt(x, 10))
+            if (
+              pathSegments.length < 2 ||
+              pathSegments.some((n) => isNaN(n) || n < 0) ||
+              !/^\d+(\/\d+)+$/.test(parsed.data.folderPath)
+            ) {
+              return this.failure(
+                "INVALID_INPUT",
+                "Folder path must specify both parent collection and subfolder index (e.g. '0/0').",
+                "app-context"
+              )
+            }
+
             const target = navigateToFolderWithIndexPath(
               restCollectionStore.value.state,
-              parsed.data.folderPath.split("/").map((x) => parseInt(x, 10))
+              pathSegments
             )
             if (!target) {
               return this.failure(

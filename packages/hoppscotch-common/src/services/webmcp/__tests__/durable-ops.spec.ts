@@ -64,6 +64,10 @@ describe("WebMCP Durable / Destructive Operations", () => {
     const correctConfirmation = "Temporary API"
     expect(target.name === correctConfirmation).toBe(true)
 
+    // Path format checks
+    expect(/^\d+$/.test("0")).toBe(true)
+    expect(/^\d+$/.test("0/1")).toBe(false)
+
     // Execute deletion
     removeRESTCollection(1)
     expect(restCollectionStore.value.state.length).toBe(1)
