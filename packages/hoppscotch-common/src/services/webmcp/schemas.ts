@@ -699,7 +699,44 @@ export const editGraphQLVariablesInputSchema = {
   type: "object",
   properties: {
     expectedRevision: revisionProperty,
-    operation: { type: "object" },
+    operation: {
+      oneOf: [
+        {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["replace_document"] },
+            document: {
+              description: "Complete replacement variables value or object.",
+            },
+          },
+          required: ["kind", "document"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["json_pointer"] },
+            operations: {
+              type: "array",
+              minItems: 1,
+              maxItems: 50,
+              items: {
+                type: "object",
+                properties: {
+                  op: { type: "string", enum: ["add", "replace", "remove"] },
+                  path: { type: "string", maxLength: 2048 },
+                  value: {},
+                },
+                required: ["op", "path"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["kind", "operations"],
+          additionalProperties: false,
+        },
+      ],
+    },
   },
   required: ["expectedRevision", "operation"],
   additionalProperties: false,
