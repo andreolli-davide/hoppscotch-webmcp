@@ -909,6 +909,7 @@ export class WebMCPService extends Service {
             deleteEnvironment(parsed.data.environmentIndex, targetEnv.id)
             if (targetEnv.id) {
               this.currentValues.deleteEnvironment(targetEnv.id)
+              this.secrets.deleteSecretEnvironment(targetEnv.id)
             }
 
             this.activity.record({

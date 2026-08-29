@@ -16,6 +16,7 @@ import {
   replaceEnvironments,
   deleteEnvironment,
 } from "~/newstore/environments"
+import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { AgentActionApprovalService } from "../human-control"
 
 setPlatformDef({
@@ -136,6 +137,15 @@ describe("WebMCP Durable / Destructive Operations", () => {
     deleteEnvironment(0, envTarget.id)
     expect(environmentsStore.value.environments.length).toBe(1)
     expect(environmentsStore.value.environments[0].name).toBe("Production")
+
+    const container = new Container()
+    const secrets = container.bind(SecretEnvironmentService)
+    secrets.secretEnvironments.set("env-1", [
+      { key: "API_KEY", value: "secret123", varIndex: 0 },
+    ])
+    expect(secrets.secretEnvironments.has("env-1")).toBe(true)
+    secrets.deleteSecretEnvironment("env-1")
+    expect(secrets.secretEnvironments.has("env-1")).toBe(false)
   })
 
   it("requires step-up human approval for durable operations", async () => {
