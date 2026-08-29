@@ -63,6 +63,8 @@ export const applyJSONPointerOperations = (
   for (const operation of operations) {
     if (!operation.path.startsWith("/"))
       throw new Error("JSON Pointer paths must start with '/'.")
+    if (operation.path === "/")
+      throw new Error("Replacing the document requires replace_document.")
     const segments = operation.path.slice(1).split("/").map(decode)
     if (
       segments.some(
@@ -88,6 +90,8 @@ export const applyJSONPointerOperations = (
     }
     const key = segments.at(-1)!
     if (Array.isArray(target)) {
+      if (key !== "-" && !/^(0|[1-9]\d*)$/.test(key))
+        throw new Error("Invalid JSON Pointer array index.")
       const index = key === "-" ? target.length : Number(key)
       if (!Number.isInteger(index) || index < 0 || index > target.length)
         throw new Error("Invalid JSON Pointer array index.")

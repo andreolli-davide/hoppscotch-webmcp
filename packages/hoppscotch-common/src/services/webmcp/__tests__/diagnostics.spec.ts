@@ -23,4 +23,19 @@ describe("WebMCP structured diagnostics helpers", () => {
       ])
     ).toThrow("Unsafe JSON Pointer path")
   })
+
+  it("refuses root replacement and invalid array index format", () => {
+    expect(() =>
+      applyJSONPointerOperations({ a: 1 }, [
+        { op: "replace", path: "/", value: { b: 2 } },
+      ])
+    ).toThrow("Replacing the document requires replace_document")
+
+    expect(() =>
+      applyJSONPointerOperations({ arr: [1, 2] }, [
+        { op: "replace", path: "/arr/01", value: 3 },
+      ])
+    ).toThrow("Invalid JSON Pointer array index")
+  })
 })
+
