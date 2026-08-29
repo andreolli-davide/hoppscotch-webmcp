@@ -50,7 +50,7 @@ function delay(timeMS: number) {
 export class TestRunnerService extends Service {
   public static readonly ID = "TEST_RUNNER_SERVICE"
 
-  public runTests(
+  public async runTests(
     tab: Ref<HoppTab<HoppTestRunnerDocument>>,
     collection: HoppCollection,
     options: TestRunnerOptions,
@@ -73,35 +73,34 @@ export class TestRunnerService extends Service {
       testScript: collection.testScript ?? "",
     }
 
-    this.runTestCollection(
-      tab,
-      collection,
-      options,
-      [],
-      undefined,
-      undefined,
-      [],
-      undefined,
-      ancestorPreRequestScripts,
-      ancestorTestScripts
-    )
-      .then(() => {
+    try {
+      await this.runTestCollection(
+        tab,
+        collection,
+        options,
+        [],
+        undefined,
+        undefined,
+        [],
+        undefined,
+        ancestorPreRequestScripts,
+        ancestorTestScripts
+      )
+      tab.value.document.status = "stopped"
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "Test execution stopped"
+      ) {
         tab.value.document.status = "stopped"
-      })
-      .catch((error) => {
-        if (
-          error instanceof Error &&
-          error.message === "Test execution stopped"
-        ) {
-          tab.value.document.status = "stopped"
-        } else {
-          tab.value.document.status = "error"
-          console.error("Test runner failed:", error)
-        }
-      })
-      .finally(() => {
-        tab.value.document.status = "stopped"
-      })
+      } else {
+        tab.value.document.status = "error"
+        console.error("Test runner failed:", error)
+        throw error
+      }
+    } finally {
+      tab.value.document.status = "stopped"
+    }
   }
 
   private async runTestCollection(
@@ -364,6 +363,8 @@ export class TestRunnerService extends Service {
           testResults: testResult,
           response: options.persistResponses ? response : null,
           isLoading: false,
+          passedTests: passed,
+          failedTests: failed,
         })
 
         if (response.type === "success" || response.type === "fail") {

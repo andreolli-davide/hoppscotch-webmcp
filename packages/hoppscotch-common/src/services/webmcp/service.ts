@@ -1,11 +1,12 @@
 import {
+  HoppCollection,
   HoppGQLRequest,
   HoppRESTRequest,
   getDefaultGQLRequest,
 } from "@hoppscotch/data"
 import { Service } from "dioc"
 import { cloneDeep } from "lodash-es"
-import { computed, Ref, watch } from "vue"
+import { computed, ref, Ref, watch } from "vue"
 import { Router } from "vue-router"
 
 import {
@@ -17,11 +18,16 @@ import { GQLTabService } from "~/services/tab/graphql"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { WorkspaceService } from "~/services/workspace.service"
+import {
+  TestRunnerService,
+  TestRunnerRequest,
+} from "~/services/test-runner/test-runner.service"
 import { getDefaultRESTRequest } from "~/helpers/rest/default"
 import {
   restCollectionStore,
   graphqlCollectionStore,
   navigateToFolderWithIndexPath,
+  getRESTCollectionByRefId,
   saveRESTRequestAs,
   editRESTRequest,
   saveGraphqlRequestAs,
@@ -33,7 +39,10 @@ import {
   graphqlHistoryStore,
 } from "~/newstore/history"
 import { HoppTab } from "~/services/tab"
-import { HoppRequestDocument } from "~/helpers/rest/document"
+import {
+  HoppRequestDocument,
+  HoppTestRunnerDocument,
+} from "~/helpers/rest/document"
 import { HoppGQLDocument } from "~/helpers/graphql/document"
 import { connection, gqlMessageEvent } from "~/helpers/graphql/connection"
 import { GQLRequestExecutionService } from "~/services/graphql-execution.service"
@@ -119,6 +128,8 @@ import {
   loadHistoryEntryParser,
   switchWorkspaceInputSchema,
   switchWorkspaceParser,
+  runCollectionInputSchema,
+  runCollectionParser,
 } from "./schemas"
 import {
   applyJSONPointerOperations,
@@ -163,6 +174,55 @@ const safeTarget = (endpoint: string) => {
   }
 }
 
+const countCollectionRequests = (collection: HoppCollection): number => {
+  let count = collection.requests.length
+  for (const folder of collection.folders) {
+    count += countCollectionRequests(folder)
+  }
+  return count
+}
+
+const extractRunnerResults = (
+  collection: HoppCollection,
+  redactor: SecretRedactor,
+  results: Array<{
+    name: string
+    method: string
+    endpoint: string
+    statusCode: number | null
+    duration: number | null
+    passedTests: number
+    failedTests: number
+    error?: string
+  }> = []
+) => {
+  for (const request of collection.requests as TestRunnerRequest[]) {
+    if (results.length >= 50) break
+    const response = request.response
+    const statusCode =
+      response && "status" in response ? response.status : null
+    const duration =
+      response && "meta" in response && response.meta?.responseDuration
+        ? response.meta.responseDuration
+        : null
+    results.push({
+      name: redactor.scrub(request.name || "Untitled", 64),
+      method: request.method,
+      endpoint: redactor.scrub(request.endpoint || "", 128),
+      statusCode,
+      duration,
+      passedTests: request.passedTests ?? 0,
+      failedTests: request.failedTests ?? 0,
+      error: request.error ? redactor.scrub(request.error, 128) : undefined,
+    })
+  }
+  for (const folder of collection.folders) {
+    if (results.length >= 50) break
+    extractRunnerResults(folder, redactor, results)
+  }
+  return results
+}
+
 export class WebMCPService extends Service {
   public static readonly ID = "WEBMCP_SERVICE"
 
@@ -175,6 +235,7 @@ export class WebMCPService extends Service {
   private readonly interceptor = this.bind(KernelInterceptorService)
   private readonly secrets = this.bind(SecretEnvironmentService)
   private readonly execution = this.bind(RESTRequestExecutionService)
+  private readonly testRunner = this.bind(TestRunnerService)
   private readonly gqlExecution = this.bind(GQLRequestExecutionService)
   private readonly realtime = this.bind(RealtimeSessionService)
   private readonly environments = this.bind(WebMCPEnvironmentService)
@@ -1304,6 +1365,248 @@ export class WebMCPService extends Service {
               revision: this.context.revision("rest-document"),
             })
             return this.observation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "run_collection",
+          title: "Run REST collection",
+          description:
+            "Run all requests in a REST collection or folder subtree as an automated test run with approval and cancellation support.",
+          inputSchema: runCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal }) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = runCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              ) &&
+              !this.context.matches("app-context", parsed.data.expectedRevision)
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            let collection: HoppCollection | undefined
+            if (parsed.data.collectionPath) {
+              collection =
+                navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  parsed.data.collectionPath
+                    .split("/")
+                    .map((x) => parseInt(x, 10))
+                ) ?? undefined
+            } else if (parsed.data.collectionID) {
+              collection =
+                (await getRESTCollectionByRefId(parsed.data.collectionID)) ??
+                undefined
+            } else {
+              collection = restCollectionStore.value.state[0]
+            }
+
+            if (!collection) {
+              return this.failure(
+                "INVALID_INPUT",
+                "Collection not found.",
+                "rest-document"
+              )
+            }
+
+            const totalReqs = countCollectionRequests(collection)
+            if (totalReqs === 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The collection contains no requests to run.",
+                "rest-document"
+              )
+            }
+
+            const envName = this.context.capture().environment.name
+            const workspaceType = this.context.capture().workspace.type
+
+            const approved = await this.approval.request(
+              {
+                action: "Run REST collection",
+                method: "POST",
+                target: `${collection.name} (${totalReqs} requests)`,
+                environment: envName,
+                workspace: workspaceType,
+                grantKey: `run-collection|${collection.name}|${envName}|${workspaceType}`,
+              },
+              signal
+            )
+
+            if (!approved) {
+              this.activity.record({
+                tool: "run_collection",
+                outcome: "denied",
+                summary: `Denied running collection '${collection.name}'`,
+                revision: this.context.revision("rest-document"),
+              })
+              return this.failure(
+                "APPROVAL_DENIED",
+                "The user rejected running the collection.",
+                "rest-document"
+              )
+            }
+
+            const stopRef = ref(false)
+            const abortHandler = () => {
+              stopRef.value = true
+            }
+            if (signal.aborted) {
+              stopRef.value = true
+            } else {
+              signal.addEventListener("abort", abortHandler, {
+                once: true,
+              })
+            }
+
+            const runnerDoc: HoppTestRunnerDocument = {
+              type: "test-runner",
+              collectionType: "my-collections",
+              collectionID: collection._ref_id || collection.id || "",
+              collection: cloneDeep(collection),
+              isDirty: false,
+              config: {
+                iterations: 1,
+                delay: parsed.data.delay,
+                stopOnError: parsed.data.stopOnError,
+                persistResponses: parsed.data.persistResponses,
+                keepVariableValues: parsed.data.keepVariableValues,
+              },
+              status: "idle",
+              request: null,
+              testRunnerMeta: {
+                completedRequests: 0,
+                totalRequests: totalReqs,
+                totalTime: 0,
+                failedTests: 0,
+                passedTests: 0,
+                totalTests: 0,
+              },
+            }
+
+            const runnerTabRef = ref<HoppTab<HoppTestRunnerDocument>>({
+              id: "webmcp-runner-tab",
+              document: runnerDoc,
+            })
+
+            try {
+              await this.testRunner.runTests(runnerTabRef, collection, {
+                ...runnerDoc.config,
+                stopRef,
+              })
+            } catch (err) {
+              if (
+                !(
+                  err instanceof Error &&
+                  err.message === "Test execution stopped"
+                )
+              ) {
+                console.error("Collection runner error:", err)
+              }
+            } finally {
+              signal.removeEventListener("abort", abortHandler)
+            }
+
+            const redactor = this.redactor()
+            const results = extractRunnerResults(
+              runnerTabRef.value.document.resultCollection ?? collection,
+              redactor
+            )
+
+            const meta = runnerTabRef.value.document.testRunnerMeta
+            const outcomeStatus = stopRef.value
+              ? "stopped"
+              : runnerTabRef.value.document.status
+
+            this.activity.record({
+              tool: "run_collection",
+              outcome: "executed",
+              summary: `Ran collection '${collection.name}': ${meta.completedRequests}/${totalReqs} completed (${meta.passedTests} passed, ${meta.failedTests} failed)`,
+              revision: this.context.revision("rest-document"),
+            })
+
+            return this.result("rest-document", {
+              summary: {
+                status: outcomeStatus,
+                collectionName: redactor.scrub(collection.name, 64),
+                metrics: {
+                  totalRequests: totalReqs,
+                  completedRequests: meta.completedRequests,
+                  passedTests: meta.passedTests,
+                  failedTests: meta.failedTests,
+                  totalTime: meta.totalTime,
+                },
+                results,
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "inspect_collection_runner",
+          title: "Inspect collection runner state",
+          description: "Inspect the current test runner status and metrics.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const runnerTab = this.restTabs
+              .getTabs()
+              .find((t) => t.document.type === "test-runner") as
+              | HoppTab<HoppTestRunnerDocument>
+              | undefined
+
+            if (!runnerTab) {
+              return this.result("rest-document", {
+                active: false,
+                message: "No test runner tab is currently open.",
+              })
+            }
+
+            const redactor = this.redactor()
+            return this.result("rest-document", {
+              active: true,
+              status: runnerTab.document.status,
+              collectionName: redactor.scrub(
+                runnerTab.document.collection.name,
+                64
+              ),
+              metrics: runnerTab.document.testRunnerMeta,
+              config: runnerTab.document.config,
+            })
           },
         },
         signal

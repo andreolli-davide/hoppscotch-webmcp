@@ -1070,3 +1070,31 @@ export const switchWorkspaceInputSchema = {
   required: ["expectedRevision", "workspaceID"],
   additionalProperties: false,
 } as const
+
+export const runCollectionParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    collectionPath: z.string().max(256).optional(),
+    collectionID: z.string().max(256).optional(),
+    delay: z.number().int().min(0).max(10000).default(0),
+    stopOnError: z.boolean().default(false),
+    persistResponses: z.boolean().default(false),
+    keepVariableValues: z.boolean().default(true),
+  })
+  .strict()
+
+export const runCollectionInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    collectionPath: { type: "string", maxLength: 256 },
+    collectionID: { type: "string", maxLength: 256 },
+    delay: { type: "integer", minimum: 0, maximum: 10000, default: 0 },
+    stopOnError: { type: "boolean", default: false },
+    persistResponses: { type: "boolean", default: false },
+    keepVariableValues: { type: "boolean", default: true },
+  },
+  required: ["expectedRevision"],
+  additionalProperties: false,
+} as const
+

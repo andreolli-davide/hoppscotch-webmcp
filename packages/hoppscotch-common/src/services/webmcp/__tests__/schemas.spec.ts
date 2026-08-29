@@ -22,6 +22,7 @@ import {
   listHistoryParser,
   loadHistoryEntryParser,
   switchWorkspaceParser,
+  runCollectionParser,
 } from "../schemas"
 
 describe("WebMCP REST input schemas", () => {
@@ -307,6 +308,26 @@ describe("WebMCP Live Artifact input schemas", () => {
       }).success
     ).toBe(true)
     expect(switchWorkspaceParser.safeParse({}).success).toBe(false)
+  })
+
+  it("validates collection runner parameters", () => {
+    expect(
+      runCollectionParser.safeParse({
+        expectedRevision: "rest-document:1",
+        collectionPath: "0",
+        delay: 500,
+        stopOnError: true,
+        persistResponses: false,
+        keepVariableValues: true,
+      }).success
+    ).toBe(true)
+
+    expect(
+      runCollectionParser.safeParse({
+        expectedRevision: "rest-document:1",
+        delay: 15000, // exceeds max 10000
+      }).success
+    ).toBe(false)
   })
 })
 
