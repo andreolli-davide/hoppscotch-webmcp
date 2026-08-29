@@ -598,42 +598,104 @@ export const graphqlSchemaSearchInputSchema = {
   additionalProperties: false,
 } as const
 
-export const editRealtimeSessionParser = z
-  .object({
-    expectedRevision: z.string().min(1).max(128),
-    patch: z
-      .object({
-        endpoint: z.string().max(8192).optional(),
-        protocols: z
-          .array(
-            z
-              .object({ value: z.string().max(256), active: z.boolean() })
-              .strict()
-          )
-          .max(32)
-          .optional(),
-        path: z.string().max(512).optional(),
-        version: z.enum(["v2", "v3", "v4"]).optional(),
-        eventType: z.string().max(256).optional(),
-        clientID: z.string().max(256).optional(),
-      })
-      .strict()
-      .refine(
-        (patch) => Object.keys(patch).length > 0,
-        "Patch cannot be empty"
-      ),
-  })
-  .strict()
+type RealtimeSchemaMode = "websocket" | "socketio" | "sse" | "mqtt"
 
-export const editRealtimeSessionInputSchema = {
+const nonEmptyPatch = <T extends z.ZodRawShape>(shape: T) =>
+  z
+    .object(shape)
+    .strict()
+    .refine((patch) => Object.keys(patch).length > 0, "Patch cannot be empty")
+
+const realtimePatchParsers = {
+  websocket: nonEmptyPatch({
+    endpoint: z.string().max(8192).optional(),
+    protocols: z
+      .array(
+        z.object({ value: z.string().max(256), active: z.boolean() }).strict()
+      )
+      .max(32)
+      .optional(),
+  }),
+  socketio: nonEmptyPatch({
+    endpoint: z.string().max(8192).optional(),
+    path: z.string().max(512).optional(),
+    version: z.enum(["v2", "v3", "v4"]).optional(),
+  }),
+  sse: nonEmptyPatch({
+    endpoint: z.string().max(8192).optional(),
+    eventType: z.string().max(256).optional(),
+  }),
+  mqtt: nonEmptyPatch({
+    endpoint: z.string().max(8192).optional(),
+    clientID: z.string().max(256).optional(),
+  }),
+} as const
+
+export const editRealtimeSessionParser = (mode: RealtimeSchemaMode) =>
+  z
+    .object({
+      expectedRevision: z.string().min(1).max(128),
+      patch: realtimePatchParsers[mode],
+    })
+    .strict()
+
+const realtimePatchInputSchemas = {
+  websocket: {
+    type: "object",
+    properties: {
+      endpoint: { type: "string", maxLength: 8192 },
+      protocols: {
+        type: "array",
+        maxItems: 32,
+        items: {
+          type: "object",
+          properties: {
+            value: { type: "string", maxLength: 256 },
+            active: { type: "boolean" },
+          },
+          required: ["value", "active"],
+          additionalProperties: false,
+        },
+      },
+    },
+    additionalProperties: false,
+  },
+  socketio: {
+    type: "object",
+    properties: {
+      endpoint: { type: "string", maxLength: 8192 },
+      path: { type: "string", maxLength: 512 },
+      version: { type: "string", enum: ["v2", "v3", "v4"] },
+    },
+    additionalProperties: false,
+  },
+  sse: {
+    type: "object",
+    properties: {
+      endpoint: { type: "string", maxLength: 8192 },
+      eventType: { type: "string", maxLength: 256 },
+    },
+    additionalProperties: false,
+  },
+  mqtt: {
+    type: "object",
+    properties: {
+      endpoint: { type: "string", maxLength: 8192 },
+      clientID: { type: "string", maxLength: 256 },
+    },
+    additionalProperties: false,
+  },
+} as const
+
+export const editRealtimeSessionInputSchema = (mode: RealtimeSchemaMode) => ({
   type: "object",
   properties: {
     expectedRevision: revisionProperty,
-    patch: { type: "object", additionalProperties: false },
+    patch: realtimePatchInputSchemas[mode],
   },
   required: ["expectedRevision", "patch"],
   additionalProperties: false,
-} as const
+})
 
 export const realtimeMessageParser = z
   .object({

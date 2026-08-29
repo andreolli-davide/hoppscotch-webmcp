@@ -736,7 +736,7 @@ export class WebMCPService extends Service {
           name: "execute_graphql_operation",
           title: "Execute GraphQL operation",
           description:
-            "Execute a visible GraphQL query or mutation through Hoppscotch after approval.",
+            "Execute a visible GraphQL query or mutation through an established GraphQL connection after approval.",
           inputSchema: expectedRevisionSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input, { signal: actionSignal }) =>
@@ -1027,9 +1027,10 @@ export class WebMCPService extends Service {
     try {
       if (action === "connect") await this.gqlExecution.connect(gql.tab)
       else if (action === "disconnect") this.gqlExecution.disconnect()
-      else if (action === "execute") await this.gqlExecution.execute(gql.tab)
+      else if (action === "execute")
+        await this.gqlExecution.executeConnected(gql.tab)
       else if (action === "subscribe")
-        this.gqlExecution.startSubscription(gql.tab)
+        this.gqlExecution.startSubscriptionConnected(gql.tab)
       else this.gqlExecution.stopSubscription()
       this.activity.record({
         tool: `${action}_graphql`,
@@ -1108,7 +1109,7 @@ export class WebMCPService extends Service {
           title: "Edit realtime session",
           description:
             "Apply a bounded revision-bound configuration patch to the visible realtime session without creating a saved resource.",
-          inputSchema: editRealtimeSessionInputSchema,
+          inputSchema: editRealtimeSessionInputSchema(mode),
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => this.editRealtimeSession(mode, input),
         },
@@ -1217,7 +1218,7 @@ export class WebMCPService extends Service {
   ) {
     if (!this.validBoundary(input))
       return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
-    const parsed = editRealtimeSessionParser.safeParse(input)
+    const parsed = editRealtimeSessionParser(mode).safeParse(input)
     if (!parsed.success)
       return this.failure(
         "INVALID_INPUT",
@@ -1236,19 +1237,6 @@ export class WebMCPService extends Service {
       )
     }
     const fields = Object.keys(parsed.data.patch)
-    const valid = {
-      websocket: ["endpoint", "protocols"],
-      socketio: ["endpoint", "path", "version"],
-      sse: ["endpoint", "eventType"],
-      mqtt: ["endpoint", "clientID"],
-    }[mode]
-    if (fields.some((field) => !valid.includes(field))) {
-      return this.failure(
-        "INVALID_INPUT",
-        "The patch contains fields unsupported by this realtime protocol.",
-        "realtime-session"
-      )
-    }
     await this.realtime.edit(mode, parsed.data.patch)
     this.activity.record({
       tool: "edit_realtime_session",
@@ -1382,12 +1370,7 @@ export class WebMCPService extends Service {
     }
     try {
       if (action === "connect") {
-        await this.realtime.connect(mode)
-        signal.addEventListener(
-          "abort",
-          () => void this.realtime.disconnect(mode),
-          { once: true }
-        )
+        await this.realtime.connect(mode, signal)
       } else if (action === "disconnect") await this.realtime.disconnect(mode)
       else if (action === "send") {
         const message = realtimeMessageParser.parse(input)

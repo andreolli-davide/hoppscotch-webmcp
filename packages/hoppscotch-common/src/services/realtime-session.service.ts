@@ -155,10 +155,61 @@ export class RealtimeSessionService extends Service {
     return this.snapshot(mode)
   }
 
-  public async connect(mode: RealtimeMode) {
+  private waitForConnection(
+    state$: {
+      value: string
+      subscribe: (next: (state: string) => void) => { unsubscribe: () => void }
+    },
+    starting: string,
+    connected: string,
+    signal: AbortSignal
+  ) {
+    return new Promise<void>((resolve, reject) => {
+      let started = state$.value === starting
+      let complete = false
+      const settle = (error?: Error) => {
+        if (complete) return
+        complete = true
+        clearTimeout(timer)
+        subscription.unsubscribe()
+        signal.removeEventListener("abort", onAbort)
+        if (error) reject(error)
+        else resolve()
+      }
+      const onAbort = () => settle(new Error("The connection was cancelled."))
+      const subscription = state$.subscribe((state) => {
+        if (state === starting) started = true
+        if (state === connected) settle()
+        else if (started && state !== starting) {
+          settle(new Error("The connection did not reach a connected state."))
+        }
+      })
+      const timer = setTimeout(
+        () => settle(new Error("The connection timed out.")),
+        15_000
+      )
+      signal.addEventListener("abort", onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    })
+  }
+
+  public async connect(mode: RealtimeMode, signal: AbortSignal) {
+    if (signal.aborted) throw new Error("The connection was cancelled.")
     const state = await this.snapshot(mode)
+    const disconnected = mode === "sse" ? "STOPPED" : "DISCONNECTED"
+    if (state.state !== disconnected) {
+      throw new Error(
+        "The realtime session is already connecting or connected."
+      )
+    }
     if (mode === "websocket") {
       const socket = await firstValueFrom(WSSocket$)
+      const completion = this.waitForConnection(
+        socket.connectionState$,
+        "CONNECTING",
+        "CONNECTED",
+        signal
+      )
       socket.connect(
         state.endpoint,
         (
@@ -170,27 +221,69 @@ export class RealtimeSessionService extends Service {
           .filter((item) => item.active)
           .map((item) => item.value)
       )
+      try {
+        await completion
+      } catch (error) {
+        socket.disconnect()
+        throw error
+      }
     } else if (mode === "socketio") {
       const socket = await firstValueFrom(SIOSocket$)
+      const completion = this.waitForConnection(
+        socket.connectionState$,
+        "CONNECTING",
+        "CONNECTED",
+        signal
+      )
       socket.connect({
         url: state.endpoint,
         path: String(state.configuration.path || "/socket.io"),
         clientVersion: state.configuration.version as any,
         auth: undefined,
       })
+      try {
+        await completion
+      } catch (error) {
+        socket.disconnect()
+        throw error
+      }
     } else if (mode === "sse") {
       const socket = await firstValueFrom(SSESocket$)
+      const completion = this.waitForConnection(
+        socket.connectionState$,
+        "STARTING",
+        "STARTED",
+        signal
+      )
       socket.start(
         state.endpoint,
         String(state.configuration.eventType || "data")
       )
+      try {
+        await completion
+      } catch (error) {
+        socket.stop()
+        throw error
+      }
     } else {
       const socket = await firstValueFrom(MQTTConn$)
+      const completion = this.waitForConnection(
+        socket.connectionState$,
+        "CONNECTING",
+        "CONNECTED",
+        signal
+      )
       socket.connect(
         state.endpoint,
         String(state.configuration.clientID || "hoppscotch"),
         mqttDefaults
       )
+      try {
+        await completion
+      } catch (error) {
+        socket.disconnect()
+        throw error
+      }
     }
   }
 

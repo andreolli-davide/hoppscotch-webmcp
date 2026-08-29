@@ -6,6 +6,7 @@ import {
   editRESTVariablesParser,
   editRESTRequestParser,
   editGraphQLOperationParser,
+  editRealtimeSessionInputSchema,
   editRealtimeSessionParser,
   graphqlPayloadParser,
   listEnvironmentsParser,
@@ -161,15 +162,21 @@ describe("WebMCP GraphQL and realtime input schemas", () => {
 
   it("rejects unsupported realtime draft fields and oversized messages", () => {
     expect(
-      editRealtimeSessionParser.safeParse({
+      editRealtimeSessionParser("websocket").safeParse({
         expectedRevision: "realtime-session:1",
         patch: { endpoint: "wss://echo.example.test", protocols: [] },
       }).success
     ).toBe(true)
     expect(
-      editRealtimeSessionParser.safeParse({
+      editRealtimeSessionParser("websocket").safeParse({
         expectedRevision: "realtime-session:1",
         patch: { password: "literal-secret" },
+      }).success
+    ).toBe(false)
+    expect(
+      editRealtimeSessionParser("sse").safeParse({
+        expectedRevision: "realtime-session:1",
+        patch: { protocols: [] },
       }).success
     ).toBe(false)
     expect(
@@ -178,6 +185,17 @@ describe("WebMCP GraphQL and realtime input schemas", () => {
         message: "x".repeat(65537),
       }).success
     ).toBe(false)
+  })
+
+  it("advertises the same mode-specific realtime fields it validates", () => {
+    const websocket = editRealtimeSessionInputSchema("websocket")
+    const socketio = editRealtimeSessionInputSchema("socketio")
+    const sse = editRealtimeSessionInputSchema("sse")
+
+    expect(websocket.properties.patch.properties).toHaveProperty("protocols")
+    expect(socketio.properties.patch.properties).toHaveProperty("path")
+    expect(socketio.properties.patch.properties).not.toHaveProperty("protocols")
+    expect(sse.properties.patch.properties).toHaveProperty("eventType")
   })
 
   it("requires a bounded MQTT topic and limits QoS", () => {

@@ -63,22 +63,42 @@ export class GQLRequestExecutionService extends Service {
 
   public async connect(tab: HoppTab<HoppGQLDocument>) {
     const options = this.baseOptions(tab)
-    return connect({
+    await connect({
       url: options.url,
       request: options.request,
       inheritedHeaders: options.inheritedHeaders,
       inheritedAuth: options.inheritedAuth,
     })
+    this.ensureConnected()
   }
 
   public disconnect() {
     if (connection.state === "CONNECTED") disconnect()
   }
 
+  private ensureConnected() {
+    if (connection.state !== "CONNECTED") {
+      throw new Error(
+        "Connect the GraphQL schema before executing an operation."
+      )
+    }
+  }
+
+  /** UI convenience path: preserve the existing connect-then-run behavior. */
   public async execute(
     tab: HoppTab<HoppGQLDocument>,
     selected?: OperationDefinitionNode | null
   ) {
+    if (connection.state !== "CONNECTED") await this.connect(tab)
+    return this.executeConnected(tab, selected)
+  }
+
+  /** WebMCP path: execution has one effect and never opens a connection. */
+  public async executeConnected(
+    tab: HoppTab<HoppGQLDocument>,
+    selected?: OperationDefinitionNode | null
+  ) {
+    this.ensureConnected()
     const options = this.options(tab, selected)
     if (options.operationType === "subscription") {
       throw new Error(
@@ -89,6 +109,14 @@ export class GQLRequestExecutionService extends Service {
   }
 
   public startSubscription(tab: HoppTab<HoppGQLDocument>) {
+    if (connection.state !== "CONNECTED")
+      return this.connect(tab).then(() => this.startSubscriptionConnected(tab))
+    return this.startSubscriptionConnected(tab)
+  }
+
+  /** WebMCP path: subscriptions are started only on an established connection. */
+  public startSubscriptionConnected(tab: HoppTab<HoppGQLDocument>) {
+    this.ensureConnected()
     const options = this.options(tab)
     if (options.operationType !== "subscription") {
       throw new Error("The current GraphQL operation is not a subscription.")
