@@ -27,6 +27,52 @@ When Hoppscotch resolves `<<var>>` or `pw.env.get("var")`, it checks scopes in t
 * `currentValue`: Session-local value; modified dynamically at runtime by scripts (`pw.env.set`) without overwriting the shared baseline.
 * `secret`: Masked/redacted from inspections, resolved safely at request execution time.
 
+### Predefined (Dynamic) Variables — `$` Prefix
+Hoppscotch provides built-in system-generated variables prefixed with `$`. They are resolved at request execution time and require **no prior definition** in any environment.
+
+**Syntax in templates:** `<<$variableName>>` (wrapped in double angle brackets like all variables).
+
+**Access in scripts:** `pw.env.get("$variableName")` returns the generated value.
+
+| Variable | Description |
+|---|---|
+| **Common** | |
+| `$guid` | A v4 style GUID |
+| `$timestamp` | Current UNIX timestamp in seconds |
+| `$isoTimestamp` | Current ISO timestamp at zero UTC |
+| `$randomUUID` | A random 36-character UUID |
+| **Text, Numbers & Colors** | |
+| `$randomAlphaNumeric` | A random alphanumeric character |
+| `$randomBoolean` | A random boolean value (`true`/`false`) |
+| `$randomInt` | A random integer between 0 and 1000 |
+| `$randomColor` | A random color name (e.g. `red`, `blue`) |
+| `$randomHexColor` | A random hex color (e.g. `#a3f2c1`) |
+| `$randomAbbreviation` | A random abbreviation (e.g. `JSON`, `API`) |
+| **Internet & Network** | |
+| `$randomIP` | A random IPv4 address |
+| `$randomIPV6` | A random IPv6 address |
+| `$randomMACAddress` | A random MAC address |
+| `$randomPassword` | A random 15-character alphanumeric password |
+| `$randomLocale` | A random two-letter language code (ISO 639-1) |
+| `$randomUserAgent` | A random user agent string |
+| `$randomProtocol` | A random internet protocol (`http` or `https`) |
+| `$randomSemver` | A random semantic version number (e.g. `3.7.1`) |
+| **Names** | |
+| `$randomFirstName` | A random first name |
+| `$randomLastName` | A random last name |
+| `$randomFullName` | A random full name |
+| `$randomNamePrefix` | A random name prefix (e.g. `Dr.`, `Ms.`) |
+| `$randomNameSuffix` | A random name suffix (e.g. `PhD`, `Jr.`) |
+| **Company** | |
+| `$randomCompanyName` | A random company name |
+| **Address** | |
+| `$randomCity` | A random city name |
+| **Profession** | |
+| `$randomJobArea` | A random job area (e.g. `Development`, `Design`) |
+| `$randomJobDescriptor` | A random job descriptor (e.g. `Senior`, `Lead`) |
+| `$randomJobTitle` | A random job title |
+| `$randomJobType` | A random job type (e.g. `Manager`, `Director`) |
+
 ---
 
 ## 2. Scripting Namespaces
