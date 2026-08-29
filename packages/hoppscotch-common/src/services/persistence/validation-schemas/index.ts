@@ -228,6 +228,19 @@ export const SOCKET_IO_REQUEST_SCHEMA = z.nullable(
       endpoint: z.string(),
       path: z.string(),
       version: z.union([z.literal("v4"), z.literal("v3"), z.literal("v2")]),
+      auth: z
+        .optional(
+          z.object({
+            authType: z.union([z.literal("None"), z.literal("Bearer")]),
+            bearerToken: z.string(),
+            authActive: z.boolean(),
+          })
+        )
+        .default({
+          authType: "None",
+          bearerToken: "",
+          authActive: true,
+        }),
     })
     .strict()
 )
@@ -246,6 +259,29 @@ export const MQTT_REQUEST_SCHEMA = z.nullable(
     .object({
       endpoint: z.string(),
       clientID: z.optional(z.string()),
+      config: z
+        .optional(
+          z.object({
+            username: z.optional(z.string()),
+            password: z.optional(z.string()),
+            keepAlive: z.optional(z.string()),
+            cleanSession: z.optional(z.boolean()),
+            lwTopic: z.optional(z.string()),
+            lwMessage: z.string(),
+            lwQos: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+            lwRetain: z.boolean(),
+          })
+        )
+        .default({
+          username: "",
+          password: "",
+          keepAlive: "60",
+          cleanSession: true,
+          lwTopic: "",
+          lwMessage: "",
+          lwQos: 0,
+          lwRetain: false,
+        }),
     })
     .strict()
 )

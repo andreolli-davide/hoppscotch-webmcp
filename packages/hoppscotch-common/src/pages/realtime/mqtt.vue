@@ -226,16 +226,21 @@ import {
   MQTTEndpoint$,
   MQTTClientID$,
   MQTTLog$,
+  MQTTConfig$,
   setMQTTConn,
   setMQTTEndpoint,
   setMQTTClientID,
   setMQTTLog,
+  setMQTTConfig,
+  defaultMQTTConfig,
   MQTTTabs$,
   setMQTTTabs,
   MQTTCurrentTab$,
   setCurrentTab,
   addMQTTCurrentTabLogLine,
 } from "~/newstore/MQTTSession"
+import { getAggregateEnvsWithCurrentValue } from "~/newstore/environments"
+import { parseTemplateString } from "@hoppscotch/data"
 import RegexWorker from "@workers/regex?worker"
 import { LogEntryData } from "~/components/realtime/Log.vue"
 
@@ -246,16 +251,7 @@ const colorMode = useColorMode()
 const { subscribeToStream } = useStreamSubscriber()
 const url = useStream(MQTTEndpoint$, "", setMQTTEndpoint)
 const clientID = useStream(MQTTClientID$, "", setMQTTClientID)
-const config = ref<MQTTConnectionConfig>({
-  username: "",
-  password: "",
-  keepAlive: "60",
-  cleanSession: true,
-  lwTopic: "",
-  lwMessage: "",
-  lwQos: 0,
-  lwRetain: false,
-})
+const config = useStream(MQTTConfig$, defaultMQTTConfig, setMQTTConfig)
 const logs = useStream(MQTTLog$, [], setMQTTLog)
 const socket = useStream(MQTTConn$, new MQTTConnection(), setMQTTConn)
 const connectionState = useReadonlyStream(
@@ -395,7 +391,25 @@ onUnmounted(() => {
 const toggleConnection = () => {
   // If it is connecting:
   if (connectionState.value === "DISCONNECTED") {
-    return socket.value.connect(url.value, clientID.value, config.value)
+    const envVars = getAggregateEnvsWithCurrentValue()
+    const resolvedUrl = parseTemplateString(url.value, envVars)
+    const resolvedClientID = parseTemplateString(clientID.value, envVars)
+    const resolvedConfig: MQTTConnectionConfig = {
+      ...config.value,
+      username: config.value.username
+        ? parseTemplateString(config.value.username, envVars, false, false)
+        : undefined,
+      password: config.value.password
+        ? parseTemplateString(config.value.password, envVars, false, false)
+        : undefined,
+      lwTopic: config.value.lwTopic
+        ? parseTemplateString(config.value.lwTopic, envVars)
+        : undefined,
+      lwMessage: config.value.lwMessage
+        ? parseTemplateString(config.value.lwMessage, envVars, false, false)
+        : "",
+    }
+    return socket.value.connect(resolvedUrl, resolvedClientID, resolvedConfig)
   }
   // Otherwise, it's disconnecting.
   socket.value.disconnect()

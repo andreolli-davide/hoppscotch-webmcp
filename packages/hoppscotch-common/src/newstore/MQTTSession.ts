@@ -1,6 +1,9 @@
 import { distinctUntilChanged, pluck } from "rxjs/operators"
 import DispatchingStore, { defineDispatchers } from "./DispatchingStore"
-import { MQTTConnection } from "~/helpers/realtime/MQTTConnection"
+import {
+  MQTTConnection,
+  MQTTConnectionConfig,
+} from "~/helpers/realtime/MQTTConnection"
 import {
   HoppRealtimeLog,
   HoppRealtimeLogLine,
@@ -14,9 +17,21 @@ type MQTTTab = {
   logs: HoppRealtimeLog[]
 }
 
-type HoppMQTTRequest = {
+export const defaultMQTTConfig: MQTTConnectionConfig = {
+  username: "",
+  password: "",
+  keepAlive: "60",
+  cleanSession: true,
+  lwTopic: "",
+  lwMessage: "",
+  lwQos: 0,
+  lwRetain: false,
+}
+
+export type HoppMQTTRequest = {
   endpoint: string
   clientID?: string
+  config: MQTTConnectionConfig
 }
 
 type HoppMQTTSession = {
@@ -31,6 +46,7 @@ type HoppMQTTSession = {
 const defaultMQTTRequest: HoppMQTTRequest = {
   endpoint: "wss://test.mosquitto.org:8081",
   clientID: "hoppscotch",
+  config: defaultMQTTConfig,
 }
 
 const defaultTab: MQTTTab = {
@@ -62,7 +78,7 @@ const dispatchers = defineDispatchers({
   setEndpoint(curr: HoppMQTTSession, { newEndpoint }: { newEndpoint: string }) {
     return {
       request: {
-        clientID: curr.request.clientID,
+        ...curr.request,
         endpoint: newEndpoint,
       },
     }
@@ -70,8 +86,33 @@ const dispatchers = defineDispatchers({
   setClientID(curr: HoppMQTTSession, { newClientID }: { newClientID: string }) {
     return {
       request: {
-        endpoint: curr.request.endpoint,
+        ...curr.request,
         clientID: newClientID,
+      },
+    }
+  },
+  setConfig(
+    curr: HoppMQTTSession,
+    { newConfig }: { newConfig: MQTTConnectionConfig }
+  ) {
+    return {
+      request: {
+        ...curr.request,
+        config: newConfig,
+      },
+    }
+  },
+  updateConfig(
+    curr: HoppMQTTSession,
+    { patch }: { patch: Partial<MQTTConnectionConfig> }
+  ) {
+    return {
+      request: {
+        ...curr.request,
+        config: {
+          ...curr.request.config,
+          ...patch,
+        },
       },
     }
   },
@@ -302,3 +343,26 @@ export const MQTTCurrentTab$ = MQTTSessionStore.subject$.pipe(
   pluck("currentTabId"),
   distinctUntilChanged()
 )
+
+export const MQTTConfig$ = MQTTSessionStore.subject$.pipe(
+  pluck("request", "config"),
+  distinctUntilChanged()
+)
+
+export function setMQTTConfig(newConfig: MQTTConnectionConfig) {
+  MQTTSessionStore.dispatch({
+    dispatcher: "setConfig",
+    payload: {
+      newConfig,
+    },
+  })
+}
+
+export function updateMQTTConfig(patch: Partial<MQTTConnectionConfig>) {
+  MQTTSessionStore.dispatch({
+    dispatcher: "updateConfig",
+    payload: {
+      patch,
+    },
+  })
+}

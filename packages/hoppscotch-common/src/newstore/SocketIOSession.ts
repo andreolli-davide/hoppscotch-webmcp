@@ -8,10 +8,23 @@ import {
 
 export type SIOClientVersion = "v4" | "v3" | "v2"
 
-type HoppSIORequest = {
+export type HoppSIOAuth = {
+  authType: "None" | "Bearer"
+  bearerToken: string
+  authActive: boolean
+}
+
+export const defaultSIOAuth: HoppSIOAuth = {
+  authType: "None",
+  bearerToken: "",
+  authActive: true,
+}
+
+export type HoppSIORequest = {
   endpoint: string
   path: string
   version: SIOClientVersion
+  auth: HoppSIOAuth
 }
 
 type HoppSIOSession = {
@@ -24,6 +37,7 @@ const defaultSIORequest: HoppSIORequest = {
   endpoint: "wss://echo-socketio.hoppscotch.io",
   path: "/socket.io",
   version: "v4",
+  auth: defaultSIOAuth,
 }
 
 const defaultSIOSession: HoppSIOSession = {
@@ -65,6 +79,56 @@ const dispatchers = defineDispatchers({
       request: {
         ...curr.request,
         version: newVersion,
+      },
+    }
+  },
+  setAuth(curr: HoppSIOSession, { newAuth }: { newAuth: HoppSIOAuth }) {
+    return {
+      request: {
+        ...curr.request,
+        auth: newAuth,
+      },
+    }
+  },
+  setAuthType(
+    curr: HoppSIOSession,
+    { newAuthType }: { newAuthType: "None" | "Bearer" }
+  ) {
+    return {
+      request: {
+        ...curr.request,
+        auth: {
+          ...curr.request.auth,
+          authType: newAuthType,
+        },
+      },
+    }
+  },
+  setBearerToken(
+    curr: HoppSIOSession,
+    { newBearerToken }: { newBearerToken: string }
+  ) {
+    return {
+      request: {
+        ...curr.request,
+        auth: {
+          ...curr.request.auth,
+          bearerToken: newBearerToken,
+        },
+      },
+    }
+  },
+  setAuthActive(
+    curr: HoppSIOSession,
+    { newAuthActive }: { newAuthActive: boolean }
+  ) {
+    return {
+      request: {
+        ...curr.request,
+        auth: {
+          ...curr.request.auth,
+          authActive: newAuthActive,
+        },
       },
     }
   },
@@ -123,6 +187,42 @@ export function setSIOPath(newPath: string) {
   })
 }
 
+export function setSIOAuth(newAuth: HoppSIOAuth) {
+  SIOSessionStore.dispatch({
+    dispatcher: "setAuth",
+    payload: {
+      newAuth,
+    },
+  })
+}
+
+export function setSIOAuthType(newAuthType: "None" | "Bearer") {
+  SIOSessionStore.dispatch({
+    dispatcher: "setAuthType",
+    payload: {
+      newAuthType,
+    },
+  })
+}
+
+export function setSIOBearerToken(newBearerToken: string) {
+  SIOSessionStore.dispatch({
+    dispatcher: "setBearerToken",
+    payload: {
+      newBearerToken,
+    },
+  })
+}
+
+export function setSIOAuthActive(newAuthActive: boolean) {
+  SIOSessionStore.dispatch({
+    dispatcher: "setAuthActive",
+    payload: {
+      newAuthActive,
+    },
+  })
+}
+
 export function setSIOSocket(socket: SIOConnection) {
   SIOSessionStore.dispatch({
     dispatcher: "setSocket",
@@ -167,6 +267,26 @@ export const SIOVersion$ = SIOSessionStore.subject$.pipe(
 
 export const SIOPath$ = SIOSessionStore.subject$.pipe(
   pluck("request", "path"),
+  distinctUntilChanged()
+)
+
+export const SIOAuth$ = SIOSessionStore.subject$.pipe(
+  pluck("request", "auth"),
+  distinctUntilChanged()
+)
+
+export const SIOAuthType$ = SIOSessionStore.subject$.pipe(
+  pluck("request", "auth", "authType"),
+  distinctUntilChanged()
+)
+
+export const SIOBearerToken$ = SIOSessionStore.subject$.pipe(
+  pluck("request", "auth", "bearerToken"),
+  distinctUntilChanged()
+)
+
+export const SIOAuthActive$ = SIOSessionStore.subject$.pipe(
+  pluck("request", "auth", "authActive"),
   distinctUntilChanged()
 )
 

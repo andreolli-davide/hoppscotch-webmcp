@@ -280,13 +280,21 @@ import {
   setSIOPath,
   setSIOVersion,
   setSIOSocket,
+  setSIOAuthType,
+  setSIOBearerToken,
+  setSIOAuthActive,
   SIOClientVersion,
   SIOEndpoint$,
   SIOLog$,
   SIOPath$,
   SIOVersion$,
   SIOSocket$,
+  SIOAuthType$,
+  SIOBearerToken$,
+  SIOAuthActive$,
 } from "~/newstore/SocketIOSession"
+import { getAggregateEnvsWithCurrentValue } from "~/newstore/environments"
+import { parseTemplateString } from "@hoppscotch/data"
 import { useColorMode } from "@composables/theming"
 import RegexWorker from "@workers/regex?worker"
 import { LogEntryData } from "~/components/realtime/Log.vue"
@@ -314,9 +322,9 @@ const log = useStream(SIOLog$, [], setSIOLog)
 const tippyActions = ref<any | null>(null)
 const authTippyActions = ref<any | null>(null)
 const isUrlValid = ref(true)
-const authType = ref<"None" | "Bearer">("None")
-const bearerToken = ref("")
-const authActive = ref(true)
+const authType = useStream(SIOAuthType$, "None", setSIOAuthType)
+const bearerToken = useStream(SIOBearerToken$, "", setSIOBearerToken)
+const authActive = useStream(SIOAuthActive$, true, setSIOAuthActive)
 
 let worker: Worker
 
@@ -432,16 +440,27 @@ const debouncer = debounce(function () {
 const toggleConnection = () => {
   // If it is connecting:
   if (connectionState.value === "DISCONNECTED") {
+    const envVars = getAggregateEnvsWithCurrentValue()
+    const resolvedUrl = parseTemplateString(url.value, envVars)
+    const resolvedPath = parseTemplateString(path.value || "/socket.io", envVars)
+    const resolvedToken = parseTemplateString(
+      bearerToken.value,
+      envVars,
+      false,
+      false
+    )
+
     return socket.value.connect({
-      url: url.value,
-      path: path.value || "/socket.io",
+      url: resolvedUrl,
+      path: resolvedPath,
       clientVersion: clientVersion.value,
-      auth: authActive.value
-        ? {
-            type: authType.value,
-            token: bearerToken.value,
-          }
-        : undefined,
+      auth:
+        authActive.value && authType.value === "Bearer"
+          ? {
+              type: "Bearer",
+              token: resolvedToken,
+            }
+          : undefined,
     })
   }
   // Otherwise, it's disconnecting.

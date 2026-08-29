@@ -1262,12 +1262,46 @@ export class WebMCPService extends Service {
         })
       }
     }
+    const rawConfig = snapshot.configuration
+    const safeConfiguration: Record<string, unknown> = { ...rawConfig }
+    if (
+      mode === "socketio" &&
+      rawConfig.auth &&
+      typeof rawConfig.auth === "object"
+    ) {
+      const auth = rawConfig.auth as Record<string, unknown>
+      const token =
+        typeof auth.bearerToken === "string" ? auth.bearerToken : ""
+      safeConfiguration.auth = {
+        authType: auth.authType ?? "None",
+        authActive: auth.authActive ?? true,
+        bearerToken:
+          token.startsWith("<<") && token.endsWith(">>")
+            ? redactor.scrub(token, 128)
+            : token.trim()
+              ? "[REDACTED]"
+              : "",
+      }
+    } else if (mode === "mqtt") {
+      if (typeof rawConfig.username === "string") {
+        safeConfiguration.username = redactor.scrub(rawConfig.username, 128)
+      }
+      if (typeof rawConfig.password === "string") {
+        const pass = rawConfig.password
+        safeConfiguration.password =
+          pass.startsWith("<<") && pass.endsWith(">>")
+            ? redactor.scrub(pass, 128)
+            : pass.trim()
+              ? "[REDACTED]"
+              : ""
+      }
+    }
     return this.result("realtime-session", {
       session: {
         mode,
         endpoint: redactor.scrub(snapshot.endpoint, 128),
         state: snapshot.state,
-        configuration: snapshot.configuration,
+        configuration: safeConfiguration,
         diagnostics: configurationDiagnostics,
         log: {
           total: snapshot.log.length,

@@ -1,5 +1,7 @@
 import { Service } from "dioc"
 import { firstValueFrom } from "rxjs"
+import { parseTemplateString } from "@hoppscotch/data"
+import { getAggregateEnvsWithCurrentValue } from "~/newstore/environments"
 
 import { MQTTConnectionConfig } from "~/helpers/realtime/MQTTConnection"
 import { HoppRealtimeLog } from "~/helpers/types/HoppRealtimeLog"
@@ -8,18 +10,25 @@ import {
   MQTTConn$,
   MQTTEndpoint$,
   MQTTLog$,
+  MQTTConfig$,
   setMQTTClientID,
   setMQTTEndpoint,
+  updateMQTTConfig,
 } from "~/newstore/MQTTSession"
 import {
+  SIOAuth$,
   SIOEndpoint$,
   SIOLog$,
   SIOPath$,
   SIOSocket$,
   SIOVersion$,
+  setSIOAuthType,
+  setSIOBearerToken,
+  setSIOAuthActive,
   setSIOEndpoint,
   setSIOPath,
   setSIOVersion,
+  HoppSIOAuth,
 } from "~/newstore/SocketIOSession"
 import {
   SSEEndpoint$,
@@ -48,14 +57,6 @@ export type RealtimeSnapshot = {
   log: HoppRealtimeLog
 }
 
-const mqttDefaults: MQTTConnectionConfig = {
-  keepAlive: "60",
-  cleanSession: true,
-  lwMessage: "",
-  lwQos: 0,
-  lwRetain: false,
-}
-
 /**
  * Owns the protocol action boundary used by WebMCP. Connection instances are
  * the same ones held by the visible realtime pages, so state and logs remain
@@ -81,10 +82,11 @@ export class RealtimeSessionService extends Service {
       }
     }
     if (mode === "socketio") {
-      const [endpoint, path, version, socket, log] = await Promise.all([
+      const [endpoint, path, version, auth, socket, log] = await Promise.all([
         firstValueFrom(SIOEndpoint$),
         firstValueFrom(SIOPath$),
         firstValueFrom(SIOVersion$),
+        firstValueFrom(SIOAuth$),
         firstValueFrom(SIOSocket$),
         firstValueFrom(SIOLog$),
       ])
@@ -92,7 +94,7 @@ export class RealtimeSessionService extends Service {
         mode,
         endpoint,
         state: socket.connectionState$.value,
-        configuration: { path, version },
+        configuration: { path, version, auth },
         log,
       }
     }
@@ -111,9 +113,10 @@ export class RealtimeSessionService extends Service {
         log,
       }
     }
-    const [endpoint, clientID, socket, log] = await Promise.all([
+    const [endpoint, clientID, config, socket, log] = await Promise.all([
       firstValueFrom(MQTTEndpoint$),
       firstValueFrom(MQTTClientID$),
+      firstValueFrom(MQTTConfig$),
       firstValueFrom(MQTTConn$),
       firstValueFrom(MQTTLog$),
     ])
@@ -123,6 +126,7 @@ export class RealtimeSessionService extends Service {
       state: socket.connectionState$.value,
       configuration: {
         clientID,
+        ...config,
         subscriptions: socket.subscribedTopics$.value.map(({ name, qos }) => ({
           name,
           qos,
@@ -145,12 +149,45 @@ export class RealtimeSessionService extends Service {
         patch.version === "v4"
       )
         setSIOVersion(patch.version)
+      if (patch.auth && typeof patch.auth === "object") {
+        const authPatch = patch.auth as Record<string, unknown>
+        if (authPatch.authType === "None" || authPatch.authType === "Bearer") {
+          setSIOAuthType(authPatch.authType)
+        }
+        if (typeof authPatch.bearerToken === "string") {
+          setSIOBearerToken(authPatch.bearerToken)
+        }
+        if (typeof authPatch.authActive === "boolean") {
+          setSIOAuthActive(authPatch.authActive)
+        }
+      }
     } else if (mode === "sse") {
       if (typeof patch.endpoint === "string") setSSEEndpoint(patch.endpoint)
       if (typeof patch.eventType === "string") setSSEEventType(patch.eventType)
     } else {
       if (typeof patch.endpoint === "string") setMQTTEndpoint(patch.endpoint)
       if (typeof patch.clientID === "string") setMQTTClientID(patch.clientID)
+      const configPatch: Partial<MQTTConnectionConfig> = {}
+      if (typeof patch.username === "string")
+        configPatch.username = patch.username
+      if (typeof patch.password === "string")
+        configPatch.password = patch.password
+      if (typeof patch.keepAlive === "string")
+        configPatch.keepAlive = patch.keepAlive
+      if (typeof patch.cleanSession === "boolean")
+        configPatch.cleanSession = patch.cleanSession
+      if (typeof patch.lwTopic === "string") configPatch.lwTopic = patch.lwTopic
+      if (typeof patch.lwMessage === "string")
+        configPatch.lwMessage = patch.lwMessage
+      if (
+        patch.lwQos === 0 ||
+        patch.lwQos === 1 ||
+        patch.lwQos === 2
+      )
+        configPatch.lwQos = patch.lwQos
+      if (typeof patch.lwRetain === "boolean")
+        configPatch.lwRetain = patch.lwRetain
+      if (Object.keys(configPatch).length > 0) updateMQTTConfig(configPatch)
     }
     return this.snapshot(mode)
   }
@@ -202,6 +239,7 @@ export class RealtimeSessionService extends Service {
         "The realtime session is already connecting or connected."
       )
     }
+    const envVars = getAggregateEnvsWithCurrentValue()
     if (mode === "websocket") {
       const socket = await firstValueFrom(WSSocket$)
       const completion = this.waitForConnection(
@@ -210,8 +248,9 @@ export class RealtimeSessionService extends Service {
         "CONNECTED",
         signal
       )
+      const resolvedUrl = parseTemplateString(state.endpoint, envVars)
       socket.connect(
-        state.endpoint,
+        resolvedUrl,
         (
           state.configuration.protocols as Array<{
             value: string
@@ -219,7 +258,7 @@ export class RealtimeSessionService extends Service {
           }>
         )
           .filter((item) => item.active)
-          .map((item) => item.value)
+          .map((item) => parseTemplateString(item.value, envVars))
       )
       try {
         await completion
@@ -235,11 +274,26 @@ export class RealtimeSessionService extends Service {
         "CONNECTED",
         signal
       )
+      const resolvedUrl = parseTemplateString(state.endpoint, envVars)
+      const resolvedPath = parseTemplateString(
+        String(state.configuration.path || "/socket.io"),
+        envVars
+      )
+      const auth = state.configuration.auth as HoppSIOAuth | undefined
+      const resolvedToken = auth?.bearerToken
+        ? parseTemplateString(auth.bearerToken, envVars, false, false)
+        : ""
       socket.connect({
-        url: state.endpoint,
-        path: String(state.configuration.path || "/socket.io"),
+        url: resolvedUrl,
+        path: resolvedPath,
         clientVersion: state.configuration.version as any,
-        auth: undefined,
+        auth:
+          auth?.authActive && auth.authType === "Bearer"
+            ? {
+                type: "Bearer",
+                token: resolvedToken,
+              }
+            : undefined,
       })
       try {
         await completion
@@ -255,8 +309,9 @@ export class RealtimeSessionService extends Service {
         "STARTED",
         signal
       )
+      const resolvedUrl = parseTemplateString(state.endpoint, envVars)
       socket.start(
-        state.endpoint,
+        resolvedUrl,
         String(state.configuration.eventType || "data")
       )
       try {
@@ -273,10 +328,34 @@ export class RealtimeSessionService extends Service {
         "CONNECTED",
         signal
       )
-      socket.connect(
-        state.endpoint,
+      const resolvedUrl = parseTemplateString(state.endpoint, envVars)
+      const resolvedClientID = parseTemplateString(
         String(state.configuration.clientID || "hoppscotch"),
-        mqttDefaults
+        envVars
+      )
+      const rawConfig = state.configuration as Record<string, unknown>
+      const resolvedConfig: MQTTConnectionConfig = {
+        username: rawConfig.username
+          ? parseTemplateString(String(rawConfig.username), envVars, false, false)
+          : undefined,
+        password: rawConfig.password
+          ? parseTemplateString(String(rawConfig.password), envVars, false, false)
+          : undefined,
+        keepAlive: String(rawConfig.keepAlive ?? "60"),
+        cleanSession: rawConfig.cleanSession !== false,
+        lwTopic: rawConfig.lwTopic
+          ? parseTemplateString(String(rawConfig.lwTopic), envVars)
+          : undefined,
+        lwMessage: rawConfig.lwMessage
+          ? parseTemplateString(String(rawConfig.lwMessage), envVars, false, false)
+          : "",
+        lwQos: (rawConfig.lwQos as 0 | 1 | 2) ?? 0,
+        lwRetain: Boolean(rawConfig.lwRetain),
+      }
+      socket.connect(
+        resolvedUrl,
+        resolvedClientID,
+        resolvedConfig
       )
       try {
         await completion

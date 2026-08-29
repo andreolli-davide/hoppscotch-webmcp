@@ -759,6 +759,14 @@ const realtimePatchParsers = {
     endpoint: z.string().max(8192).optional(),
     path: z.string().max(512).optional(),
     version: z.enum(["v2", "v3", "v4"]).optional(),
+    auth: z
+      .object({
+        authType: z.enum(["None", "Bearer"]).optional(),
+        bearerToken: z.string().max(4096).optional(),
+        authActive: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
   }),
   sse: nonEmptyPatch({
     endpoint: z.string().max(8192).optional(),
@@ -767,6 +775,14 @@ const realtimePatchParsers = {
   mqtt: nonEmptyPatch({
     endpoint: z.string().max(8192).optional(),
     clientID: z.string().max(256).optional(),
+    username: z.string().max(512).optional(),
+    password: z.string().max(4096).optional(),
+    keepAlive: z.string().max(32).optional(),
+    cleanSession: z.boolean().optional(),
+    lwTopic: z.string().max(512).optional(),
+    lwMessage: z.string().max(4096).optional(),
+    lwQos: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
+    lwRetain: z.boolean().optional(),
   }),
 } as const
 
@@ -805,6 +821,15 @@ const realtimePatchInputSchemas = {
       endpoint: { type: "string", maxLength: 8192 },
       path: { type: "string", maxLength: 512 },
       version: { type: "string", enum: ["v2", "v3", "v4"] },
+      auth: {
+        type: "object",
+        properties: {
+          authType: { type: "string", enum: ["None", "Bearer"] },
+          bearerToken: { type: "string", maxLength: 4096 },
+          authActive: { type: "boolean" },
+        },
+        additionalProperties: false,
+      },
     },
     additionalProperties: false,
   },
@@ -821,6 +846,14 @@ const realtimePatchInputSchemas = {
     properties: {
       endpoint: { type: "string", maxLength: 8192 },
       clientID: { type: "string", maxLength: 256 },
+      username: { type: "string", maxLength: 512 },
+      password: { type: "string", maxLength: 4096 },
+      keepAlive: { type: "string", maxLength: 32 },
+      cleanSession: { type: "boolean" },
+      lwTopic: { type: "string", maxLength: 512 },
+      lwMessage: { type: "string", maxLength: 4096 },
+      lwQos: { type: "integer", enum: [0, 1, 2] },
+      lwRetain: { type: "boolean" },
     },
     additionalProperties: false,
   },
