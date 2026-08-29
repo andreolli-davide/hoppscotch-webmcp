@@ -195,7 +195,9 @@ export class ActiveAppContextService extends Service {
           }
         : undefined,
       dirtyDocumentCount: this.restTabs.getDirtyTabsCount(),
-      capabilityPacks: rest ? ["app-context", "rest"] : ["app-context"],
+      capabilityPacks: rest
+        ? ["app-context", "environment", "rest"]
+        : ["app-context"],
     }
   }
 

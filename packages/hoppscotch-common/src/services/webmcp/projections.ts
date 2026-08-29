@@ -29,6 +29,24 @@ const SUMMARY_MIME_CHARS = 64
 const SUMMARY_FAILURE_CHARS = 64
 const SUMMARY_DIAGNOSTIC_CHARS = 64
 
+const AUTH_CREDENTIAL_FIELDS: Record<string, readonly string[]> = {
+  basic: ["username", "password"],
+  digest: ["username", "password"],
+  bearer: ["token"],
+  "oauth-2": ["token", "clientID", "clientSecret"],
+  "api-key": ["key", "value"],
+  "aws-signature": [
+    "accessKey",
+    "secretKey",
+    "region",
+    "serviceName",
+    "serviceToken",
+  ],
+  hawk: ["authId", "authKey"],
+  "akamai-eg": ["accessToken", "clientToken", "clientSecret"],
+  jwt: ["secret", "privateKey"],
+}
+
 export class SecretRedactor {
   private readonly values: string[]
 
@@ -174,6 +192,34 @@ const projectBody = async (
     length: body.body.length,
     truncated: body.body.length > 0,
     digest: await digest(bytes),
+  }
+}
+
+const projectAuth = (request: HoppRESTRequest, redactor: SecretRedactor) => {
+  const auth = request.auth
+  const source = auth.authType === "oauth-2" ? auth.grantTypeInfo : auth
+  const allCredentials = (AUTH_CREDENTIAL_FIELDS[auth.authType] ?? [])
+    .map((field) => {
+      const value = (source as Record<string, unknown>)[field]
+      if (typeof value !== "string" || value.length === 0) return null
+      const reference = /^<<([^<>]+)>>$/.exec(value)?.[1]
+      return {
+        field,
+        configured: true,
+        reference: reference
+          ? redactor.scrub(reference, SUMMARY_KEY_CHARS)
+          : undefined,
+      }
+    })
+    .filter((value): value is NonNullable<typeof value> => value !== null)
+  const credentials = allCredentials.slice(0, SUMMARY_LIST_ITEMS)
+
+  return {
+    type: auth.authType,
+    active: auth.authActive,
+    placement: "addTo" in auth ? auth.addTo : undefined,
+    credentials,
+    credentialsTruncated: allCredentials.length > SUMMARY_LIST_ITEMS,
   }
 }
 
@@ -412,7 +458,15 @@ export const projectRESTExchange = async (
           active,
         })),
       headersTruncated: request.headers.length > SUMMARY_LIST_ITEMS,
-      auth: { type: request.auth.authType, active: request.auth.authActive },
+      auth: projectAuth(request, redactor),
+      variables: {
+        count: request.requestVariables.length,
+        active: request.requestVariables.filter(({ active }) => active).length,
+      },
+      scripts: {
+        preRequestLength: request.preRequestScript.length,
+        postRequestLength: request.testScript.length,
+      },
       body: await projectBody(request, redactor),
     },
     environment: {

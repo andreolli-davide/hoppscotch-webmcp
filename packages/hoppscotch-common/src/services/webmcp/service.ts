@@ -13,9 +13,14 @@ import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { HoppTab } from "~/services/tab"
 import { HoppRequestDocument } from "~/helpers/rest/document"
+import {
+  getSelectedEnvironmentIndex,
+  setSelectedEnvironmentIndex,
+} from "~/newstore/environments"
 
 import { WebMCPAdapter } from "./adapter"
-import { ActiveAppContextService } from "./context"
+import { ActiveAppContextService, VisibleRESTContext } from "./context"
+import { WebMCPEnvironmentService } from "./environment"
 import {
   AgentActionApprovalService,
   AgentActivityService,
@@ -25,14 +30,27 @@ import {
   readRESTPayload,
   SecretRedactor,
 } from "./projections"
+import { configureRESTAuth, replaceRESTDraftFields } from "./rest-drafts"
 import {
+  configureRESTAuthInputSchema,
+  configureRESTAuthParser,
+  editRESTScriptsInputSchema,
+  editRESTScriptsParser,
+  editRESTVariablesInputSchema,
+  editRESTVariablesParser,
   editRESTRequestInputSchema,
   editRESTRequestParser,
   emptyInputSchema,
   executeRESTRequestParser,
   expectedRevisionSchema,
+  inspectEnvironmentInputSchema,
+  inspectEnvironmentParser,
+  listEnvironmentsInputSchema,
+  listEnvironmentsParser,
   readRESTPayloadInputSchema,
   readRESTPayloadParser,
+  selectEnvironmentInputSchema,
+  selectEnvironmentParser,
 } from "./schemas"
 import {
   RESTRequestPatch,
@@ -82,6 +100,7 @@ export class WebMCPService extends Service {
   private readonly interceptor = this.bind(KernelInterceptorService)
   private readonly secrets = this.bind(SecretEnvironmentService)
   private readonly execution = this.bind(RESTRequestExecutionService)
+  private readonly environments = this.bind(WebMCPEnvironmentService)
   private readonly approval = this.bind(AgentActionApprovalService)
   private readonly activity = this.bind(AgentActivityService)
 
@@ -262,6 +281,69 @@ export class WebMCPService extends Service {
     await Promise.all([
       this.adapter.register(
         {
+          name: "list_environments",
+          title: "List available environments",
+          description:
+            "List personal and current-workspace environment choices as bounded metadata with opaque handles, names, scope, selection, and variable counts.",
+          inputSchema: listEnvironmentsInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = listEnvironmentsParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const rest = this.visibleREST()
+            if ("ok" in rest) return rest
+            const listed = await this.environments.list(parsed.data.offset)
+            const current = this.visibleREST()
+            if ("ok" in current) return current
+            const redactor = this.redactor()
+            listed.environments = listed.environments.map((environment) => ({
+              ...environment,
+              name: redactor.scrub(environment.name, 64),
+            }))
+            return this.result("app-context", listed)
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "inspect_environment",
+          title: "Inspect selected environment",
+          description:
+            "Inspect the selected environment through variable names, classification, and value-availability metadata.",
+          inputSchema: inspectEnvironmentInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.inspectEnvironment(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "select_environment",
+          title: "Select an environment",
+          description:
+            "Select an app-provided environment for the visible REST workspace using a revision-bound opaque handle. This visibly updates normal app state.",
+          inputSchema: selectEnvironmentInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.selectEnvironment(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
           name: "inspect_rest_exchange",
           title: "Inspect current REST exchange",
           description:
@@ -282,10 +364,49 @@ export class WebMCPService extends Service {
       ),
       this.adapter.register(
         {
+          name: "configure_rest_auth",
+          title: "Configure REST authorization",
+          description:
+            "Configure REST authorization in the visible draft with credential references supplied as environment variable names.",
+          inputSchema: configureRESTAuthInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.configureRESTAuth(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_rest_variables",
+          title: "Edit REST request variables",
+          description:
+            "Replace bounded active-request variables in the visible REST draft and return its updated unsaved state.",
+          inputSchema: editRESTVariablesInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.editRESTVariables(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_rest_scripts",
+          title: "Edit REST request scripts",
+          description:
+            "Store a bounded pre-request or post-request test script in the visible draft for a separately approved request execution.",
+          inputSchema: editRESTScriptsInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.editRESTScripts(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
           name: "read_rest_payload",
           title: "Read REST payload window",
           description:
-            "Read a bounded, revision-bound window from the visible REST request or response. Text is redacted and binary or file content is represented by metadata.",
+            "Read a bounded, revision-bound window from the visible REST request or response as redacted text or binary and file metadata.",
           inputSchema: readRESTPayloadInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) => {
@@ -344,7 +465,7 @@ export class WebMCPService extends Service {
           name: "edit_rest_request",
           title: "Edit current REST request",
           description:
-            "Apply an allow-listed revision-bound patch to the visible REST draft. The updated draft is returned as unsaved state, while protected credential and script fields remain managed by the app.",
+            "Apply an allow-listed revision-bound patch to the visible REST draft and return its updated unsaved state for request, URL, parameters, headers, and body fields.",
           inputSchema: editRESTRequestInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
@@ -368,6 +489,91 @@ export class WebMCPService extends Service {
         signal
       ),
     ])
+  }
+
+  private async inspectEnvironment(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = inspectEnvironmentParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    const referencedNames = parsed.data.referencedOnly
+      ? new Set(
+          [
+            ...JSON.stringify(rest.tab.document.request).matchAll(
+              /<<([^<>]+)>>/g
+            ),
+          ].map((match) => match[1])
+        )
+      : undefined
+    const environment = this.environments.inspectSelected(referencedNames)
+    const redactor = this.redactor()
+    environment.name = redactor.scrub(environment.name, 64)
+    environment.variables = environment.variables.map((variable) => ({
+      ...variable,
+      name: redactor.scrub(variable.name, 64),
+    }))
+    return this.result("rest-document", { environment })
+  }
+
+  private async selectEnvironment(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = selectEnvironmentParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (!this.context.matches("app-context", parsed.data.expectedRevision)) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The app context changed; list environments again.",
+        "app-context",
+        true
+      )
+    }
+
+    const original = cloneDeep(getSelectedEnvironmentIndex())
+    if (!this.environments.select(parsed.data.environmentHandle)) {
+      return this.failure(
+        "ENVIRONMENT_NOT_FOUND",
+        "The environment handle is no longer available; list environments again.",
+        "app-context",
+        true
+      )
+    }
+    const resultingRevision = this.context.revision("app-context")
+    const token = rest.token
+    const selectedName = this.redactor().scrub(
+      this.context.capture().environment.name,
+      64
+    )
+    this.activity.record(
+      {
+        tool: "select_environment",
+        outcome: "changed",
+        summary: `Selected environment ${selectedName}`.slice(0, 256),
+        revision: resultingRevision,
+      },
+      () => {
+        if (
+          this.context.captureVisibleREST()?.token !== token ||
+          !this.context.matches("app-context", resultingRevision)
+        )
+          return false
+        setSelectedEnvironmentIndex(original)
+        return true
+      }
+    )
+    return this.result("app-context", { selected: true })
   }
 
   private async editRESTRequest(input: Record<string, unknown>) {
@@ -447,6 +653,170 @@ export class WebMCPService extends Service {
       }
     )
 
+    const observation = await this.observation()
+    return observation.ok ? { ...observation, changedFields } : observation
+  }
+
+  private async configureRESTAuth(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = configureRESTAuthParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The REST draft changed; inspect it again.",
+        "rest-document",
+        true
+      )
+    }
+
+    try {
+      const { expectedRevision: _, ...configuration } = parsed.data
+      const auth = configureRESTAuth(
+        rest.tab.document.request.auth,
+        configuration
+      )
+      const request = replaceRESTDraftFields(rest.tab.document.request, {
+        auth,
+      })
+      return this.commitRESTDraft(
+        rest,
+        request,
+        "configure_rest_auth",
+        `Configured REST ${configuration.authType} authorization`,
+        ["auth"]
+      )
+    } catch (error) {
+      return this.failure(
+        "INVALID_INPUT",
+        error instanceof Error ? error.message : "Invalid authorization",
+        "rest-document"
+      )
+    }
+  }
+
+  private async editRESTVariables(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = editRESTVariablesParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The REST draft changed; inspect it again.",
+        "rest-document",
+        true
+      )
+    }
+
+    try {
+      const request = replaceRESTDraftFields(rest.tab.document.request, {
+        requestVariables: parsed.data.variables,
+      })
+      return this.commitRESTDraft(
+        rest,
+        request,
+        "edit_rest_variables",
+        `Replaced ${parsed.data.variables.length} REST request variables`,
+        ["requestVariables"]
+      )
+    } catch (error) {
+      return this.failure(
+        "INVALID_INPUT",
+        error instanceof Error ? error.message : "Invalid request variables",
+        "rest-document"
+      )
+    }
+  }
+
+  private async editRESTScripts(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = editRESTScriptsParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The REST draft changed; inspect it again.",
+        "rest-document",
+        true
+      )
+    }
+
+    try {
+      const field =
+        parsed.data.target === "pre_request" ? "preRequestScript" : "testScript"
+      const request = replaceRESTDraftFields(rest.tab.document.request, {
+        [field]: parsed.data.script,
+      })
+      return this.commitRESTDraft(
+        rest,
+        request,
+        "edit_rest_scripts",
+        `Replaced REST ${parsed.data.target} script`,
+        [field]
+      )
+    } catch (error) {
+      return this.failure(
+        "INVALID_INPUT",
+        error instanceof Error ? error.message : "Invalid request script",
+        "rest-document"
+      )
+    }
+  }
+
+  private async commitRESTDraft(
+    rest: VisibleRESTContext,
+    request: HoppRESTRequest,
+    tool: "configure_rest_auth" | "edit_rest_variables" | "edit_rest_scripts",
+    summary: string,
+    changedFields: string[]
+  ) {
+    const originalRequest = cloneDeep(rest.tab.document.request)
+    const originalDirty = rest.tab.document.isDirty
+    rest.tab.document.request = request
+    rest.tab.document.isDirty = true
+    const resultingRevision = this.context.revision("rest-document")
+    const token = rest.token
+    this.activity.record(
+      {
+        tool,
+        outcome: "changed",
+        summary: summary.slice(0, 256),
+        revision: resultingRevision,
+      },
+      () => {
+        const current = this.context.captureVisibleREST()
+        if (
+          !current ||
+          current.token !== token ||
+          !this.context.matches("rest-document", resultingRevision)
+        )
+          return false
+        current.tab.document.request = originalRequest
+        current.tab.document.isDirty = originalDirty
+        return true
+      }
+    )
     const observation = await this.observation()
     return observation.ok ? { ...observation, changedFields } : observation
   }

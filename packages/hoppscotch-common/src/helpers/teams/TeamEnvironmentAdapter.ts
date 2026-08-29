@@ -77,7 +77,7 @@ export default class TeamEnvironmentAdapter {
 
     this.unsubscribeSubscriptions()
 
-    if (this.teamID) this.initialize()
+    return this.teamID ? this.initialize() : Promise.resolve()
   }
 
   async initialize() {

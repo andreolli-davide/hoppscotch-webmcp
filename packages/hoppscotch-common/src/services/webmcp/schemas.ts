@@ -271,3 +271,239 @@ export const editRESTRequestParser = z
 export const executeRESTRequestParser = z
   .object({ expectedRevision: z.string().min(1).max(128) })
   .strict()
+
+const revisionProperty = {
+  type: "string",
+  minLength: 1,
+  maxLength: 128,
+  description: "Revision token returned by the latest matching inspection.",
+} as const
+
+const environmentReference = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[^<>\r\n]+$/, "Use an environment variable name, not a value")
+
+const authReferenceFields = [
+  "username",
+  "password",
+  "token",
+  "key",
+  "value",
+  "accessKey",
+  "secretKey",
+  "region",
+  "serviceName",
+  "serviceToken",
+  "authId",
+  "authKey",
+  "secret",
+  "privateKey",
+  "clientID",
+  "clientSecret",
+] as const
+
+const authTypes = [
+  "inherit",
+  "none",
+  "basic",
+  "digest",
+  "bearer",
+  "oauth-2",
+  "api-key",
+  "aws-signature",
+  "hawk",
+  "jwt",
+] as const
+
+export const configureRESTAuthParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    authType: z.enum(authTypes),
+    active: z.boolean(),
+    placement: z.enum(["HEADERS", "QUERY_PARAMS"]).optional(),
+    references: z
+      .object(
+        Object.fromEntries(
+          authReferenceFields.map((field) => [
+            field,
+            environmentReference.optional(),
+          ])
+        ) as Record<
+          (typeof authReferenceFields)[number],
+          z.ZodOptional<typeof environmentReference>
+        >
+      )
+      .strict()
+      .optional(),
+  })
+  .strict()
+
+const authReferenceProperties = Object.fromEntries(
+  authReferenceFields.map((field) => [
+    field,
+    {
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+      pattern: "^[^<>\\r\\n]+$",
+      description: `Environment variable name for ${field}.`,
+    },
+  ])
+)
+
+export const configureRESTAuthInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    authType: {
+      type: "string",
+      enum: authTypes,
+      description: "Supported authorization mode for the visible draft.",
+    },
+    active: {
+      type: "boolean",
+      description: "Whether authorization is enabled for execution.",
+    },
+    placement: {
+      type: "string",
+      enum: ["HEADERS", "QUERY_PARAMS"],
+      description:
+        "Credential placement for authorization modes that support it.",
+    },
+    references: {
+      type: "object",
+      description: "Credential fields mapped to environment variable names.",
+      properties: authReferenceProperties,
+      additionalProperties: false,
+    },
+  },
+  required: ["expectedRevision", "authType", "active"],
+  additionalProperties: false,
+} as const
+
+const restVariable = z
+  .object({
+    key: z.string().min(1).max(256),
+    value: z.string().max(8192),
+    active: z.boolean(),
+  })
+  .strict()
+
+export const editRESTVariablesParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    variables: z.array(restVariable).max(50),
+  })
+  .strict()
+
+export const editRESTVariablesInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    variables: {
+      type: "array",
+      maxItems: 50,
+      description: "Complete replacement set for active-request variables.",
+      items: {
+        type: "object",
+        properties: {
+          key: { type: "string", minLength: 1, maxLength: 256 },
+          value: { type: "string", maxLength: 8192 },
+          active: { type: "boolean" },
+        },
+        required: ["key", "value", "active"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["expectedRevision", "variables"],
+  additionalProperties: false,
+} as const
+
+export const editRESTScriptsParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    target: z.enum(["pre_request", "post_request"]),
+    script: z.string().max(32768),
+  })
+  .strict()
+
+export const editRESTScriptsInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    target: {
+      type: "string",
+      enum: ["pre_request", "post_request"],
+      description: "Pre-request script or post-request test script.",
+    },
+    script: {
+      type: "string",
+      maxLength: 32768,
+      description:
+        "Complete replacement script text for a separately approved request execution.",
+    },
+  },
+  required: ["expectedRevision", "target", "script"],
+  additionalProperties: false,
+} as const
+
+export const inspectEnvironmentParser = z
+  .object({ referencedOnly: z.boolean().default(false) })
+  .strict()
+
+export const inspectEnvironmentInputSchema = {
+  type: "object",
+  properties: {
+    referencedOnly: {
+      type: "boolean",
+      default: false,
+      description:
+        "Filter the result to selected-environment variables referenced by the visible request.",
+    },
+  },
+  additionalProperties: false,
+} as const
+
+export const listEnvironmentsParser = z
+  .object({ offset: z.number().int().min(0).max(2147483647).default(0) })
+  .strict()
+
+export const listEnvironmentsInputSchema = {
+  type: "object",
+  properties: {
+    offset: {
+      type: "integer",
+      minimum: 0,
+      maximum: 2147483647,
+      default: 0,
+      description:
+        "Environment-list offset returned as nextOffset by the previous page.",
+    },
+  },
+  additionalProperties: false,
+} as const
+
+export const selectEnvironmentParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    environmentHandle: z.string().min(1).max(128),
+  })
+  .strict()
+
+export const selectEnvironmentInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    environmentHandle: {
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+      description: "Opaque handle returned by list_environments.",
+    },
+  },
+  required: ["expectedRevision", "environmentHandle"],
+  additionalProperties: false,
+} as const

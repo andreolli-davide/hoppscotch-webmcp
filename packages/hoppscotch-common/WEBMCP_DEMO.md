@@ -1,4 +1,4 @@
-# WebMCP Phase 1 demo
+# WebMCP REST workspace demo
 
 The WebMCP integration is an experimental progressive enhancement and is off by
 default. It exposes the live Hoppscotch app context and the visible REST request
@@ -29,9 +29,18 @@ await document.modelContext
   .then((tools) => tools.map(({ name }) => name))
 ```
 
-The REST editor returns `inspect_app_context`, `inspect_rest_exchange`,
-`read_rest_payload`, `edit_rest_request`, and `execute_rest_request`. On other
-routes, only `inspect_app_context` remains.
+The REST editor returns:
+
+- context and environment tools: `inspect_app_context`, `list_environments`,
+  `inspect_environment`, and `select_environment`;
+- REST observation/execution tools: `inspect_rest_exchange`,
+  `read_rest_payload`, `edit_rest_request`, and `execute_rest_request`;
+- narrow draft extensions: `configure_rest_auth`, `edit_rest_variables`, and
+  `edit_rest_scripts`.
+
+On other routes, only `inspect_app_context` remains. Authorization tools accept
+environment variable names and store `<<VARIABLE>>` references; they do not
+accept raw credential fields.
 
 ## Acceptance walkthrough
 
@@ -47,6 +56,12 @@ routes, only `inspect_app_context` remains.
    return `STATE_CHANGED` without modifying the request.
 6. Navigate to GraphQL, realtime, settings, and a shared-request URL and confirm
    the REST tools are unregistered.
+
+For the extended REST walkthrough, list environments and select one using its
+opaque handle, then configure a bearer or API-key reference. Edit request
+variables or either script and confirm each change is visible, dirty, undoable,
+and rejected when called again with a stale revision. Script text must not run
+until the separately approved `execute_rest_request` call.
 
 Do not use real credentials in demo payloads. Hoppscotch redacts credentials it
 manages or structurally recognizes, but cannot classify every arbitrary secret
