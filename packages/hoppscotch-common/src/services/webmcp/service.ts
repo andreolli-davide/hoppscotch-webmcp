@@ -1208,12 +1208,12 @@ export class WebMCPService extends Service {
       }
     }
     try {
-      if (action === "connect") await this.gqlExecution.connect(gql.tab)
+      if (action === "connect") await this.gqlExecution.connect(gql.tab, signal)
       else if (action === "disconnect") this.gqlExecution.disconnect()
       else if (action === "execute")
-        await this.gqlExecution.executeConnected(gql.tab)
+        await this.gqlExecution.executeConnected(gql.tab, null, signal)
       else if (action === "subscribe")
-        this.gqlExecution.startSubscriptionConnected(gql.tab)
+        this.gqlExecution.startSubscriptionConnected(gql.tab, signal)
       else this.gqlExecution.stopSubscription()
       this.activity.record({
         tool: `${action}_graphql`,
@@ -1223,6 +1223,17 @@ export class WebMCPService extends Service {
       })
       return this.gqlObservation()
     } catch (error) {
+      if (
+        signal.aborted ||
+        (error instanceof Error &&
+          error.message.toLowerCase().includes("cancelled"))
+      ) {
+        return this.failure(
+          "CANCELLED",
+          "The GraphQL action was cancelled.",
+          "graphql-document"
+        )
+      }
       return this.failure(
         "EXECUTION_FAILED",
         error instanceof Error ? error.message : "GraphQL action failed.",

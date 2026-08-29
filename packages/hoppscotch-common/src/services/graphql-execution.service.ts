@@ -61,14 +61,21 @@ export class GQLRequestExecutionService extends Service {
     }
   }
 
-  public async connect(tab: HoppTab<HoppGQLDocument>) {
+  public async connect(
+    tab: HoppTab<HoppGQLDocument>,
+    signal?: AbortSignal
+  ) {
     const options = this.baseOptions(tab)
-    await connect({
-      url: options.url,
-      request: options.request,
-      inheritedHeaders: options.inheritedHeaders,
-      inheritedAuth: options.inheritedAuth,
-    })
+    await connect(
+      {
+        url: options.url,
+        request: options.request,
+        inheritedHeaders: options.inheritedHeaders,
+        inheritedAuth: options.inheritedAuth,
+      },
+      false,
+      signal
+    )
     this.ensureConnected()
   }
 
@@ -87,16 +94,18 @@ export class GQLRequestExecutionService extends Service {
   /** UI convenience path: preserve the existing connect-then-run behavior. */
   public async execute(
     tab: HoppTab<HoppGQLDocument>,
-    selected?: OperationDefinitionNode | null
+    selected?: OperationDefinitionNode | null,
+    signal?: AbortSignal
   ) {
-    if (connection.state !== "CONNECTED") await this.connect(tab)
-    return this.executeConnected(tab, selected)
+    if (connection.state !== "CONNECTED") await this.connect(tab, signal)
+    return this.executeConnected(tab, selected, signal)
   }
 
   /** WebMCP path: execution has one effect and never opens a connection. */
   public async executeConnected(
     tab: HoppTab<HoppGQLDocument>,
-    selected?: OperationDefinitionNode | null
+    selected?: OperationDefinitionNode | null,
+    signal?: AbortSignal
   ) {
     this.ensureConnected()
     const options = this.options(tab, selected)
@@ -105,23 +114,31 @@ export class GQLRequestExecutionService extends Service {
         "Use the subscription lifecycle actions for subscriptions."
       )
     }
-    return runGQLOperation(options)
+    return runGQLOperation(options, signal)
   }
 
-  public startSubscription(tab: HoppTab<HoppGQLDocument>) {
+  public startSubscription(
+    tab: HoppTab<HoppGQLDocument>,
+    signal?: AbortSignal
+  ) {
     if (connection.state !== "CONNECTED")
-      return this.connect(tab).then(() => this.startSubscriptionConnected(tab))
-    return this.startSubscriptionConnected(tab)
+      return this.connect(tab, signal).then(() =>
+        this.startSubscriptionConnected(tab, signal)
+      )
+    return this.startSubscriptionConnected(tab, signal)
   }
 
   /** WebMCP path: subscriptions are started only on an established connection. */
-  public startSubscriptionConnected(tab: HoppTab<HoppGQLDocument>) {
+  public startSubscriptionConnected(
+    tab: HoppTab<HoppGQLDocument>,
+    signal?: AbortSignal
+  ) {
     this.ensureConnected()
     const options = this.options(tab)
     if (options.operationType !== "subscription") {
       throw new Error("The current GraphQL operation is not a subscription.")
     }
-    return runGQLOperation(options)
+    return runGQLOperation(options, signal)
   }
 
   public stopSubscription() {

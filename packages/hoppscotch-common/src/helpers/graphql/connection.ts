@@ -185,8 +185,13 @@ let timeoutSubscription: any
 
 export const connect = async (
   options: ConnectionRequestOptions,
-  isRunGQLOperation = false
+  isRunGQLOperation = false,
+  signal?: AbortSignal
 ) => {
+  if (signal?.aborted) {
+    throw new Error("The connection was cancelled.")
+  }
+
   if (connection.state === "CONNECTED") {
     throw new Error(
       "A connection is already running. Close it before starting another."
@@ -199,13 +204,25 @@ export const connect = async (
   connection.state = "CONNECTING"
 
   const poll = async () => {
+    if (signal?.aborted) {
+      disconnect()
+      return
+    }
     try {
-      await getSchema(options)
+      await getSchema(options, signal)
+      if (signal?.aborted) {
+        disconnect()
+        return
+      }
       if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
       timeoutSubscription = setTimeout(() => {
         poll()
       }, GQL_SCHEMA_POLL_INTERVAL)
     } catch (error) {
+      if (signal?.aborted) {
+        disconnect()
+        return
+      }
       connection.state = "ERROR"
 
       if (!isRunGQLOperation) {
@@ -221,7 +238,10 @@ export const connect = async (
 
 export const disconnect = () => {
   if (connection.state !== "CONNECTED") {
-    throw new Error("No connections are running to be disconnected")
+    clearTimeout(timeoutSubscription)
+    connection.state = "DISCONNECTED"
+    connection.schema = null
+    return
   }
 
   clearTimeout(timeoutSubscription)
@@ -236,7 +256,13 @@ export const reset = () => {
   connection.schema = null
 }
 
-const getSchema = async (options: ConnectionRequestOptions) => {
+const getSchema = async (
+  options: ConnectionRequestOptions,
+  signal?: AbortSignal
+) => {
+  if (signal?.aborted) {
+    throw new Error("The connection was cancelled.")
+  }
   try {
     const { url, request, inheritedHeaders, inheritedAuth } = options
 
@@ -289,52 +315,76 @@ const getSchema = async (options: ConnectionRequestOptions) => {
     }
 
     const kernelInterceptorService = getService(KernelInterceptorService)
-    const { response } = kernelInterceptorService.execute(kernelRequest)
+    const { response, cancel } = kernelInterceptorService.execute(kernelRequest)
 
-    const res = await response
+    const onAbort = () => {
+      cancel()
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
 
-    if (E.isLeft(res)) {
-      connection.state = "ERROR"
+    try {
+      const res = await response
 
-      if (res.left !== "cancellation" && typeof res.left === "object") {
-        connection.error = {
-          type: res.left.error?.kind || "error",
-          message: (t: ReturnType<typeof getI18n>) => {
-            if (res.left !== "cancellation" && typeof res.left === "object") {
-              return (
-                res.left.humanMessage?.description(t) ||
-                t("graphql.connection_error_http")
-              )
-            }
-            return "Unknown"
-          },
-          component: res.left.component,
+      if (E.isLeft(res)) {
+        if (signal?.aborted || res.left === "cancellation") {
+          throw new Error("The connection was cancelled.")
         }
+        connection.state = "ERROR"
+
+        if (typeof res.left === "object") {
+          connection.error = {
+            type: res.left.error?.kind || "error",
+            message: (t: ReturnType<typeof getI18n>) => {
+              if (typeof res.left === "object") {
+                return (
+                  res.left.humanMessage?.description(t) ||
+                  t("graphql.connection_error_http")
+                )
+              }
+              return "Unknown"
+            },
+            component: res.left.component,
+          }
+        }
+
+        throw new Error(
+          typeof res.left === "string" ? res.left : res.left.error.message
+        )
       }
 
-      throw new Error(
-        typeof res.left === "string" ? res.left : res.left.error.message
-      )
+      const data = res.right
+
+      const decoder = new TextDecoder("utf-8")
+      const responseText = decoder.decode(data.body.body)
+
+      const introspectResponse = JSON.parse(responseText)
+
+      const schemaData = buildClientSchema(introspectResponse.data)
+
+      connection.schema = schemaData
+      connection.error = null
+    } finally {
+      signal?.removeEventListener("abort", onAbort)
     }
-
-    const data = res.right
-
-    const decoder = new TextDecoder("utf-8")
-    const responseText = decoder.decode(data.body.body)
-
-    const introspectResponse = JSON.parse(responseText)
-
-    const schemaData = buildClientSchema(introspectResponse.data)
-
-    connection.schema = schemaData
-    connection.error = null
   } catch (e: any) {
     console.error(e)
     disconnect()
+    throw e
   }
 }
 
-export const runGQLOperation = async (options: RunQueryOptions) => {
+export const runGQLOperation = async (
+  options: RunQueryOptions,
+  signal?: AbortSignal
+) => {
+  if (signal?.aborted) {
+    throw new Error(
+      options.operationType === "subscription"
+        ? "The GraphQL subscription was cancelled."
+        : "The GraphQL operation was cancelled."
+    )
+  }
+
   if (connection.state !== "CONNECTED") {
     await connect(
       {
@@ -343,7 +393,8 @@ export const runGQLOperation = async (options: RunQueryOptions) => {
         inheritedHeaders: options.inheritedHeaders,
         inheritedAuth: options.inheritedAuth,
       },
-      true
+      true,
+      signal
     )
   }
 
@@ -420,7 +471,7 @@ export const runGQLOperation = async (options: RunQueryOptions) => {
   }
 
   if (operationType === "subscription") {
-    return runSubscription(options, finalHeaders)
+    return runSubscription(options, finalHeaders, signal)
   }
 
   try {
@@ -435,65 +486,77 @@ export const runGQLOperation = async (options: RunQueryOptions) => {
     }
 
     const kernelInterceptorService = getService(KernelInterceptorService)
-    const { response } = kernelInterceptorService.execute(kernelRequest)
+    const { response, cancel } = kernelInterceptorService.execute(kernelRequest)
 
-    const result = await response
+    const onAbort = () => {
+      cancel()
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
 
-    if (E.isLeft(result)) {
-      if (result.left !== "cancellation" && typeof result.left === "object") {
-        connection.error = {
-          type: result.left.error?.kind || "error",
-          message: (t: ReturnType<typeof getI18n>) => {
-            if (
-              result.left !== "cancellation" &&
-              typeof result.left === "object"
-            ) {
-              return (
-                result.left.humanMessage?.description(t) ||
-                t("graphql.operation_error")
-              )
-            }
-            return "Unknown"
-          },
-          component: result.left.component,
+    try {
+      const result = await response
+
+      if (E.isLeft(result)) {
+        if (signal?.aborted || result.left === "cancellation") {
+          throw new Error("The GraphQL operation was cancelled.")
         }
+        if (typeof result.left === "object") {
+          connection.error = {
+            type: result.left.error?.kind || "error",
+            message: (t: ReturnType<typeof getI18n>) => {
+              if (typeof result.left === "object") {
+                return (
+                  result.left.humanMessage?.description(t) ||
+                  t("graphql.operation_error")
+                )
+              }
+              return "Unknown"
+            },
+            component: result.left.component,
+          }
+        }
+
+        throw new Error(
+          typeof result.left === "string"
+            ? result.left
+            : result.left.error.message
+        )
       }
 
-      throw new Error(
-        typeof result.left === "string"
-          ? result.left
-          : result.left.error.message
-      )
-    }
+      const relayResponse = result.right
 
-    const relayResponse = result.right
+      const parsedResponse = await GQLResponse.toResponse(relayResponse, options)
 
-    const parsedResponse = await GQLResponse.toResponse(relayResponse, options)
+      if (parsedResponse.type === "error") {
+        throw new Error(parsedResponse.error.message)
+      }
 
-    if (parsedResponse.type === "error") {
-      throw new Error(parsedResponse.error.message)
-    }
+      const timeStart = Date.now()
+      const timeEnd = Date.now()
 
-    const timeStart = Date.now()
-    const timeEnd = Date.now()
-
-    gqlMessageEvent.value = {
-      ...parsedResponse,
-      document: {
-        type: "success",
-        statusCode: relayResponse.status,
-        statusText: relayResponse.statusText,
-        meta: {
-          responseSize: relayResponse.body.body.byteLength,
-          responseDuration: timeEnd - timeStart,
+      gqlMessageEvent.value = {
+        ...parsedResponse,
+        document: {
+          type: "success",
+          statusCode: relayResponse.status,
+          statusText: relayResponse.statusText,
+          meta: {
+            responseSize: relayResponse.body.body.byteLength,
+            responseDuration: timeEnd - timeStart,
+          },
         },
-      },
+      }
+
+      addQueryToHistory(options, parsedResponse.data)
+
+      return parsedResponse.data
+    } finally {
+      signal?.removeEventListener("abort", onAbort)
     }
-
-    addQueryToHistory(options, parsedResponse.data)
-
-    return parsedResponse.data
   } catch (error: any) {
+    if (signal?.aborted) {
+      throw new Error("The GraphQL operation was cancelled.")
+    }
     gqlMessageEvent.value = {
       type: "error",
       error: {
@@ -572,8 +635,14 @@ const generateAuthHeader = async (
 
 export const runSubscription = (
   options: RunQueryOptions,
-  headers?: Record<string, string>
+  headers?: Record<string, string>,
+  signal?: AbortSignal
 ) => {
+  if (signal?.aborted) {
+    socketDisconnect()
+    throw new Error("The GraphQL subscription was cancelled.")
+  }
+
   const { url, query, operationName } = options
   const wsUrl = url.replace(/^http/, "ws")
 
@@ -581,7 +650,16 @@ export const runSubscription = (
 
   connection.socket = new WebSocket(wsUrl, "graphql-ws")
 
+  const onAbort = () => {
+    socketDisconnect()
+  }
+  signal?.addEventListener("abort", onAbort, { once: true })
+
   connection.socket.onopen = (event) => {
+    if (signal?.aborted) {
+      socketDisconnect()
+      return
+    }
     console.log("WebSocket is open now.", event)
 
     connection.socket?.send(
@@ -603,6 +681,7 @@ export const runSubscription = (
   gqlMessageEvent.value = "reset"
 
   connection.socket.onmessage = (event) => {
+    if (signal?.aborted) return
     const data = JSON.parse(event.data)
     switch (data.type) {
       case GQL.CONNECTION_ACK: {
@@ -634,6 +713,7 @@ export const runSubscription = (
   }
 
   connection.socket.onclose = (event) => {
+    signal?.removeEventListener("abort", onAbort)
     console.log("WebSocket is closed now.", event)
     connection.subscriptionState.set(currentTabID.value, "UNSUBSCRIBED")
   }
