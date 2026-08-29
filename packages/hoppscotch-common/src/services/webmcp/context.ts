@@ -61,118 +61,133 @@ export class ActiveAppContextService extends Service {
     "realtime-session": 1,
   }
 
+  private readonly subscriptions: Array<{ unsubscribe: () => void }> = []
+  private readonly watchStops: Array<() => void> = []
+
   override onServiceInit() {
-    watch(
-      () => [
-        this.restTabs.currentTabID.value,
-        this.restTabs.currentActiveTab.value?.document?.type,
-        this.restTabs.currentActiveTab.value?.document?.isDirty,
-        this.restTabs.currentActiveTab.value?.document?.type === "request"
-          ? this.restTabs.currentActiveTab.value?.document?.request
-          : null,
-        this.restTabs.currentActiveTab.value?.document?.type === "request"
-          ? this.restTabs.currentActiveTab.value?.document?.inheritedProperties
-          : null,
-        this.restTabs.currentActiveTab.value?.document?.type === "request"
-          ? this.restTabs.currentActiveTab.value?.document?.saveContext
-          : null,
-      ],
-      () => {
-        this.bump("app-context")
-        this.bump("rest-document")
-      },
-      { deep: true, flush: "sync" }
+    this.watchStops.push(
+      watch(
+        () => [
+          this.restTabs.currentTabID.value,
+          this.restTabs.currentActiveTab.value?.document?.type,
+          this.restTabs.currentActiveTab.value?.document?.isDirty,
+          this.restTabs.currentActiveTab.value?.document?.type === "request"
+            ? this.restTabs.currentActiveTab.value?.document?.request
+            : null,
+          this.restTabs.currentActiveTab.value?.document?.type === "request"
+            ? this.restTabs.currentActiveTab.value?.document?.inheritedProperties
+            : null,
+          this.restTabs.currentActiveTab.value?.document?.type === "request"
+            ? this.restTabs.currentActiveTab.value?.document?.saveContext
+            : null,
+        ],
+        () => {
+          this.bump("app-context")
+          this.bump("rest-document")
+        },
+        { deep: true, flush: "sync" }
+      ),
+      watch(
+        () => [
+          this.gqlTabs.currentTabID.value,
+          this.gqlTabs.currentActiveTab.value?.document?.request,
+          this.gqlTabs.currentActiveTab.value?.document?.isDirty,
+          this.gqlTabs.currentActiveTab.value?.document?.saveContext,
+          this.gqlTabs.currentActiveTab.value?.document?.inheritedProperties,
+        ],
+        () => {
+          this.bump("app-context")
+          this.bump("graphql-document")
+        },
+        { deep: true, flush: "sync" }
+      ),
+      watch(
+        () => [gqlMessageEvent.value, connection.state, connection.schema],
+        () => this.bump("graphql-response"),
+        { deep: true, flush: "sync" }
+      ),
+      watch(
+        () =>
+          this.restTabs.currentActiveTab.value?.document?.type === "request"
+            ? [
+                this.restTabs.currentActiveTab.value?.document?.response,
+                this.restTabs.currentActiveTab.value?.document?.testResults,
+              ]
+            : null,
+        () => this.bump("rest-response"),
+        { deep: true, flush: "sync" }
+      ),
+      watch(
+        this.workspace.currentWorkspace,
+        () => {
+          this.bump("app-context")
+          this.bump("rest-document")
+        },
+        { deep: true, flush: "sync" }
+      ),
+      watch(
+        () => this.interceptor.getCurrentId(),
+        () => this.bump("rest-document"),
+        { flush: "sync" }
+      ),
+      watch(
+        () => this.secrets.secretEnvironments,
+        () => this.bump("rest-document"),
+        { deep: true, flush: "sync" }
+      ),
+      watch(
+        () => this.currentValues.environments,
+        () => this.bump("rest-document"),
+        { deep: true, flush: "sync" }
+      )
     )
 
-    watch(
-      () => [
-        this.gqlTabs.currentTabID.value,
-        this.gqlTabs.currentActiveTab.value?.document?.request,
-        this.gqlTabs.currentActiveTab.value?.document?.isDirty,
-        this.gqlTabs.currentActiveTab.value?.document?.saveContext,
-        this.gqlTabs.currentActiveTab.value?.document?.inheritedProperties,
-      ],
-      () => {
+    this.subscriptions.push(
+      environmentsStore.subject$.subscribe(() => {
+        this.bump("app-context")
+        this.bump("rest-document")
+      }),
+      restCollections$.subscribe(() => {
+        this.bump("app-context")
+        this.bump("rest-document")
+      }),
+      graphqlCollections$.subscribe(() => {
         this.bump("app-context")
         this.bump("graphql-document")
-      },
-      { deep: true, flush: "sync" }
-    )
-    watch(
-      () => [gqlMessageEvent.value, connection.state, connection.schema],
-      () => this.bump("graphql-response"),
-      { deep: true, flush: "sync" }
-    )
-
-    watch(
-      () =>
-        this.restTabs.currentActiveTab.value?.document?.type === "request"
-          ? [
-              this.restTabs.currentActiveTab.value?.document?.response,
-              this.restTabs.currentActiveTab.value?.document?.testResults,
-            ]
-          : null,
-      () => this.bump("rest-response"),
-      { deep: true, flush: "sync" }
-    )
-
-    watch(
-      this.workspace.currentWorkspace,
-      () => {
+      }),
+      restHistory$.subscribe(() => {
         this.bump("app-context")
         this.bump("rest-document")
-      },
-      { deep: true, flush: "sync" }
+      }),
+      graphqlHistory$.subscribe(() => {
+        this.bump("app-context")
+        this.bump("graphql-document")
+      })
     )
-    watch(
-      () => this.interceptor.getCurrentId(),
-      () => this.bump("rest-document"),
-      { flush: "sync" }
-    )
-    watch(
-      () => this.secrets.secretEnvironments,
-      () => this.bump("rest-document"),
-      { deep: true, flush: "sync" }
-    )
-    watch(
-      () => this.currentValues.environments,
-      () => this.bump("rest-document"),
-      { deep: true, flush: "sync" }
-    )
-
-    environmentsStore.subject$.subscribe(() => {
-      this.bump("app-context")
-      this.bump("rest-document")
-    })
-    restCollections$.subscribe(() => {
-      this.bump("app-context")
-      this.bump("rest-document")
-    })
-    graphqlCollections$.subscribe(() => {
-      this.bump("app-context")
-      this.bump("graphql-document")
-    })
-    restHistory$.subscribe(() => {
-      this.bump("app-context")
-      this.bump("rest-document")
-    })
-    graphqlHistory$.subscribe(() => {
-      this.bump("app-context")
-      this.bump("graphql-document")
-    })
     const bumpRealtimeSession = () => this.bump("realtime-session")
-    WSRequest$.subscribe(bumpRealtimeSession)
-    WSLog$.subscribe(bumpRealtimeSession)
-    WSSocket$.subscribe(bumpRealtimeSession)
-    SIORequest$.subscribe(bumpRealtimeSession)
-    SIOLog$.subscribe(bumpRealtimeSession)
-    SIOSocket$.subscribe(bumpRealtimeSession)
-    SSERequest$.subscribe(bumpRealtimeSession)
-    SSELog$.subscribe(bumpRealtimeSession)
-    SSESocket$.subscribe(bumpRealtimeSession)
-    MQTTRequest$.subscribe(bumpRealtimeSession)
-    MQTTLog$.subscribe(bumpRealtimeSession)
-    MQTTConn$.subscribe(bumpRealtimeSession)
+    this.subscriptions.push(
+      WSRequest$.subscribe(bumpRealtimeSession),
+      WSLog$.subscribe(bumpRealtimeSession),
+      WSSocket$.subscribe(bumpRealtimeSession),
+      SIORequest$.subscribe(bumpRealtimeSession),
+      SIOLog$.subscribe(bumpRealtimeSession),
+      SIOSocket$.subscribe(bumpRealtimeSession),
+      SSERequest$.subscribe(bumpRealtimeSession),
+      SSELog$.subscribe(bumpRealtimeSession),
+      SSESocket$.subscribe(bumpRealtimeSession),
+      MQTTRequest$.subscribe(bumpRealtimeSession),
+      MQTTLog$.subscribe(bumpRealtimeSession),
+      MQTTConn$.subscribe(bumpRealtimeSession)
+    )
+  }
+
+  public dispose() {
+    this.watchStops.forEach((stop) => stop())
+    this.watchStops.length = 0
+    this.subscriptions.forEach((sub) => sub.unsubscribe())
+    this.subscriptions.length = 0
+    this.stopRouteWatch?.()
+    this.stopRouteWatch = null
   }
 
   public attachRouter(router: Router) {

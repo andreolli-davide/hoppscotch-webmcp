@@ -308,6 +308,7 @@ export class WebMCPService extends Service {
     this.appController?.abort()
     this.appController = null
     this.approval.clear()
+    this.context.dispose()
   }
 
   private async syncRESTPack() {
