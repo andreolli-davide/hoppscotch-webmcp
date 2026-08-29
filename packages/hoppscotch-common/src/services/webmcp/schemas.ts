@@ -931,3 +931,142 @@ export const realtimeLogInputSchema = {
   required: ["expectedRevision"],
   additionalProperties: false,
 } as const
+
+export const switchTabParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    tabID: z.string().min(1).max(128),
+  })
+  .strict()
+
+export const switchTabInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    tabID: { type: "string", minLength: 1, maxLength: 128 },
+  },
+  required: ["expectedRevision", "tabID"],
+  additionalProperties: false,
+} as const
+
+export const createTabParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    name: z.string().max(256).optional(),
+  })
+  .strict()
+
+export const createTabInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    name: { type: "string", maxLength: 256 },
+  },
+  required: ["expectedRevision"],
+  additionalProperties: false,
+} as const
+
+export const closeTabParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    tabID: z.string().min(1).max(128),
+    force: z.boolean().default(false),
+  })
+  .strict()
+
+export const closeTabInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    tabID: { type: "string", minLength: 1, maxLength: 128 },
+    force: { type: "boolean", default: false },
+  },
+  required: ["expectedRevision", "tabID"],
+  additionalProperties: false,
+} as const
+
+export const inspectCollectionParser = z
+  .object({
+    path: z.string().min(1).max(256),
+  })
+  .strict()
+
+export const inspectCollectionInputSchema = {
+  type: "object",
+  properties: {
+    path: { type: "string", minLength: 1, maxLength: 256 },
+  },
+  required: ["path"],
+  additionalProperties: false,
+} as const
+
+export const saveRequestToCollectionParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    collectionPath: z.string().max(256).optional(),
+    name: z.string().max(256).optional(),
+  })
+  .strict()
+
+export const saveRequestToCollectionInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    collectionPath: { type: "string", maxLength: 256 },
+    name: { type: "string", maxLength: 256 },
+  },
+  required: ["expectedRevision"],
+  additionalProperties: false,
+} as const
+
+export const listHistoryParser = z
+  .object({
+    limit: z.number().int().min(1).max(50).default(10),
+    offset: z.number().int().min(0).default(0),
+  })
+  .strict()
+
+export const listHistoryInputSchema = {
+  type: "object",
+  properties: {
+    limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
+    offset: { type: "integer", minimum: 0, default: 0 },
+  },
+  additionalProperties: false,
+} as const
+
+export const loadHistoryEntryParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    index: z.number().int().min(0),
+    targetTab: z.enum(["current", "new"]).default("current"),
+  })
+  .strict()
+
+export const loadHistoryEntryInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    index: { type: "integer", minimum: 0 },
+    targetTab: { type: "string", enum: ["current", "new"], default: "current" },
+  },
+  required: ["expectedRevision", "index"],
+  additionalProperties: false,
+} as const
+
+export const switchWorkspaceParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    workspaceID: z.string().min(1).max(128),
+  })
+  .strict()
+
+export const switchWorkspaceInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    workspaceID: { type: "string", minLength: 1, maxLength: 128 },
+  },
+  required: ["expectedRevision", "workspaceID"],
+  additionalProperties: false,
+} as const

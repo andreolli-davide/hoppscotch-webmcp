@@ -9,6 +9,11 @@ import {
   getCurrentEnvironment,
   getSelectedEnvironmentType,
 } from "~/newstore/environments"
+import {
+  restCollections$,
+  graphqlCollections$,
+} from "~/newstore/collections"
+import { restHistory$, graphqlHistory$ } from "~/newstore/history"
 import { CurrentValueService } from "~/services/current-environment-value.service"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
@@ -138,6 +143,22 @@ export class ActiveAppContextService extends Service {
     environmentsStore.subject$.subscribe(() => {
       this.bump("app-context")
       this.bump("rest-document")
+    })
+    restCollections$.subscribe(() => {
+      this.bump("app-context")
+      this.bump("rest-document")
+    })
+    graphqlCollections$.subscribe(() => {
+      this.bump("app-context")
+      this.bump("graphql-document")
+    })
+    restHistory$.subscribe(() => {
+      this.bump("app-context")
+      this.bump("rest-document")
+    })
+    graphqlHistory$.subscribe(() => {
+      this.bump("app-context")
+      this.bump("graphql-document")
     })
     const bumpRealtimeSession = () => this.bump("realtime-session")
     WSRequest$.subscribe(bumpRealtimeSession)

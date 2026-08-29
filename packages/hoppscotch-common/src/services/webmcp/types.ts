@@ -22,6 +22,7 @@ export type WebMCPErrorCode =
   | "CANCELLED"
   | "SCRIPT_FAILED"
   | "EXECUTION_FAILED"
+  | "DIRTY_TAB_UNSAVED_CHANGES"
 
 /** A bounded, redacted diagnostic. Locations are source-relative when present. */
 export type WebMCPDiagnostic = {

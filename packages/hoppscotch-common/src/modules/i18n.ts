@@ -48,7 +48,7 @@ type LanguagesDef = {
 
 const FALLBACK_LANG_CODE = "en"
 
-const persistenceService = getService(PersistenceService)
+const getPersistenceService = () => getService(PersistenceService)
 
 // TypeScript cannot understand dir is restricted to "ltr" or "rtl" yet, hence assertion
 export const APP_LANGUAGES: LanguagesDef[] = languages as LanguagesDef[]
@@ -128,7 +128,7 @@ const mergeAdditionalMessages = (locale: string): void => {
 const resolveCurrentLocale = async () =>
   pipe(
     // Resolve from locale and make sure it is in languages
-    await persistenceService.getLocalConfig("locale"),
+    await getPersistenceService().getLocalConfig("locale"),
     O.fromNullable,
     O.filter((locale) =>
       pipe(
@@ -180,7 +180,7 @@ export const changeAppLanguage = async (locale: string) => {
   // TODO: Look into the type issues here
   i18nInstance.global.locale.value = locale
 
-  await persistenceService.setLocalConfig("locale", locale)
+  await getPersistenceService().setLocalConfig("locale", locale)
 }
 
 /**
@@ -214,7 +214,7 @@ export default <HoppModule>{
     const currentLocale = await resolveCurrentLocale()
     changeAppLanguage(currentLocale)
 
-    await persistenceService.setLocalConfig("locale", currentLocale)
+    await getPersistenceService().setLocalConfig("locale", currentLocale)
   },
   onBeforeRouteChange(to, _, router) {
     // Convert old locale path format to new format

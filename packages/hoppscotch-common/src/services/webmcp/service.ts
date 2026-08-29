@@ -1,4 +1,8 @@
-import { HoppGQLRequest, HoppRESTRequest } from "@hoppscotch/data"
+import {
+  HoppGQLRequest,
+  HoppRESTRequest,
+  getDefaultGQLRequest,
+} from "@hoppscotch/data"
 import { Service } from "dioc"
 import { cloneDeep } from "lodash-es"
 import { computed, Ref, watch } from "vue"
@@ -12,6 +16,22 @@ import { RESTTabService } from "~/services/tab/rest"
 import { GQLTabService } from "~/services/tab/graphql"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
+import { WorkspaceService } from "~/services/workspace.service"
+import { getDefaultRESTRequest } from "~/helpers/rest/default"
+import {
+  restCollectionStore,
+  graphqlCollectionStore,
+  navigateToFolderWithIndexPath,
+  saveRESTRequestAs,
+  editRESTRequest,
+  saveGraphqlRequestAs,
+  editGraphqlRequest,
+  cascadeParentCollectionForProperties,
+} from "~/newstore/collections"
+import {
+  restHistoryStore,
+  graphqlHistoryStore,
+} from "~/newstore/history"
 import { HoppTab } from "~/services/tab"
 import { HoppRequestDocument } from "~/helpers/rest/document"
 import { HoppGQLDocument } from "~/helpers/graphql/document"
@@ -83,6 +103,22 @@ import {
   readRESTScriptParser,
   editGraphQLVariablesInputSchema,
   editGraphQLVariablesParser,
+  switchTabInputSchema,
+  switchTabParser,
+  createTabInputSchema,
+  createTabParser,
+  closeTabInputSchema,
+  closeTabParser,
+  inspectCollectionInputSchema,
+  inspectCollectionParser,
+  saveRequestToCollectionInputSchema,
+  saveRequestToCollectionParser,
+  listHistoryInputSchema,
+  listHistoryParser,
+  loadHistoryEntryInputSchema,
+  loadHistoryEntryParser,
+  switchWorkspaceInputSchema,
+  switchWorkspaceParser,
 } from "./schemas"
 import {
   applyJSONPointerOperations,
@@ -135,6 +171,7 @@ export class WebMCPService extends Service {
   private readonly context = this.bind(ActiveAppContextService)
   private readonly restTabs = this.bind(RESTTabService)
   private readonly gqlTabs = this.bind(GQLTabService)
+  private readonly workspace = this.bind(WorkspaceService)
   private readonly interceptor = this.bind(KernelInterceptorService)
   private readonly secrets = this.bind(SecretEnvironmentService)
   private readonly execution = this.bind(RESTRequestExecutionService)
@@ -336,26 +373,132 @@ export class WebMCPService extends Service {
   }
 
   private async registerAppPack(signal: AbortSignal) {
-    await this.adapter.register(
-      {
-        name: "inspect_app_context",
-        title: "Inspect Hoppscotch context",
-        description:
-          "Inspect the visible Hoppscotch surface, workspace, selected environment, active live artifact, and capability packs. Results use bounded, redacted projections.",
-        inputSchema: emptyInputSchema,
-        annotations: { readOnlyHint: true, untrustedContentHint: true },
-        execute: async (input: Record<string, unknown>) => {
-          if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-            return this.failure(
-              "INVALID_INPUT",
-              "This tool accepts an empty object only."
-            )
-          }
-          return this.result("app-context", {})
+    await Promise.all([
+      this.adapter.register(
+        {
+          name: "inspect_app_context",
+          title: "Inspect Hoppscotch context",
+          description:
+            "Inspect the visible Hoppscotch surface, workspace, selected environment, active live artifact, and capability packs. Results use bounded, redacted projections.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            return this.result("app-context", {})
+          },
         },
-      },
-      signal
-    )
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "list_workspaces",
+          title: "List available workspaces",
+          description:
+            "List personal and team workspaces with their names, roles, and current selection status.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const current = this.workspace.currentWorkspace.value
+            const redactor = this.redactor()
+            const listAdapter = this.workspace.acquireTeamListAdapter(null)
+            const teams = listAdapter.teamList$.value
+            const workspaces = [
+              {
+                id: "personal",
+                name: "Personal Workspace",
+                type: "personal",
+                isCurrent: current.type === "personal",
+              },
+              ...teams.map((team) => ({
+                id: team.id,
+                name: redactor.scrub(team.name, 64),
+                type: "team",
+                role: team.myRole ? redactor.scrub(team.myRole, 32) : undefined,
+                isCurrent:
+                  current.type === "team" && current.teamID === team.id,
+              })),
+            ]
+            return this.result("app-context", { workspaces })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "switch_workspace",
+          title: "Switch active workspace",
+          description:
+            "Switch to the personal workspace or a team workspace by workspace ID.",
+          inputSchema: switchWorkspaceInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = switchWorkspaceParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches("app-context", parsed.data.expectedRevision)
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+            if (parsed.data.workspaceID === "personal") {
+              this.workspace.changeWorkspace({ type: "personal" })
+            } else {
+              const listAdapter = this.workspace.acquireTeamListAdapter(null)
+              const team = listAdapter.teamList$.value.find(
+                (t) => t.id === parsed.data.workspaceID
+              )
+              if (!team) {
+                return this.failure(
+                  "INVALID_INPUT",
+                  "The requested team workspace was not found.",
+                  "app-context"
+                )
+              }
+              this.workspace.changeWorkspace({
+                type: "team",
+                teamID: team.id,
+                teamName: team.name,
+                role: team.myRole,
+              })
+            }
+            this.activity.record({
+              tool: "switch_workspace",
+              outcome: "changed",
+              summary: `Switched workspace to ${parsed.data.workspaceID}`,
+              revision: this.context.revision("app-context"),
+            })
+            return this.result("app-context", { switched: true })
+          },
+        },
+        signal
+      ),
+    ])
   }
 
   private async registerRESTPack(signal: AbortSignal) {
@@ -615,6 +758,556 @@ export class WebMCPService extends Service {
         },
         signal
       ),
+      this.adapter.register(
+        {
+          name: "list_tabs",
+          title: "List open tabs",
+          description:
+            "List all open editor tabs for the current mode with their IDs, titles, dirty states, and active selection.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const redactor = this.redactor()
+            const tabs = this.restTabs.getTabs().map((tab) => ({
+              id: tab.id,
+              title: redactor.scrub(
+                tab.document.type === "request"
+                  ? tab.document.request.name
+                  : tab.document.type,
+                64
+              ),
+              type: tab.document.type,
+              isDirty: tab.document.isDirty,
+              isActive: tab.id === this.restTabs.currentTabID.value,
+              saveContext:
+                tab.document.type === "request" && tab.document.saveContext
+                  ? {
+                      originLocation: tab.document.saveContext.originLocation,
+                      folderPath:
+                        tab.document.saveContext.originLocation ===
+                        "user-collection"
+                          ? tab.document.saveContext.folderPath
+                          : undefined,
+                    }
+                  : undefined,
+            }))
+            return this.result("rest-document", { tabs })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "switch_tab",
+          title: "Switch active tab",
+          description: "Switch to a specific open tab by tab ID.",
+          inputSchema: switchTabInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = switchTabParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The tab state changed; inspect it again.",
+                "rest-document",
+                true
+              )
+            }
+            const tab = this.restTabs
+              .getTabs()
+              .find((t) => t.id === parsed.data.tabID)
+            if (!tab) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The requested tab was not found.",
+                "rest-document"
+              )
+            }
+            this.restTabs.setActiveTab(parsed.data.tabID)
+            this.activity.record({
+              tool: "switch_tab",
+              outcome: "changed",
+              summary: `Switched active tab to ${parsed.data.tabID}`,
+              revision: this.context.revision("rest-document"),
+            })
+            return this.observation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "create_tab",
+          title: "Create new tab",
+          description:
+            "Open a new blank request tab in the editor and set it as active.",
+          inputSchema: createTabInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = createTabParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The tab state changed; inspect it again.",
+                "rest-document",
+                true
+              )
+            }
+            const req = getDefaultRESTRequest()
+            if (parsed.data.name) req.name = parsed.data.name
+            const newTab = this.restTabs.createNewTab(
+              {
+                type: "request",
+                request: req,
+                isDirty: false,
+                optionTabPreference: "params",
+              },
+              true
+            )
+            this.activity.record({
+              tool: "create_tab",
+              outcome: "changed",
+              summary: `Created new tab ${newTab.id}`,
+              revision: this.context.revision("rest-document"),
+            })
+            return this.observation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "close_tab",
+          title: "Close tab",
+          description:
+            "Close an open tab by ID. If the tab has unsaved changes, force must be set to true.",
+          inputSchema: closeTabInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = closeTabParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The tab state changed; inspect it again.",
+                "rest-document",
+                true
+              )
+            }
+            const tab = this.restTabs
+              .getTabs()
+              .find((t) => t.id === parsed.data.tabID)
+            if (!tab) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The requested tab was not found.",
+                "rest-document"
+              )
+            }
+            if (this.restTabs.getTabs().length <= 1) {
+              return this.failure(
+                "INVALID_INPUT",
+                "Cannot close the only open tab.",
+                "rest-document"
+              )
+            }
+            if (tab.document.isDirty && !parsed.data.force) {
+              return this.failure(
+                "DIRTY_TAB_UNSAVED_CHANGES",
+                "The tab has unsaved changes. Save it to a collection or pass force: true to discard changes.",
+                "rest-document"
+              )
+            }
+            this.restTabs.closeTab(parsed.data.tabID)
+            this.activity.record({
+              tool: "close_tab",
+              outcome: "changed",
+              summary: `Closed tab ${parsed.data.tabID}`,
+              revision: this.context.revision("rest-document"),
+            })
+            return this.observation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "list_collections",
+          title: "List collections",
+          description:
+            "List top-level collections with folder counts, request counts, and paths.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const redactor = this.redactor()
+            const collections = restCollectionStore.value.state.map(
+              (col, index) => ({
+                id: col.id,
+                name: redactor.scrub(col.name, 64),
+                path: String(index),
+                foldersCount: col.folders.length,
+                requestsCount: col.requests.length,
+              })
+            )
+            return this.result("rest-document", { collections })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "inspect_collection",
+          title: "Inspect collection or folder",
+          description:
+            "Inspect the structure of a specific collection or folder by path.",
+          inputSchema: inspectCollectionInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = inspectCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const target = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              parsed.data.path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The requested collection or folder path was not found.",
+                "rest-document"
+              )
+            }
+            const redactor = this.redactor()
+            return this.result("rest-document", {
+              collection: {
+                name: redactor.scrub(target.name, 64),
+                path: parsed.data.path,
+                authType: target.auth?.authType ?? "inherit",
+                headersCount: target.headers?.length ?? 0,
+                variablesCount: target.variables?.length ?? 0,
+                folders: target.folders.map((f, i) => ({
+                  name: redactor.scrub(f.name, 64),
+                  path: `${parsed.data.path}/${i}`,
+                  foldersCount: f.folders.length,
+                  requestsCount: f.requests.length,
+                })),
+                requests: target.requests.map((r, i) => ({
+                  name: redactor.scrub(r.name, 64),
+                  method: (r as HoppRESTRequest).method,
+                  endpoint: redactor.scrub(
+                    (r as HoppRESTRequest).endpoint || "",
+                    128
+                  ),
+                  index: i,
+                })),
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "save_request_to_collection",
+          title: "Save request to collection",
+          description:
+            "Save the visible request draft into a collection/folder or update it in place.",
+          inputSchema: saveRequestToCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = saveRequestToCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const rest = this.visibleREST()
+            if ("ok" in rest) return rest
+            if (
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The request draft changed; inspect it again.",
+                "rest-document",
+                true
+              )
+            }
+            const activeTab = rest.tab
+            const currentDoc = activeTab.document
+            const reqToSave = cloneDeep(currentDoc.request)
+            if (parsed.data.name) reqToSave.name = parsed.data.name
+
+            let path = parsed.data.collectionPath
+            if (
+              !path &&
+              currentDoc.saveContext?.originLocation === "user-collection"
+            ) {
+              path = currentDoc.saveContext.folderPath
+            }
+            if (!path) {
+              path = "0"
+            }
+
+            const target = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Collection path ${path} not found.`,
+                "rest-document"
+              )
+            }
+
+            if (
+              !parsed.data.collectionPath &&
+              currentDoc.saveContext?.originLocation === "user-collection" &&
+              currentDoc.saveContext.requestIndex !== undefined
+            ) {
+              editRESTRequest(
+                path,
+                currentDoc.saveContext.requestIndex,
+                reqToSave
+              )
+              activeTab.document.isDirty = false
+              activeTab.document.request = reqToSave
+            } else {
+              const insertionIndex = saveRESTRequestAs(path, reqToSave)
+              activeTab.document.request = reqToSave
+              activeTab.document.isDirty = false
+              activeTab.document.saveContext = {
+                originLocation: "user-collection",
+                folderPath: path,
+                requestIndex: insertionIndex,
+                exampleID: undefined,
+                requestRefID: reqToSave._ref_id,
+              }
+              activeTab.document.inheritedProperties =
+                cascadeParentCollectionForProperties(path, "rest")
+            }
+
+            this.activity.record({
+              tool: "save_request_to_collection",
+              outcome: "changed",
+              summary: `Saved request '${reqToSave.name}' to collection ${path}`,
+              revision: this.context.revision("rest-document"),
+            })
+            return this.observation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "list_history",
+          title: "List execution history",
+          description:
+            "List recent request history entries for the current mode.",
+          inputSchema: listHistoryInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = listHistoryParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const historyState = restHistoryStore.value.state
+            const slice = historyState.slice(
+              parsed.data.offset,
+              parsed.data.offset + parsed.data.limit
+            )
+            const redactor = this.redactor()
+            const entries = slice.map((entry, i) => ({
+              index: parsed.data.offset + i,
+              name: redactor.scrub(entry.request.name || "Untitled", 64),
+              method: entry.request.method,
+              endpoint: redactor.scrub(entry.request.endpoint, 128),
+              statusCode: entry.responseMeta?.statusCode ?? null,
+              duration: entry.responseMeta?.duration ?? null,
+              star: entry.star,
+              updatedOn: entry.updatedOn ? entry.updatedOn.toISOString() : null,
+            }))
+            return this.result("rest-document", {
+              total: historyState.length,
+              offset: parsed.data.offset,
+              limit: parsed.data.limit,
+              entries,
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "load_history_entry",
+          title: "Load history entry into tab",
+          description:
+            "Load a request from execution history into an active or new tab.",
+          inputSchema: loadHistoryEntryInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = loadHistoryEntryParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The editor state changed; inspect it again.",
+                "rest-document",
+                true
+              )
+            }
+            const historyEntry = restHistoryStore.value.state[parsed.data.index]
+            if (!historyEntry) {
+              return this.failure(
+                "INVALID_INPUT",
+                `History entry at index ${parsed.data.index} not found.`,
+                "rest-document"
+              )
+            }
+            const reqToLoad = cloneDeep(historyEntry.request)
+            if (parsed.data.targetTab === "new") {
+              this.restTabs.createNewTab(
+                {
+                  type: "request",
+                  request: reqToLoad,
+                  isDirty: false,
+                  optionTabPreference: "params",
+                },
+                true
+              )
+            } else {
+              const rest = this.visibleREST()
+              if ("ok" in rest) return rest
+              if (rest.tab.document.isDirty) {
+                return this.failure(
+                  "DIRTY_TAB_UNSAVED_CHANGES",
+                  "The active tab has unsaved changes. Save it or choose targetTab: 'new'.",
+                  "rest-document"
+                )
+              }
+              rest.tab.document.request = reqToLoad
+              rest.tab.document.isDirty = false
+              rest.tab.document.saveContext = undefined
+            }
+            this.activity.record({
+              tool: "load_history_entry",
+              outcome: "changed",
+              summary: `Loaded history entry ${parsed.data.index}`,
+              revision: this.context.revision("rest-document"),
+            })
+            return this.observation()
+          },
+        },
+        signal
+      ),
     ])
   }
 
@@ -871,6 +1564,546 @@ export class WebMCPService extends Service {
               new AbortController().signal,
               "unsubscribe"
             ),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "list_gql_tabs",
+          title: "List open GraphQL tabs",
+          description:
+            "List all open GraphQL editor tabs with their IDs, titles, dirty states, and active selection.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const redactor = this.redactor()
+            const tabs = this.gqlTabs.getTabs().map((tab) => ({
+              id: tab.id,
+              title: redactor.scrub(
+                tab.document.request.name || "Untitled",
+                64
+              ),
+              isDirty: tab.document.isDirty,
+              isActive: tab.id === this.gqlTabs.currentTabID.value,
+              saveContext: tab.document.saveContext
+                ? {
+                    originLocation: tab.document.saveContext.originLocation,
+                    folderPath:
+                      tab.document.saveContext.originLocation ===
+                      "user-collection"
+                        ? tab.document.saveContext.folderPath
+                        : undefined,
+                  }
+                : undefined,
+            }))
+            return this.result("graphql-document", { tabs })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "switch_gql_tab",
+          title: "Switch active GraphQL tab",
+          description: "Switch to a specific open GraphQL tab by tab ID.",
+          inputSchema: switchTabInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = switchTabParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "graphql-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The tab state changed; inspect it again.",
+                "graphql-document",
+                true
+              )
+            }
+            const tab = this.gqlTabs
+              .getTabs()
+              .find((t) => t.id === parsed.data.tabID)
+            if (!tab) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The requested tab was not found.",
+                "graphql-document"
+              )
+            }
+            this.gqlTabs.setActiveTab(parsed.data.tabID)
+            this.activity.record({
+              tool: "switch_gql_tab",
+              outcome: "changed",
+              summary: `Switched active GraphQL tab to ${parsed.data.tabID}`,
+              revision: this.context.revision("graphql-document"),
+            })
+            return this.gqlObservation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "create_gql_tab",
+          title: "Create new GraphQL tab",
+          description:
+            "Open a new blank GraphQL request tab in the editor and set it as active.",
+          inputSchema: createTabInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = createTabParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "graphql-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The tab state changed; inspect it again.",
+                "graphql-document",
+                true
+              )
+            }
+            const req = getDefaultGQLRequest()
+            if (parsed.data.name) req.name = parsed.data.name
+            const newTab = this.gqlTabs.createNewTab(
+              {
+                type: "graphql",
+                request: req,
+                isDirty: false,
+                response: null,
+                optionTabPreference: "query",
+              } as any,
+              true
+            )
+            this.activity.record({
+              tool: "create_gql_tab",
+              outcome: "changed",
+              summary: `Created new GraphQL tab ${newTab.id}`,
+              revision: this.context.revision("graphql-document"),
+            })
+            return this.gqlObservation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "close_gql_tab",
+          title: "Close GraphQL tab",
+          description:
+            "Close an open GraphQL tab by ID. If the tab has unsaved changes, force must be set to true.",
+          inputSchema: closeTabInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = closeTabParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "graphql-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The tab state changed; inspect it again.",
+                "graphql-document",
+                true
+              )
+            }
+            const tab = this.gqlTabs
+              .getTabs()
+              .find((t) => t.id === parsed.data.tabID)
+            if (!tab) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The requested tab was not found.",
+                "graphql-document"
+              )
+            }
+            if (this.gqlTabs.getTabs().length <= 1) {
+              return this.failure(
+                "INVALID_INPUT",
+                "Cannot close the only open tab.",
+                "graphql-document"
+              )
+            }
+            if (tab.document.isDirty && !parsed.data.force) {
+              return this.failure(
+                "DIRTY_TAB_UNSAVED_CHANGES",
+                "The tab has unsaved changes. Save it to a collection or pass force: true to discard changes.",
+                "graphql-document"
+              )
+            }
+            this.gqlTabs.closeTab(parsed.data.tabID)
+            this.activity.record({
+              tool: "close_gql_tab",
+              outcome: "changed",
+              summary: `Closed GraphQL tab ${parsed.data.tabID}`,
+              revision: this.context.revision("graphql-document"),
+            })
+            return this.gqlObservation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "list_gql_collections",
+          title: "List GraphQL collections",
+          description:
+            "List top-level GraphQL collections with folder counts, request counts, and paths.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
+              return this.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const redactor = this.redactor()
+            const collections = graphqlCollectionStore.value.state.map(
+              (col, index) => ({
+                id: col.id,
+                name: redactor.scrub(col.name, 64),
+                path: String(index),
+                foldersCount: col.folders.length,
+                requestsCount: col.requests.length,
+              })
+            )
+            return this.result("graphql-document", { collections })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "inspect_gql_collection",
+          title: "Inspect GraphQL collection or folder",
+          description:
+            "Inspect the structure of a specific GraphQL collection or folder by path.",
+          inputSchema: inspectCollectionInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = inspectCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const target = navigateToFolderWithIndexPath(
+              graphqlCollectionStore.value.state,
+              parsed.data.path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The requested collection or folder path was not found.",
+                "graphql-document"
+              )
+            }
+            const redactor = this.redactor()
+            return this.result("graphql-document", {
+              collection: {
+                name: redactor.scrub(target.name, 64),
+                path: parsed.data.path,
+                authType: target.auth?.authType ?? "inherit",
+                headersCount: target.headers?.length ?? 0,
+                variablesCount: target.variables?.length ?? 0,
+                folders: target.folders.map((f, i) => ({
+                  name: redactor.scrub(f.name, 64),
+                  path: `${parsed.data.path}/${i}`,
+                  foldersCount: f.folders.length,
+                  requestsCount: f.requests.length,
+                })),
+                requests: target.requests.map((r, i) => ({
+                  name: redactor.scrub(r.name, 64),
+                  index: i,
+                })),
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "save_gql_request_to_collection",
+          title: "Save GraphQL request to collection",
+          description:
+            "Save the visible GraphQL request draft into a collection/folder or update it in place.",
+          inputSchema: saveRequestToCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = saveRequestToCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const gql = this.visibleGQL()
+            if ("ok" in gql) return gql
+            if (
+              !this.context.matches(
+                "graphql-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The request draft changed; inspect it again.",
+                "graphql-document",
+                true
+              )
+            }
+            const activeTab = gql.tab
+            const currentDoc = activeTab.document
+            const reqToSave = cloneDeep(currentDoc.request)
+            if (parsed.data.name) reqToSave.name = parsed.data.name
+
+            let path = parsed.data.collectionPath
+            if (
+              !path &&
+              currentDoc.saveContext?.originLocation === "user-collection"
+            ) {
+              path = currentDoc.saveContext.folderPath
+            }
+            if (!path) {
+              path = "0"
+            }
+
+            const target = navigateToFolderWithIndexPath(
+              graphqlCollectionStore.value.state,
+              path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.failure(
+                "INVALID_INPUT",
+                `Collection path ${path} not found.`,
+                "graphql-document"
+              )
+            }
+
+            if (
+              !parsed.data.collectionPath &&
+              currentDoc.saveContext?.originLocation === "user-collection" &&
+              currentDoc.saveContext.requestIndex !== undefined
+            ) {
+              editGraphqlRequest(
+                path,
+                currentDoc.saveContext.requestIndex,
+                reqToSave
+              )
+              activeTab.document.isDirty = false
+              activeTab.document.request = reqToSave
+            } else {
+              const insertionIndex = saveGraphqlRequestAs(path, reqToSave)
+              activeTab.document.request = reqToSave
+              activeTab.document.isDirty = false
+              activeTab.document.saveContext = {
+                originLocation: "user-collection",
+                folderPath: path,
+                requestIndex: insertionIndex,
+                requestRefID: reqToSave._ref_id,
+              }
+              activeTab.document.inheritedProperties =
+                cascadeParentCollectionForProperties(path, "graphql")
+            }
+
+            this.activity.record({
+              tool: "save_gql_request_to_collection",
+              outcome: "changed",
+              summary: `Saved GraphQL request '${reqToSave.name}' to collection ${path}`,
+              revision: this.context.revision("graphql-document"),
+            })
+            return this.gqlObservation()
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "list_gql_history",
+          title: "List GraphQL execution history",
+          description:
+            "List recent GraphQL request history entries.",
+          inputSchema: listHistoryInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = listHistoryParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const historyState = graphqlHistoryStore.value.state
+            const slice = historyState.slice(
+              parsed.data.offset,
+              parsed.data.offset + parsed.data.limit
+            )
+            const redactor = this.redactor()
+            const entries = slice.map((entry, i) => ({
+              index: parsed.data.offset + i,
+              name: redactor.scrub(entry.request.name || "Untitled", 64),
+              url: redactor.scrub(entry.request.url, 128),
+              star: entry.star,
+              updatedOn: entry.updatedOn ? entry.updatedOn.toISOString() : null,
+            }))
+            return this.result("graphql-document", {
+              total: historyState.length,
+              offset: parsed.data.offset,
+              limit: parsed.data.limit,
+              entries,
+            })
+          },
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "load_gql_history_entry",
+          title: "Load GraphQL history entry into tab",
+          description:
+            "Load a GraphQL request from execution history into an active or new tab.",
+          inputSchema: loadHistoryEntryInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.validBoundary(input)) {
+              return this.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = loadHistoryEntryParser.safeParse(input)
+            if (!parsed.success) {
+              return this.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.context.matches(
+                "graphql-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The editor state changed; inspect it again.",
+                "graphql-document",
+                true
+              )
+            }
+            const historyEntry =
+              graphqlHistoryStore.value.state[parsed.data.index]
+            if (!historyEntry) {
+              return this.failure(
+                "INVALID_INPUT",
+                `GraphQL history entry at index ${parsed.data.index} not found.`,
+                "graphql-document"
+              )
+            }
+            const reqToLoad = cloneDeep(historyEntry.request)
+            if (parsed.data.targetTab === "new") {
+              this.gqlTabs.createNewTab(
+                {
+                  type: "graphql",
+                  request: reqToLoad,
+                  isDirty: false,
+                  response: null,
+                  optionTabPreference: "query",
+                } as any,
+                true
+              )
+            } else {
+              const gql = this.visibleGQL()
+              if ("ok" in gql) return gql
+              if (gql.tab.document.isDirty) {
+                return this.failure(
+                  "DIRTY_TAB_UNSAVED_CHANGES",
+                  "The active tab has unsaved changes. Save it or choose targetTab: 'new'.",
+                  "graphql-document"
+                )
+              }
+              gql.tab.document.request = reqToLoad
+              gql.tab.document.isDirty = false
+              gql.tab.document.saveContext = undefined
+            }
+            this.activity.record({
+              tool: "load_gql_history_entry",
+              outcome: "changed",
+              summary: `Loaded GraphQL history entry ${parsed.data.index}`,
+              revision: this.context.revision("graphql-document"),
+            })
+            return this.gqlObservation()
+          },
         },
         signal
       ),

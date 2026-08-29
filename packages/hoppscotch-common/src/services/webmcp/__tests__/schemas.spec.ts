@@ -14,6 +14,14 @@ import {
   readRESTPayloadParser,
   realtimeMessageParser,
   requestPatchSchema,
+  switchTabParser,
+  createTabParser,
+  closeTabParser,
+  inspectCollectionParser,
+  saveRequestToCollectionParser,
+  listHistoryParser,
+  loadHistoryEntryParser,
+  switchWorkspaceParser,
 } from "../schemas"
 
 describe("WebMCP REST input schemas", () => {
@@ -215,3 +223,90 @@ describe("WebMCP GraphQL and realtime input schemas", () => {
     ).toBe(false)
   })
 })
+
+describe("WebMCP Live Artifact input schemas", () => {
+  it("validates tab operations", () => {
+    expect(
+      switchTabParser.safeParse({
+        expectedRevision: "rest-document:1",
+        tabID: "tab-123",
+      }).success
+    ).toBe(true)
+    expect(
+      switchTabParser.safeParse({
+        expectedRevision: "rest-document:1",
+      }).success
+    ).toBe(false)
+
+    expect(
+      createTabParser.safeParse({
+        expectedRevision: "rest-document:1",
+        name: "New Request",
+      }).success
+    ).toBe(true)
+
+    expect(
+      closeTabParser.safeParse({
+        expectedRevision: "rest-document:1",
+        tabID: "tab-123",
+        force: true,
+      }).success
+    ).toBe(true)
+  })
+
+  it("validates collection operations", () => {
+    expect(
+      inspectCollectionParser.safeParse({
+        path: "0/1",
+      }).success
+    ).toBe(true)
+    expect(inspectCollectionParser.safeParse({}).success).toBe(false)
+
+    expect(
+      saveRequestToCollectionParser.safeParse({
+        expectedRevision: "rest-document:1",
+        collectionPath: "0",
+        name: "My Saved Request",
+      }).success
+    ).toBe(true)
+  })
+
+  it("validates history operations", () => {
+    expect(
+      listHistoryParser.safeParse({
+        limit: 20,
+        offset: 10,
+      }).success
+    ).toBe(true)
+    expect(
+      listHistoryParser.safeParse({
+        limit: 100, // exceeds max 50
+      }).success
+    ).toBe(false)
+
+    expect(
+      loadHistoryEntryParser.safeParse({
+        expectedRevision: "rest-document:1",
+        index: 3,
+        targetTab: "new",
+      }).success
+    ).toBe(true)
+  })
+
+  it("validates workspace switching", () => {
+    expect(
+      switchWorkspaceParser.safeParse({
+        expectedRevision: "app-context:1",
+        workspaceID: "personal",
+      }).success
+    ).toBe(true)
+    expect(
+      switchWorkspaceParser.safeParse({
+        expectedRevision: "app-context:1",
+        workspaceID: "team-456",
+      }).success
+    ).toBe(true)
+    expect(switchWorkspaceParser.safeParse({}).success).toBe(false)
+  })
+})
+
