@@ -507,3 +507,189 @@ export const selectEnvironmentInputSchema = {
   required: ["expectedRevision", "environmentHandle"],
   additionalProperties: false,
 } as const
+
+const gqlHeader = z
+  .object({
+    key: z.string().max(256),
+    value: z.string().max(8192),
+    active: z.boolean(),
+  })
+  .strict()
+
+export const editGraphQLOperationParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    patch: z
+      .object({
+        endpoint: z.string().max(8192).optional(),
+        query: z.string().max(65536).optional(),
+        variables: z.string().max(65536).optional(),
+        headers: z.array(gqlHeader).max(100).optional(),
+      })
+      .strict()
+      .refine(
+        (patch) => Object.keys(patch).length > 0,
+        "Patch cannot be empty"
+      ),
+  })
+  .strict()
+
+export const editGraphQLOperationInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    patch: {
+      type: "object",
+      properties: {
+        endpoint: { type: "string", maxLength: 8192 },
+        query: { type: "string", maxLength: 65536 },
+        variables: { type: "string", maxLength: 65536 },
+        headers: {
+          type: "array",
+          maxItems: 100,
+          items: {
+            type: "object",
+            properties: {
+              key: { type: "string", maxLength: 256 },
+              value: { type: "string", maxLength: 8192 },
+              active: { type: "boolean" },
+            },
+            required: ["key", "value", "active"],
+            additionalProperties: false,
+          },
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  required: ["expectedRevision", "patch"],
+  additionalProperties: false,
+} as const
+
+export const graphqlPayloadParser = z
+  .object({
+    source: z.enum(["query", "variables", "response"]),
+    expectedRevision: z.string().min(1).max(128),
+    offset: z.number().int().min(0).max(2147483647).default(0),
+    maxChars: z.number().int().min(1).max(768).default(384),
+  })
+  .strict()
+
+export const graphqlPayloadInputSchema = {
+  type: "object",
+  properties: {
+    source: { type: "string", enum: ["query", "variables", "response"] },
+    expectedRevision: revisionProperty,
+    offset: { type: "integer", minimum: 0, maximum: 2147483647, default: 0 },
+    maxChars: { type: "integer", minimum: 1, maximum: 768, default: 384 },
+  },
+  required: ["source", "expectedRevision"],
+  additionalProperties: false,
+} as const
+
+export const graphqlSchemaSearchParser = z
+  .object({ query: z.string().min(1).max(128) })
+  .strict()
+
+export const graphqlSchemaSearchInputSchema = {
+  type: "object",
+  properties: { query: { type: "string", minLength: 1, maxLength: 128 } },
+  required: ["query"],
+  additionalProperties: false,
+} as const
+
+export const editRealtimeSessionParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    patch: z
+      .object({
+        endpoint: z.string().max(8192).optional(),
+        protocols: z
+          .array(
+            z
+              .object({ value: z.string().max(256), active: z.boolean() })
+              .strict()
+          )
+          .max(32)
+          .optional(),
+        path: z.string().max(512).optional(),
+        version: z.enum(["v2", "v3", "v4"]).optional(),
+        eventType: z.string().max(256).optional(),
+        clientID: z.string().max(256).optional(),
+      })
+      .strict()
+      .refine(
+        (patch) => Object.keys(patch).length > 0,
+        "Patch cannot be empty"
+      ),
+  })
+  .strict()
+
+export const editRealtimeSessionInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    patch: { type: "object", additionalProperties: false },
+  },
+  required: ["expectedRevision", "patch"],
+  additionalProperties: false,
+} as const
+
+export const realtimeMessageParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    message: z.string().min(1).max(65536),
+    eventName: z.string().max(256).default(""),
+  })
+  .strict()
+
+export const realtimeMessageInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    message: { type: "string", minLength: 1, maxLength: 65536 },
+    eventName: { type: "string", maxLength: 256, default: "" },
+  },
+  required: ["expectedRevision", "message"],
+  additionalProperties: false,
+} as const
+
+export const mqttTopicParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    topic: z.string().min(1).max(512),
+    message: z.string().max(65536).optional(),
+    qos: z.union([z.literal(0), z.literal(1), z.literal(2)]).default(0),
+  })
+  .strict()
+
+export const mqttTopicInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    topic: { type: "string", minLength: 1, maxLength: 512 },
+    message: { type: "string", maxLength: 65536 },
+    qos: { type: "integer", enum: [0, 1, 2], default: 0 },
+  },
+  required: ["expectedRevision", "topic"],
+  additionalProperties: false,
+} as const
+
+export const realtimeLogParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    offset: z.number().int().min(0).max(2147483647).default(0),
+    limit: z.number().int().min(1).max(20).default(10),
+  })
+  .strict()
+
+export const realtimeLogInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    offset: { type: "integer", minimum: 0, maximum: 2147483647, default: 0 },
+    limit: { type: "integer", minimum: 1, maximum: 20, default: 10 },
+  },
+  required: ["expectedRevision"],
+  additionalProperties: false,
+} as const

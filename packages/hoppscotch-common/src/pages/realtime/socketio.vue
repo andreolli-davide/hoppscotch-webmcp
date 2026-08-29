@@ -279,11 +279,13 @@ import {
   setSIOLog,
   setSIOPath,
   setSIOVersion,
+  setSIOSocket,
   SIOClientVersion,
   SIOEndpoint$,
   SIOLog$,
   SIOPath$,
   SIOVersion$,
+  SIOSocket$,
 } from "~/newstore/SocketIOSession"
 import { useColorMode } from "@composables/theming"
 import RegexWorker from "@workers/regex?worker"
@@ -301,9 +303,9 @@ const SIOVersions = Object.keys(SOCKET_CLIENTS)
 const url = useStream(SIOEndpoint$, "", setSIOEndpoint)
 const clientVersion = useStream(SIOVersion$, "v4", setSIOVersion)
 const path = useStream(SIOPath$, "", setSIOPath)
-const socket = new SIOConnection()
+const socket = useStream(SIOSocket$, new SIOConnection(), setSIOSocket)
 const connectionState = useReadonlyStream(
-  socket.connectionState$,
+  socket.value.connectionState$,
   "DISCONNECTED"
 )
 const log = useStream(SIOLog$, [], setSIOLog)
@@ -344,7 +346,7 @@ onMounted(() => {
   worker = new RegexWorker()
   worker.addEventListener("message", workerResponseHandler)
 
-  subscribeToStream(socket.event$, (event) => {
+  subscribeToStream(socket.value.event$, (event) => {
     switch (event?.type) {
       case "CONNECTING":
         log.value = [
@@ -430,7 +432,7 @@ const debouncer = debounce(function () {
 const toggleConnection = () => {
   // If it is connecting:
   if (connectionState.value === "DISCONNECTED") {
-    return socket.connect({
+    return socket.value.connect({
       url: url.value,
       path: path.value || "/socket.io",
       clientVersion: clientVersion.value,
@@ -443,10 +445,10 @@ const toggleConnection = () => {
     })
   }
   // Otherwise, it's disconnecting.
-  socket.disconnect()
+  socket.value.disconnect()
 }
 const sendMessage = (event: { message: string; eventName: string }) => {
-  socket.sendMessage(event)
+  socket.value.sendMessage(event)
 }
 const onSelectVersion = (version: SIOClientVersion) => {
   clientVersion.value = version

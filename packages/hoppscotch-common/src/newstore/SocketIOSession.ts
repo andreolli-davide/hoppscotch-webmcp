@@ -1,14 +1,10 @@
 import { pluck, distinctUntilChanged } from "rxjs/operators"
-import { Socket as SocketV2 } from "socket.io-client-v2"
-import { Socket as SocketV3 } from "socket.io-client-v3"
-import { Socket as SocketV4 } from "socket.io-client-v4"
 import DispatchingStore, { defineDispatchers } from "./DispatchingStore"
+import { SIOConnection } from "~/helpers/realtime/SIOConnection"
 import {
   HoppRealtimeLog,
   HoppRealtimeLogLine,
 } from "~/helpers/types/HoppRealtimeLog"
-
-type SocketIO = SocketV2 | SocketV3 | SocketV4
 
 export type SIOClientVersion = "v4" | "v3" | "v2"
 
@@ -21,7 +17,7 @@ type HoppSIORequest = {
 type HoppSIOSession = {
   request: HoppSIORequest
   log: HoppRealtimeLog
-  socket: SocketIO | null
+  socket: SIOConnection
 }
 
 const defaultSIORequest: HoppSIORequest = {
@@ -32,7 +28,7 @@ const defaultSIORequest: HoppSIORequest = {
 
 const defaultSIOSession: HoppSIOSession = {
   request: defaultSIORequest,
-  socket: null,
+  socket: new SIOConnection(),
   log: [],
 }
 
@@ -72,7 +68,7 @@ const dispatchers = defineDispatchers({
       },
     }
   },
-  setSocket(_: HoppSIOSession, { socket }: { socket: SocketIO }) {
+  setSocket(_: HoppSIOSession, { socket }: { socket: SIOConnection }) {
     return {
       socket,
     }
@@ -127,7 +123,7 @@ export function setSIOPath(newPath: string) {
   })
 }
 
-export function setSIOSocket(socket: SocketIO) {
+export function setSIOSocket(socket: SIOConnection) {
   SIOSessionStore.dispatch({
     dispatcher: "setSocket",
     payload: {

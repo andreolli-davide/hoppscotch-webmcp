@@ -57,18 +57,16 @@
 <script setup lang="ts">
 import { useI18n } from "@composables/i18n"
 import { useToast } from "@composables/toast"
-import { HoppGQLAuth, HoppGQLRequest } from "@hoppscotch/data"
-import { computedWithControl, useVModel } from "@vueuse/core"
+import { HoppGQLRequest } from "@hoppscotch/data"
+import { useVModel } from "@vueuse/core"
 import { useService } from "dioc/vue"
 import * as gql from "graphql"
-import { clone } from "lodash-es"
 import { computed, ref, watch } from "vue"
 import { defineActionHandler } from "~/helpers/actions"
 import {
   connection,
   gqlMessageEvent,
   GQLResponseEvent,
-  runGQLOperation,
 } from "~/helpers/graphql/connection"
 import { HoppInheritedProperty } from "~/helpers/types/HoppInheritedProperties"
 import { completePageProgress, startPageProgress } from "~/modules/loadingbar"
@@ -76,6 +74,7 @@ import { editGraphqlRequest } from "~/newstore/collections"
 import { platform } from "~/platform"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { GQLTabService } from "~/services/tab/graphql"
+import { GQLRequestExecutionService } from "~/services/graphql-execution.service"
 
 const _VALID_GQL_OPERATIONS = [
   "query",
@@ -92,6 +91,7 @@ const t = useI18n()
 const toast = useToast()
 
 const tabs = useService(GQLTabService)
+const execution = useService(GQLRequestExecutionService)
 
 // v-model integration with props and emit
 const props = withDefaults(
@@ -117,11 +117,6 @@ const selectedOptionTab = useVModel(props, "optionTab", emit)
 
 const request = useVModel(props, "modelValue", emit)
 
-const url = computedWithControl(
-  () => tabs.currentActiveTab.value,
-  () => tabs.currentActiveTab.value.document.request.url
-)
-
 const activeGQLHeadersCount = computed(
   () =>
     request.value.headers.filter(
@@ -135,27 +130,9 @@ const runQuery = async (
   const startTime = Date.now()
   startPageProgress()
   try {
-    const runURL = clone(url.value)
-    const runQuery = clone(request.value.query)
-    const runVariables = clone(request.value.variables)
-
-    const inheritedHeaders =
-      tabs.currentActiveTab.value.document.inheritedProperties?.headers.map(
-        (header) => header.inheritedHeader
-      ) ?? []
-
-    await runGQLOperation({
-      name: request.value.name,
-      url: runURL,
-      request: request.value,
-      inheritedHeaders,
-      inheritedAuth: tabs.currentActiveTab.value.document.inheritedProperties
-        ?.auth.inheritedAuth as HoppGQLAuth | undefined,
-      query: runQuery,
-      variables: runVariables,
-      operationName: definition?.name?.value,
-      operationType: definition?.operation ?? "query",
-    })
+    // Keep the UI on the same semantic execution path exposed to WebMCP.
+    // The active tab is captured by the service before network work begins.
+    await execution.execute(tabs.currentActiveTab.value, definition)
     const duration = Date.now() - startTime
     completePageProgress()
     toast.success(`${t("state.finished_in", { duration })}`)

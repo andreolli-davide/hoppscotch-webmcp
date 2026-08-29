@@ -1,7 +1,11 @@
-import { getDefaultRESTRequest } from "@hoppscotch/data"
+import { getDefaultGQLRequest, getDefaultRESTRequest } from "@hoppscotch/data"
 import { describe, expect, it } from "vitest"
 
-import { configureRESTAuth, replaceRESTDraftFields } from "../rest-drafts"
+import {
+  configureGQLAuth,
+  configureRESTAuth,
+  replaceRESTDraftFields,
+} from "../rest-drafts"
 
 describe("WebMCP REST draft extensions", () => {
   it("writes credential references without accepting credential values", () => {
@@ -64,5 +68,21 @@ describe("WebMCP REST draft extensions", () => {
     expect(updated.testScript).toBe("pw.expect(1).toBe(1)")
     expect(updated.endpoint).toBe(original.endpoint)
     expect(updated.auth).toEqual(original.auth)
+  })
+
+  it("maps GraphQL authorization references without permitting REST-only modes", () => {
+    expect(
+      configureGQLAuth(getDefaultGQLRequest().auth, {
+        authType: "bearer",
+        active: true,
+        references: { token: "GQL_TOKEN" },
+      })
+    ).toMatchObject({ authType: "bearer", token: "<<GQL_TOKEN>>" })
+    expect(() =>
+      configureGQLAuth(getDefaultGQLRequest().auth, {
+        authType: "jwt",
+        active: true,
+      })
+    ).toThrow("not supported by GraphQL")
   })
 })

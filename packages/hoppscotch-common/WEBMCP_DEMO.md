@@ -42,6 +42,21 @@ On other routes, only `inspect_app_context` remains. Authorization tools accept
 environment variable names and store `<<VARIABLE>>` references; they do not
 accept raw credential fields.
 
+The packs follow the visible workspace:
+
+- GraphQL exposes operation inspection, bounded payload/schema reads, draft and
+  authorization edits, schema connection, finite query/mutation execution, and
+  explicit subscription start/stop actions.
+- WebSocket and Socket.IO expose inspect/edit/connect/disconnect/send; Socket.IO
+  includes an event name with each send.
+- SSE exposes inspect/edit/connect/disconnect only because it is receive-only.
+- MQTT exposes inspect/edit/connect/disconnect plus publish and topic
+  subscription actions.
+
+Every route-specific pack is removed on navigation. Realtime connection,
+message, publish, and subscription actions receive the same revision-bound
+approval as REST execution; logs are bounded, revision-bound, and redacted.
+
 ## Acceptance walkthrough
 
 1. Make an unsaved REST edit and ask the Inspector agent to describe the current
@@ -56,6 +71,12 @@ accept raw credential fields.
    return `STATE_CHANGED` without modifying the request.
 6. Navigate to GraphQL, realtime, settings, and a shared-request URL and confirm
    the REST tools are unregistered.
+
+For GraphQL, inspect and edit an unsaved query, connect the schema, execute a
+query or mutation, then verify a subscription uses explicit start and stop
+actions. For each realtime route, confirm the matching pack alone is exposed;
+SSE must never expose a send action, while MQTT must expose publish and
+subscribe/unsubscribe actions.
 
 For the extended REST walkthrough, list environments and select one using its
 opaque handle, then configure a bearer or API-key reference. Edit request

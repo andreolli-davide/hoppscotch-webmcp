@@ -13,8 +13,14 @@ import { CurrentValueService } from "~/services/current-environment-value.servic
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { RESTTabService } from "~/services/tab/rest"
+import { GQLTabService } from "~/services/tab/graphql"
 import { HoppTab } from "~/services/tab"
 import { WorkspaceService } from "~/services/workspace.service"
+import { connection, gqlMessageEvent } from "~/helpers/graphql/connection"
+import { WSRequest$, WSLog$, WSSocket$ } from "~/newstore/WebSocketSession"
+import { SIORequest$, SIOLog$, SIOSocket$ } from "~/newstore/SocketIOSession"
+import { SSERequest$, SSELog$, SSESocket$ } from "~/newstore/SSESession"
+import { MQTTRequest$, MQTTLog$, MQTTConn$ } from "~/newstore/MQTTSession"
 
 import { ActiveAppContextDTO, WebMCPRevisionScope } from "./types"
 
@@ -23,10 +29,16 @@ export type VisibleRESTContext = {
   token: string
 }
 
+export type VisibleGQLContext = {
+  tab: HoppTab<any>
+  token: string
+}
+
 export class ActiveAppContextService extends Service {
   public static readonly ID = "ACTIVE_APP_CONTEXT_SERVICE"
 
   private readonly restTabs = this.bind(RESTTabService)
+  private readonly gqlTabs = this.bind(GQLTabService)
   private readonly workspace = this.bind(WorkspaceService)
   private readonly interceptor = this.bind(KernelInterceptorService)
   private readonly secrets = this.bind(SecretEnvironmentService)
@@ -39,6 +51,9 @@ export class ActiveAppContextService extends Service {
     "app-context": 1,
     "rest-document": 1,
     "rest-response": 1,
+    "graphql-document": 1,
+    "graphql-response": 1,
+    "realtime-session": 1,
   }
 
   override onServiceInit() {
@@ -61,6 +76,26 @@ export class ActiveAppContextService extends Service {
         this.bump("app-context")
         this.bump("rest-document")
       },
+      { deep: true, flush: "sync" }
+    )
+
+    watch(
+      () => [
+        this.gqlTabs.currentTabID.value,
+        this.gqlTabs.currentActiveTab.value.document.request,
+        this.gqlTabs.currentActiveTab.value.document.isDirty,
+        this.gqlTabs.currentActiveTab.value.document.saveContext,
+        this.gqlTabs.currentActiveTab.value.document.inheritedProperties,
+      ],
+      () => {
+        this.bump("app-context")
+        this.bump("graphql-document")
+      },
+      { deep: true, flush: "sync" }
+    )
+    watch(
+      () => [gqlMessageEvent.value, connection.state, connection.schema],
+      () => this.bump("graphql-response"),
       { deep: true, flush: "sync" }
     )
 
@@ -104,6 +139,19 @@ export class ActiveAppContextService extends Service {
       this.bump("app-context")
       this.bump("rest-document")
     })
+    const bumpRealtimeSession = () => this.bump("realtime-session")
+    WSRequest$.subscribe(bumpRealtimeSession)
+    WSLog$.subscribe(bumpRealtimeSession)
+    WSSocket$.subscribe(bumpRealtimeSession)
+    SIORequest$.subscribe(bumpRealtimeSession)
+    SIOLog$.subscribe(bumpRealtimeSession)
+    SIOSocket$.subscribe(bumpRealtimeSession)
+    SSERequest$.subscribe(bumpRealtimeSession)
+    SSELog$.subscribe(bumpRealtimeSession)
+    SSESocket$.subscribe(bumpRealtimeSession)
+    MQTTRequest$.subscribe(bumpRealtimeSession)
+    MQTTLog$.subscribe(bumpRealtimeSession)
+    MQTTConn$.subscribe(bumpRealtimeSession)
   }
 
   public attachRouter(router: Router) {
@@ -131,6 +179,22 @@ export class ActiveAppContextService extends Service {
     return Boolean(this.captureVisibleREST())
   }
 
+  public isGQLAvailable() {
+    return Boolean(this.captureVisibleGQL())
+  }
+
+  public realtimeMode(): "websocket" | "socketio" | "sse" | "mqtt" | null {
+    const path = this.router.value?.currentRoute.value.path ?? ""
+    if (!path.startsWith("/realtime/")) return null
+    const mode = path.split("/")[2]
+    return mode === "websocket" ||
+      mode === "socketio" ||
+      mode === "sse" ||
+      mode === "mqtt"
+      ? mode
+      : null
+  }
+
   public captureVisibleREST(): VisibleRESTContext | null {
     if (this.router.value?.currentRoute.value.path !== "/") return null
     const tab = this.restTabs.getActiveTab()
@@ -142,6 +206,18 @@ export class ActiveAppContextService extends Service {
       this.documentTokens.set(tab.document, token)
     }
     return { tab: tab as HoppTab<HoppRequestDocument>, token }
+  }
+
+  public captureVisibleGQL(): VisibleGQLContext | null {
+    if (this.router.value?.currentRoute.value.path !== "/graphql") return null
+    const tab = this.gqlTabs.getActiveTab()
+    if (!tab) return null
+    let token = this.documentTokens.get(tab.document)
+    if (!token) {
+      token = uuidV4()
+      this.documentTokens.set(tab.document, token)
+    }
+    return { tab, token }
   }
 
   public capture(): ActiveAppContextDTO {
@@ -166,6 +242,8 @@ export class ActiveAppContextService extends Service {
     const selectedEnvironment = getCurrentEnvironment()
     const selectedType = getSelectedEnvironmentType()
     const rest = this.captureVisibleREST()
+    const gql = this.captureVisibleGQL()
+    const realtimeMode = this.realtimeMode()
 
     return {
       surface,
@@ -193,11 +271,28 @@ export class ActiveAppContextService extends Service {
             kind: "request",
             dirty: rest.tab.document.isDirty,
           }
-        : undefined,
-      dirtyDocumentCount: this.restTabs.getDirtyTabsCount(),
+        : gql
+          ? {
+              token: gql.token,
+              kind: "graphql",
+              dirty: gql.tab.document.isDirty,
+            }
+          : realtimeMode
+            ? {
+                token: `realtime:${realtimeMode}`,
+                kind: "realtime",
+                dirty: false,
+              }
+            : undefined,
+      dirtyDocumentCount:
+        this.restTabs.getDirtyTabsCount() + this.gqlTabs.getDirtyTabsCount(),
       capabilityPacks: rest
         ? ["app-context", "environment", "rest"]
-        : ["app-context"],
+        : gql
+          ? ["app-context", "graphql"]
+          : realtimeMode
+            ? ["app-context", `realtime-${realtimeMode}`]
+            : ["app-context"],
     }
   }
 

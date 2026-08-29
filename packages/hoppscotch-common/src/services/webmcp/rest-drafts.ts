@@ -1,4 +1,4 @@
-import { HoppRESTAuth, HoppRESTRequest } from "@hoppscotch/data"
+import { HoppGQLAuth, HoppRESTAuth, HoppRESTRequest } from "@hoppscotch/data"
 import { cloneDeep } from "lodash-es"
 
 import { configureRESTAuthParser } from "./schemas"
@@ -188,4 +188,32 @@ export const replaceRESTDraftFields = (
   if (parsed.type !== "ok")
     throw new Error("The change does not produce a valid REST request")
   return parsed.value
+}
+
+/** GraphQL supports the auth subset shared with the REST draft editor. */
+export const configureGQLAuth = (
+  current: HoppGQLAuth,
+  configuration: AuthConfiguration
+): HoppGQLAuth => {
+  if (
+    ![
+      "inherit",
+      "none",
+      "basic",
+      "bearer",
+      "oauth-2",
+      "api-key",
+      "aws-signature",
+    ].includes(configuration.authType)
+  ) {
+    throw new Error("This authorization mode is not supported by GraphQL")
+  }
+  const restAuth = configureRESTAuth(
+    current as unknown as HoppRESTAuth,
+    configuration
+  )
+  const parsed = HoppGQLAuth.safeParse(restAuth)
+  if (!parsed.success)
+    throw new Error("The authorization configuration is not valid for GraphQL")
+  return parsed.data
 }

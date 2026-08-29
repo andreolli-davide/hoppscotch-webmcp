@@ -5,8 +5,13 @@ import {
   editRESTScriptsParser,
   editRESTVariablesParser,
   editRESTRequestParser,
+  editGraphQLOperationParser,
+  editRealtimeSessionParser,
+  graphqlPayloadParser,
   listEnvironmentsParser,
+  mqttTopicParser,
   readRESTPayloadParser,
+  realtimeMessageParser,
   requestPatchSchema,
 } from "../schemas"
 
@@ -118,5 +123,77 @@ describe("WebMCP REST input schemas", () => {
     expect(listEnvironmentsParser.safeParse({}).data?.offset).toBe(0)
     expect(listEnvironmentsParser.safeParse({ offset: 4 }).success).toBe(true)
     expect(listEnvironmentsParser.safeParse({ offset: -1 }).success).toBe(false)
+  })
+})
+
+describe("WebMCP GraphQL and realtime input schemas", () => {
+  it("allows only bounded GraphQL draft fields", () => {
+    expect(
+      editGraphQLOperationParser.safeParse({
+        expectedRevision: "graphql-document:2",
+        patch: { query: "query Viewer { viewer { id } }", variables: "{}" },
+      }).success
+    ).toBe(true)
+    expect(
+      editGraphQLOperationParser.safeParse({
+        expectedRevision: "graphql-document:2",
+        patch: { auth: { token: "secret" } },
+      }).success
+    ).toBe(false)
+  })
+
+  it("binds GraphQL payload windows to a bounded revision", () => {
+    expect(
+      graphqlPayloadParser.safeParse({
+        source: "response",
+        expectedRevision: "graphql-response:4",
+        maxChars: 768,
+      }).success
+    ).toBe(true)
+    expect(
+      graphqlPayloadParser.safeParse({
+        source: "response",
+        expectedRevision: "graphql-response:4",
+        maxChars: 769,
+      }).success
+    ).toBe(false)
+  })
+
+  it("rejects unsupported realtime draft fields and oversized messages", () => {
+    expect(
+      editRealtimeSessionParser.safeParse({
+        expectedRevision: "realtime-session:1",
+        patch: { endpoint: "wss://echo.example.test", protocols: [] },
+      }).success
+    ).toBe(true)
+    expect(
+      editRealtimeSessionParser.safeParse({
+        expectedRevision: "realtime-session:1",
+        patch: { password: "literal-secret" },
+      }).success
+    ).toBe(false)
+    expect(
+      realtimeMessageParser.safeParse({
+        expectedRevision: "realtime-session:1",
+        message: "x".repeat(65537),
+      }).success
+    ).toBe(false)
+  })
+
+  it("requires a bounded MQTT topic and limits QoS", () => {
+    expect(
+      mqttTopicParser.safeParse({
+        expectedRevision: "realtime-session:1",
+        topic: "events/orders",
+        qos: 1,
+      }).success
+    ).toBe(true)
+    expect(
+      mqttTopicParser.safeParse({
+        expectedRevision: "realtime-session:1",
+        topic: "events/orders",
+        qos: 3,
+      }).success
+    ).toBe(false)
   })
 })

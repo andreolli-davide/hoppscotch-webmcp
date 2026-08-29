@@ -66,16 +66,15 @@ import { platform } from "~/platform"
 import { useI18n } from "@composables/i18n"
 import { computed, ref, watch } from "vue"
 import { connection } from "~/helpers/graphql/connection"
-import { connect } from "~/helpers/graphql/connection"
-import { disconnect } from "~/helpers/graphql/connection"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { useService } from "dioc/vue"
 import { defineActionHandler } from "~/helpers/actions"
 import { GQLTabService } from "~/services/tab/graphql"
-import { HoppGQLAuth, HoppGQLRequest } from "@hoppscotch/data"
+import { GQLRequestExecutionService } from "~/services/graphql-execution.service"
 
 const t = useI18n()
 const tabs = useService(GQLTabService)
+const execution = useService(GQLRequestExecutionService)
 
 const interceptorService = useService(KernelInterceptorService)
 
@@ -94,28 +93,12 @@ const onConnectClick = () => {
   if (!connected.value) {
     gqlConnect()
   } else {
-    disconnect()
+    execution.disconnect()
   }
 }
 
 const gqlConnect = () => {
-  const inheritedHeaders =
-    tabs.currentActiveTab.value.document.inheritedProperties?.headers.map(
-      (header) => {
-        if (header.inheritedHeader) {
-          return header.inheritedHeader
-        }
-        return []
-      }
-    ) as HoppGQLRequest["headers"]
-
-  connect({
-    url: url.value,
-    request: tabs.currentActiveTab.value.document.request,
-    inheritedHeaders,
-    inheritedAuth: tabs.currentActiveTab.value.document.inheritedProperties
-      ?.auth.inheritedAuth as HoppGQLAuth,
-  })
+  void execution.connect(tabs.currentActiveTab.value)
 
   platform.analytics?.logEvent({
     type: "HOPP_REQUEST_RUN",
@@ -146,7 +129,7 @@ watch(
       lastTwoUrls.value.length === 2 &&
       lastTwoUrls.value.at(0) !== lastTwoUrls.value.at(1)
     ) {
-      disconnect()
+      execution.disconnect()
       connectionSwitchModal.value = true
     }
   },
@@ -156,7 +139,7 @@ watch(
 )
 
 const cancelSwitch = () => {
-  if (connected.value) disconnect()
+  if (connected.value) execution.disconnect()
   connectionSwitchModal.value = false
 }
 
@@ -166,5 +149,5 @@ defineActionHandler(
   computed(() => !connected.value)
 )
 
-defineActionHandler("gql.disconnect", disconnect, connected)
+defineActionHandler("gql.disconnect", () => execution.disconnect(), connected)
 </script>

@@ -4,10 +4,15 @@ export type WebMCPRevisionScope =
   | "app-context"
   | "rest-document"
   | "rest-response"
+  | "graphql-document"
+  | "graphql-response"
+  | "realtime-session"
 
 export type WebMCPErrorCode =
   | "WEBMCP_DISABLED"
   | "NO_ACTIVE_REST_REQUEST"
+  | "NO_ACTIVE_GRAPHQL_REQUEST"
+  | "NO_ACTIVE_REALTIME_SESSION"
   | "STATE_CHANGED"
   | "INVALID_INPUT"
   | "ENVIRONMENT_NOT_FOUND"
@@ -32,7 +37,7 @@ export type ActiveAppContextDTO = {
   }
   activeDocument?: {
     token: string
-    kind: "request"
+    kind: "request" | "graphql" | "realtime"
     dirty: boolean
   }
   dirtyDocumentCount: number

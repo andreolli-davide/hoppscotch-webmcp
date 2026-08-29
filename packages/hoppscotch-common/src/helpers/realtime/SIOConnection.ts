@@ -1,6 +1,6 @@
 import { BehaviorSubject, Subject } from "rxjs"
 import { SIOClientV2, SIOClientV3, SIOClientV4, SIOClient } from "./SIOClients"
-import { SIOClientVersion } from "~/newstore/SocketIOSession"
+import type { SIOClientVersion } from "~/newstore/SocketIOSession"
 import { platform } from "~/platform"
 
 export const SOCKET_CLIENTS = {

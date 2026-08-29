@@ -1,4 +1,4 @@
-import { HoppRESTRequest } from "@hoppscotch/data"
+import { HoppGQLRequest, HoppRESTRequest } from "@hoppscotch/data"
 import { Service } from "dioc"
 import { cloneDeep } from "lodash-es"
 import { computed, Ref, watch } from "vue"
@@ -9,10 +9,18 @@ import {
   RESTRequestAlreadyRunningError,
 } from "~/services/rest-request-execution.service"
 import { RESTTabService } from "~/services/tab/rest"
+import { GQLTabService } from "~/services/tab/graphql"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { HoppTab } from "~/services/tab"
 import { HoppRequestDocument } from "~/helpers/rest/document"
+import { HoppGQLDocument } from "~/helpers/graphql/document"
+import { connection, gqlMessageEvent } from "~/helpers/graphql/connection"
+import { GQLRequestExecutionService } from "~/services/graphql-execution.service"
+import {
+  RealtimeMode,
+  RealtimeSessionService,
+} from "~/services/realtime-session.service"
 import {
   getSelectedEnvironmentIndex,
   setSelectedEnvironmentIndex,
@@ -30,7 +38,11 @@ import {
   readRESTPayload,
   SecretRedactor,
 } from "./projections"
-import { configureRESTAuth, replaceRESTDraftFields } from "./rest-drafts"
+import {
+  configureGQLAuth,
+  configureRESTAuth,
+  replaceRESTDraftFields,
+} from "./rest-drafts"
 import {
   configureRESTAuthInputSchema,
   configureRESTAuthParser,
@@ -51,6 +63,20 @@ import {
   readRESTPayloadParser,
   selectEnvironmentInputSchema,
   selectEnvironmentParser,
+  editGraphQLOperationInputSchema,
+  editGraphQLOperationParser,
+  graphqlPayloadInputSchema,
+  graphqlPayloadParser,
+  graphqlSchemaSearchInputSchema,
+  graphqlSchemaSearchParser,
+  editRealtimeSessionInputSchema,
+  editRealtimeSessionParser,
+  mqttTopicInputSchema,
+  mqttTopicParser,
+  realtimeLogInputSchema,
+  realtimeLogParser,
+  realtimeMessageInputSchema,
+  realtimeMessageParser,
 } from "./schemas"
 import {
   RESTRequestPatch,
@@ -78,7 +104,7 @@ const safeTarget = (endpoint: string) => {
   try {
     const trimmed = endpoint.trim()
     const domain = trimmed.split(/[/:#?]+/)[0]
-    const normalized = /^https?:\/\//.test(trimmed)
+    const normalized = /^(https?|wss?):\/\//.test(trimmed)
       ? trimmed
       : domain === "localhost" || /([0-9]+\.)*[0-9]/.test(domain)
         ? `http://${trimmed}`
@@ -97,15 +123,21 @@ export class WebMCPService extends Service {
   private readonly adapter = new WebMCPAdapter(this.enabled)
   private readonly context = this.bind(ActiveAppContextService)
   private readonly restTabs = this.bind(RESTTabService)
+  private readonly gqlTabs = this.bind(GQLTabService)
   private readonly interceptor = this.bind(KernelInterceptorService)
   private readonly secrets = this.bind(SecretEnvironmentService)
   private readonly execution = this.bind(RESTRequestExecutionService)
+  private readonly gqlExecution = this.bind(GQLRequestExecutionService)
+  private readonly realtime = this.bind(RealtimeSessionService)
   private readonly environments = this.bind(WebMCPEnvironmentService)
   private readonly approval = this.bind(AgentActionApprovalService)
   private readonly activity = this.bind(AgentActivityService)
 
   private appController: AbortController | null = null
   private restController: AbortController | null = null
+  private gqlController: AbortController | null = null
+  private realtimeController: AbortController | null = null
+  private registeredRealtimeMode: RealtimeMode | null = null
   private stopCapabilityWatch: (() => void) | null = null
 
   public readonly diagnostic = computed(() => this.adapter.diagnostic.value)
@@ -122,14 +154,15 @@ export class WebMCPService extends Service {
 
     this.appController = new AbortController()
     await this.registerAppPack(this.appController.signal)
-    await this.syncRESTPack()
+    await this.syncCapabilityPacks()
     this.stopCapabilityWatch = watch(
       () => [
         router.currentRoute.value.path,
         this.restTabs.currentTabID.value,
         this.restTabs.currentActiveTab.value.document.type,
+        this.gqlTabs.currentTabID.value,
       ],
-      () => void this.syncRESTPack(),
+      () => void this.syncCapabilityPacks(),
       { flush: "post" }
     )
   }
@@ -139,6 +172,11 @@ export class WebMCPService extends Service {
     this.stopCapabilityWatch = null
     this.restController?.abort()
     this.restController = null
+    this.gqlController?.abort()
+    this.gqlController = null
+    this.realtimeController?.abort()
+    this.realtimeController = null
+    this.registeredRealtimeMode = null
     this.appController?.abort()
     this.appController = null
     this.approval.clear()
@@ -153,6 +191,37 @@ export class WebMCPService extends Service {
       this.restController.abort()
       this.restController = null
     }
+  }
+
+  private async syncGraphQLPack() {
+    const available = this.context.isGQLAvailable()
+    if (available && !this.gqlController) {
+      this.gqlController = new AbortController()
+      await this.registerGraphQLPack(this.gqlController.signal)
+    } else if (!available && this.gqlController) {
+      this.gqlController.abort()
+      this.gqlController = null
+    }
+  }
+
+  private async syncCapabilityPacks() {
+    await Promise.all([
+      this.syncRESTPack(),
+      this.syncGraphQLPack(),
+      this.syncRealtimePack(),
+    ])
+  }
+
+  private async syncRealtimePack() {
+    const mode = this.context.realtimeMode()
+    if (mode === this.registeredRealtimeMode) return
+    this.realtimeController?.abort()
+    this.realtimeController = null
+    this.registeredRealtimeMode = null
+    if (!mode) return
+    this.realtimeController = new AbortController()
+    this.registeredRealtimeMode = mode
+    await this.registerRealtimePack(mode, this.realtimeController.signal)
   }
 
   private base(scope: WebMCPRevisionScope) {
@@ -489,6 +558,866 @@ export class WebMCPService extends Service {
         signal
       ),
     ])
+  }
+
+  private visibleGQL() {
+    const gql = this.context.captureVisibleGQL()
+    return (
+      gql ??
+      this.failure(
+        "NO_ACTIVE_GRAPHQL_REQUEST",
+        "The GraphQL request editor is no longer visible.",
+        "app-context",
+        true
+      )
+    )
+  }
+
+  private gqlExchange(document: HoppGQLDocument) {
+    const redactor = this.redactor()
+    const response = gqlMessageEvent.value
+    const safeHeaders = document.request.headers.slice(0, 4).map((header) => ({
+      key: redactor.scrub(header.key, 48),
+      active: header.active,
+      value: /authorization|cookie|token|secret|api[-_]?key/i.test(header.key)
+        ? "[REDACTED]"
+        : redactor.scrub(header.value, 48),
+    }))
+    const responseText =
+      response && response !== "reset" && response.type === "response"
+        ? redactor.scrub(response.data, 256)
+        : undefined
+    return {
+      draft: {
+        dirty: document.isDirty,
+        provenance: document.saveContext?.originLocation ?? "unsaved",
+      },
+      operation: {
+        endpoint: redactor.scrub(document.request.url, 128),
+        queryPreview: redactor.scrub(document.request.query, 256),
+        variablesPreview: redactor.scrub(document.request.variables, 128),
+        headers: safeHeaders,
+        auth: {
+          type: document.request.auth?.authType ?? "none",
+          active: document.request.auth?.authActive ?? false,
+        },
+      },
+      connection: {
+        state: connection.state,
+        schemaLoaded: Boolean(connection.schema),
+        subscriptionState:
+          connection.subscriptionState.get(this.gqlTabs.currentTabID.value) ??
+          "UNSUBSCRIBED",
+      },
+      response:
+        response && response !== "reset"
+          ? response.type === "error"
+            ? {
+                state: "error",
+                message: redactor.scrub(response.error.message, 128),
+              }
+            : {
+                state: "success",
+                preview: responseText,
+                status: response.document?.statusCode,
+              }
+          : { state: "empty" },
+    }
+  }
+
+  private gqlObservation() {
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    return this.result("graphql-document", {
+      responseRevision: this.context.revision("graphql-response"),
+      operation: this.gqlExchange(gql.tab.document),
+    })
+  }
+
+  private async registerGraphQLPack(signal: AbortSignal) {
+    await Promise.all([
+      this.adapter.register(
+        {
+          name: "inspect_graphql_operation",
+          title: "Inspect current GraphQL operation",
+          description:
+            "Inspect the visible GraphQL operation, connection, latest response, and draft state with bounded redacted content.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) =>
+            this.validBoundary(input) && Object.keys(input).length === 0
+              ? this.gqlObservation()
+              : this.failure(
+                  "INVALID_INPUT",
+                  "This tool accepts an empty object only."
+                ),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "read_graphql_payload",
+          title: "Read GraphQL payload window",
+          description:
+            "Read a bounded revision-bound query, variables, or response text window from the visible GraphQL operation.",
+          inputSchema: graphqlPayloadInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => this.readGraphQLPayload(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "search_graphql_schema",
+          title: "Search GraphQL schema",
+          description:
+            "Search the loaded GraphQL schema by type or field name and return a bounded structural summary.",
+          inputSchema: graphqlSchemaSearchInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => this.searchGraphQLSchema(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_graphql_operation",
+          title: "Edit current GraphQL operation",
+          description:
+            "Apply a bounded revision-bound patch to the visible GraphQL endpoint, document, variables, or headers without saving it.",
+          inputSchema: editGraphQLOperationInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => this.editGraphQLOperation(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "configure_graphql_auth",
+          title: "Configure GraphQL authorization",
+          description:
+            "Configure visible GraphQL authorization with environment variable references, never literal credential values.",
+          inputSchema: configureRESTAuthInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => this.configureGraphQLAuth(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "connect_graphql",
+          title: "Connect GraphQL schema",
+          description:
+            "Connect the visible GraphQL request to load its schema after approval.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: actionSignal }) =>
+            this.runGraphQLAction(input, actionSignal, "connect"),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "disconnect_graphql",
+          title: "Disconnect GraphQL schema",
+          description: "Disconnect the visible GraphQL schema connection.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) =>
+            this.runGraphQLAction(
+              input,
+              new AbortController().signal,
+              "disconnect"
+            ),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "execute_graphql_operation",
+          title: "Execute GraphQL operation",
+          description:
+            "Execute a visible GraphQL query or mutation through Hoppscotch after approval.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: actionSignal }) =>
+            this.runGraphQLAction(input, actionSignal, "execute"),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "start_gql_subscription",
+          title: "Start GraphQL subscription",
+          description:
+            "Start the visible GraphQL subscription after approval and return its lifecycle state.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: actionSignal }) =>
+            this.runGraphQLAction(input, actionSignal, "subscribe"),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "stop_gql_subscription",
+          title: "Stop GraphQL subscription",
+          description: "Stop the active visible GraphQL subscription.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) =>
+            this.runGraphQLAction(
+              input,
+              new AbortController().signal,
+              "unsubscribe"
+            ),
+        },
+        signal
+      ),
+    ])
+  }
+
+  private async readGraphQLPayload(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = graphqlPayloadParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    const scope =
+      parsed.data.source === "response"
+        ? "graphql-response"
+        : "graphql-document"
+    if (!this.context.matches(scope, parsed.data.expectedRevision)) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The payload changed; inspect it again.",
+        scope,
+        true
+      )
+    }
+    const response = gqlMessageEvent.value
+    const value =
+      parsed.data.source === "query"
+        ? gql.tab.document.request.query
+        : parsed.data.source === "variables"
+          ? gql.tab.document.request.variables
+          : response && response !== "reset" && response.type === "response"
+            ? response.data
+            : ""
+    const text = this.redactor().scrub(
+      value,
+      parsed.data.offset + parsed.data.maxChars
+    )
+    return this.result(scope, {
+      payload: {
+        source: parsed.data.source,
+        offset: parsed.data.offset,
+        text: text.slice(
+          parsed.data.offset,
+          parsed.data.offset + parsed.data.maxChars
+        ),
+        totalChars: text.length,
+        truncated: parsed.data.offset + parsed.data.maxChars < text.length,
+      },
+    })
+  }
+
+  private async searchGraphQLSchema(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = graphqlSchemaSearchParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    const needle = parsed.data.query.toLocaleLowerCase()
+    const matches = connection.schema
+      ? Object.values(connection.schema.getTypeMap())
+          .filter((item) => item.name.toLocaleLowerCase().includes(needle))
+          .slice(0, 8)
+          .map((item) => ({
+            name: item.name,
+            kind: item.astNode?.kind ?? "type",
+          }))
+      : []
+    return this.result("graphql-document", {
+      schemaLoaded: Boolean(connection.schema),
+      matches,
+    })
+  }
+
+  private async editGraphQLOperation(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = editGraphQLOperationParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    if (
+      !this.context.matches("graphql-document", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The GraphQL draft changed; inspect it again.",
+        "graphql-document",
+        true
+      )
+    }
+    const original = cloneDeep(gql.tab.document.request)
+    const candidate = { ...cloneDeep(original) }
+    if (parsed.data.patch.endpoint !== undefined)
+      candidate.url = parsed.data.patch.endpoint
+    if (parsed.data.patch.query !== undefined)
+      candidate.query = parsed.data.patch.query
+    if (parsed.data.patch.variables !== undefined)
+      candidate.variables = parsed.data.patch.variables
+    if (parsed.data.patch.headers !== undefined)
+      candidate.headers = parsed.data.patch.headers.map((header) => ({
+        ...header,
+        description: "",
+      }))
+    const validated = HoppGQLRequest.safeParse(candidate)
+    if (validated.type !== "ok")
+      return this.failure(
+        "INVALID_INPUT",
+        "The patch does not produce a valid GraphQL request.",
+        "graphql-document"
+      )
+    gql.tab.document.request = validated.value
+    gql.tab.document.isDirty = true
+    const revision = this.context.revision("graphql-document")
+    this.activity.record({
+      tool: "edit_graphql_operation",
+      outcome: "changed",
+      summary:
+        `Changed GraphQL ${Object.keys(parsed.data.patch).join(", ")}`.slice(
+          0,
+          256
+        ),
+      revision,
+    })
+    const observation = this.gqlObservation()
+    return observation.ok
+      ? { ...observation, changedFields: Object.keys(parsed.data.patch) }
+      : observation
+  }
+
+  private async configureGraphQLAuth(input: Record<string, unknown>) {
+    if (!this.validBoundary(input)) {
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    }
+    const parsed = configureRESTAuthParser.safeParse(input)
+    if (!parsed.success) {
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    }
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    if (
+      !this.context.matches("graphql-document", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The GraphQL draft changed; inspect it again.",
+        "graphql-document",
+        true
+      )
+    }
+    try {
+      const { expectedRevision: _, ...configuration } = parsed.data
+      gql.tab.document.request = {
+        ...cloneDeep(gql.tab.document.request),
+        auth: configureGQLAuth(gql.tab.document.request.auth, configuration),
+      }
+      gql.tab.document.isDirty = true
+      this.activity.record({
+        tool: "configure_graphql_auth",
+        outcome: "changed",
+        summary: `Configured GraphQL ${configuration.authType} authorization`,
+        revision: this.context.revision("graphql-document"),
+      })
+      return this.gqlObservation()
+    } catch (error) {
+      return this.failure(
+        "INVALID_INPUT",
+        error instanceof Error ? error.message : "Invalid authorization",
+        "graphql-document"
+      )
+    }
+  }
+
+  private async runGraphQLAction(
+    input: Record<string, unknown>,
+    signal: AbortSignal,
+    action: "connect" | "disconnect" | "execute" | "subscribe" | "unsubscribe"
+  ) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = executeRESTRequestParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    if (
+      !this.context.matches("graphql-document", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The GraphQL draft changed; inspect it again.",
+        "graphql-document",
+        true
+      )
+    }
+    const consequential =
+      action === "connect" || action === "execute" || action === "subscribe"
+    if (consequential) {
+      const approved = await this.approval.request(
+        {
+          action: `${action === "execute" ? "Execute" : action === "subscribe" ? "Start" : "Connect"} GraphQL`,
+          method: "POST",
+          target: this.redactor().scrub(
+            safeTarget(gql.tab.document.request.url),
+            256
+          ),
+          environment: this.context.capture().environment.name,
+          workspace: this.context.capture().workspace.type,
+          grantKey: `graphql|${action}|${this.context.capture().environment.name}|${this.context.capture().workspace.type}`,
+        },
+        signal
+      )
+      if (!approved)
+        return this.failure(
+          signal.aborted ? "CANCELLED" : "APPROVAL_DENIED",
+          signal.aborted
+            ? "The action was cancelled."
+            : "The user denied the action.",
+          "graphql-document"
+        )
+      if (
+        !this.context.matches(
+          "graphql-document",
+          parsed.data.expectedRevision
+        ) ||
+        this.context.captureVisibleGQL()?.token !== gql.token
+      ) {
+        return this.failure(
+          "STATE_CHANGED",
+          "The GraphQL draft changed while approval was open.",
+          "graphql-document",
+          true
+        )
+      }
+    }
+    try {
+      if (action === "connect") await this.gqlExecution.connect(gql.tab)
+      else if (action === "disconnect") this.gqlExecution.disconnect()
+      else if (action === "execute") await this.gqlExecution.execute(gql.tab)
+      else if (action === "subscribe")
+        this.gqlExecution.startSubscription(gql.tab)
+      else this.gqlExecution.stopSubscription()
+      this.activity.record({
+        tool: `${action}_graphql`,
+        outcome: action === "execute" ? "executed" : "changed",
+        summary: `GraphQL ${action}`,
+        revision: this.context.revision("graphql-document"),
+      })
+      return this.gqlObservation()
+    } catch (error) {
+      return this.failure(
+        "EXECUTION_FAILED",
+        error instanceof Error ? error.message : "GraphQL action failed.",
+        "graphql-document"
+      )
+    }
+  }
+
+  private visibleRealtime(mode: RealtimeMode) {
+    return this.context.realtimeMode() === mode
+      ? true
+      : this.failure(
+          "NO_ACTIVE_REALTIME_SESSION",
+          "The requested realtime session is no longer visible.",
+          "app-context",
+          true
+        )
+  }
+
+  private async realtimeObservation(mode: RealtimeMode) {
+    const visible = this.visibleRealtime(mode)
+    if (visible !== true) return visible
+    const snapshot = await this.realtime.snapshot(mode)
+    const redactor = this.redactor()
+    return this.result("realtime-session", {
+      session: {
+        mode,
+        endpoint: redactor.scrub(snapshot.endpoint, 128),
+        state: snapshot.state,
+        configuration: snapshot.configuration,
+        log: {
+          total: snapshot.log.length,
+          tail: snapshot.log.slice(-3).map((line) => ({
+            source: redactor.scrub(line.source, 32),
+            prefix: line.prefix ? redactor.scrub(line.prefix, 48) : undefined,
+            payload: redactor.scrub(line.payload, 128),
+            timestamp: line.ts,
+          })),
+        },
+      },
+    })
+  }
+
+  private async registerRealtimePack(mode: RealtimeMode, signal: AbortSignal) {
+    const common = [
+      this.adapter.register(
+        {
+          name: "inspect_realtime_session",
+          title: "Inspect realtime session",
+          description:
+            "Inspect the visible realtime session configuration, connection state, and bounded redacted log tail.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) =>
+            this.validBoundary(input) && Object.keys(input).length === 0
+              ? this.realtimeObservation(mode)
+              : this.failure(
+                  "INVALID_INPUT",
+                  "This tool accepts an empty object only."
+                ),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_realtime_session",
+          title: "Edit realtime session",
+          description:
+            "Apply a bounded revision-bound configuration patch to the visible realtime session without creating a saved resource.",
+          inputSchema: editRealtimeSessionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => this.editRealtimeSession(mode, input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "connect_realtime",
+          title: "Connect realtime session",
+          description:
+            "Connect the visible realtime session after explicit app approval.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: actionSignal }) =>
+            this.runRealtimeAction(mode, "connect", input, actionSignal),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "disconnect_realtime",
+          title: "Disconnect realtime session",
+          description: "Disconnect the visible realtime session.",
+          inputSchema: expectedRevisionSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) =>
+            this.runRealtimeAction(
+              mode,
+              "disconnect",
+              input,
+              new AbortController().signal
+            ),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "read_realtime_log",
+          title: "Read realtime log window",
+          description:
+            "Read a bounded revision-bound window of the visible realtime session log.",
+          inputSchema: realtimeLogInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => this.readRealtimeLog(mode, input),
+        },
+        signal
+      ),
+    ]
+    if (mode === "websocket" || mode === "socketio") {
+      common.push(
+        this.adapter.register(
+          {
+            name: "send_realtime_message",
+            title: "Send realtime message",
+            description:
+              "Send a message through the visible realtime connection after approval. Socket.IO requires an event name.",
+            inputSchema: realtimeMessageInputSchema,
+            annotations: { readOnlyHint: false, untrustedContentHint: true },
+            execute: async (input, { signal: actionSignal }) =>
+              this.runRealtimeAction(mode, "send", input, actionSignal),
+          },
+          signal
+        )
+      )
+    }
+    if (mode === "mqtt") {
+      for (const [name, action, description] of [
+        [
+          "publish_mqtt_message",
+          "publish",
+          "Publish a message to an MQTT topic after approval.",
+        ],
+        [
+          "subscribe_mqtt_topic",
+          "subscribe",
+          "Subscribe the visible MQTT session to a topic after approval.",
+        ],
+        [
+          "unsubscribe_mqtt_topic",
+          "unsubscribe",
+          "Unsubscribe the visible MQTT session from a topic after approval.",
+        ],
+      ] as const) {
+        common.push(
+          this.adapter.register(
+            {
+              name,
+              title: description.slice(0, 48),
+              description,
+              inputSchema: mqttTopicInputSchema,
+              annotations: { readOnlyHint: false, untrustedContentHint: true },
+              execute: async (input, { signal: actionSignal }) =>
+                this.runRealtimeAction(mode, action, input, actionSignal),
+            },
+            signal
+          )
+        )
+      }
+    }
+    await Promise.all(common)
+  }
+
+  private async editRealtimeSession(
+    mode: RealtimeMode,
+    input: Record<string, unknown>
+  ) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = editRealtimeSessionParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const visible = this.visibleRealtime(mode)
+    if (visible !== true) return visible
+    if (
+      !this.context.matches("realtime-session", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The realtime session changed; inspect it again.",
+        "realtime-session",
+        true
+      )
+    }
+    const fields = Object.keys(parsed.data.patch)
+    const valid = {
+      websocket: ["endpoint", "protocols"],
+      socketio: ["endpoint", "path", "version"],
+      sse: ["endpoint", "eventType"],
+      mqtt: ["endpoint", "clientID"],
+    }[mode]
+    if (fields.some((field) => !valid.includes(field))) {
+      return this.failure(
+        "INVALID_INPUT",
+        "The patch contains fields unsupported by this realtime protocol.",
+        "realtime-session"
+      )
+    }
+    await this.realtime.edit(mode, parsed.data.patch)
+    this.activity.record({
+      tool: "edit_realtime_session",
+      outcome: "changed",
+      summary: `Changed ${mode} ${fields.join(", ")}`.slice(0, 256),
+      revision: this.context.revision("realtime-session"),
+    })
+    return this.realtimeObservation(mode)
+  }
+
+  private async readRealtimeLog(
+    mode: RealtimeMode,
+    input: Record<string, unknown>
+  ) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = realtimeLogParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const visible = this.visibleRealtime(mode)
+    if (visible !== true) return visible
+    if (
+      !this.context.matches("realtime-session", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The realtime log changed; inspect it again.",
+        "realtime-session",
+        true
+      )
+    }
+    const snapshot = await this.realtime.snapshot(mode)
+    const redactor = this.redactor()
+    const entries = snapshot.log
+      .slice(parsed.data.offset, parsed.data.offset + parsed.data.limit)
+      .map((line) => ({
+        source: redactor.scrub(line.source, 32),
+        prefix: line.prefix ? redactor.scrub(line.prefix, 48) : undefined,
+        payload: redactor.scrub(line.payload, 256),
+        timestamp: line.ts,
+      }))
+    return this.result("realtime-session", {
+      log: {
+        offset: parsed.data.offset,
+        entries,
+        total: snapshot.log.length,
+        truncated: parsed.data.offset + entries.length < snapshot.log.length,
+      },
+    })
+  }
+
+  private async runRealtimeAction(
+    mode: RealtimeMode,
+    action:
+      | "connect"
+      | "disconnect"
+      | "send"
+      | "publish"
+      | "subscribe"
+      | "unsubscribe",
+    input: Record<string, unknown>,
+    signal: AbortSignal
+  ) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parser =
+      action === "send"
+        ? realtimeMessageParser
+        : action === "publish" ||
+            action === "subscribe" ||
+            action === "unsubscribe"
+          ? mqttTopicParser
+          : executeRESTRequestParser
+    const parsed = parser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const visible = this.visibleRealtime(mode)
+    if (visible !== true) return visible
+    if (
+      !this.context.matches("realtime-session", parsed.data.expectedRevision)
+    ) {
+      return this.failure(
+        "STATE_CHANGED",
+        "The realtime session changed; inspect it again.",
+        "realtime-session",
+        true
+      )
+    }
+    const consequential = action !== "disconnect"
+    const snapshot = await this.realtime.snapshot(mode)
+    if (consequential) {
+      const approved = await this.approval.request(
+        {
+          action: `${action[0].toUpperCase()}${action.slice(1)} ${mode}`,
+          method: action.toUpperCase(),
+          target: this.redactor().scrub(safeTarget(snapshot.endpoint), 256),
+          environment: this.context.capture().environment.name,
+          workspace: this.context.capture().workspace.type,
+          grantKey: `realtime|${mode}|${action}|${snapshot.endpoint}|${this.context.capture().environment.name}`,
+        },
+        signal
+      )
+      if (!approved)
+        return this.failure(
+          signal.aborted ? "CANCELLED" : "APPROVAL_DENIED",
+          signal.aborted
+            ? "The action was cancelled."
+            : "The user denied the action.",
+          "realtime-session"
+        )
+      if (
+        !this.context.matches(
+          "realtime-session",
+          parsed.data.expectedRevision
+        ) ||
+        this.visibleRealtime(mode) !== true
+      ) {
+        return this.failure(
+          "STATE_CHANGED",
+          "The realtime session changed while approval was open.",
+          "realtime-session",
+          true
+        )
+      }
+    }
+    try {
+      if (action === "connect") {
+        await this.realtime.connect(mode)
+        signal.addEventListener(
+          "abort",
+          () => void this.realtime.disconnect(mode),
+          { once: true }
+        )
+      } else if (action === "disconnect") await this.realtime.disconnect(mode)
+      else if (action === "send") {
+        const message = realtimeMessageParser.parse(input)
+        await this.realtime.send(
+          mode as "websocket" | "socketio",
+          message.message,
+          message.eventName
+        )
+      } else {
+        const topic = mqttTopicParser.parse(input)
+        if (action === "publish")
+          await this.realtime.publish(topic.topic, topic.message ?? "")
+        else if (action === "subscribe")
+          await this.realtime.subscribe(topic.topic, topic.qos)
+        else await this.realtime.unsubscribe(topic.topic)
+      }
+      this.activity.record({
+        tool: `${action}_${mode}`,
+        outcome: consequential ? "executed" : "changed",
+        summary: `${action} ${mode}`.slice(0, 256),
+        revision: this.context.revision("realtime-session"),
+      })
+      return this.realtimeObservation(mode)
+    } catch (error) {
+      return this.failure(
+        "EXECUTION_FAILED",
+        error instanceof Error ? error.message : "Realtime action failed.",
+        "realtime-session"
+      )
+    }
   }
 
   private async inspectEnvironment(input: Record<string, unknown>) {
