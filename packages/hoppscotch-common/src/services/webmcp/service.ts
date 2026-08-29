@@ -1176,7 +1176,11 @@ export class WebMCPService extends Service {
           ),
           environment: this.context.capture().environment.name,
           workspace: this.context.capture().workspace.type,
-          grantKey: `graphql|${action}|${this.context.capture().environment.name}|${this.context.capture().workspace.type}`,
+          grantKey: `graphql|${action}|${
+            gql.tab.document.request.url.includes("<<")
+              ? parsed.data.expectedRevision
+              : safeTarget(gql.tab.document.request.url)
+          }|${this.context.capture().environment.name}|${this.context.capture().workspace.type}`,
         },
         signal
       )
@@ -1536,7 +1540,11 @@ export class WebMCPService extends Service {
           target: this.redactor().scrub(safeTarget(snapshot.endpoint), 256),
           environment: this.context.capture().environment.name,
           workspace: this.context.capture().workspace.type,
-          grantKey: `realtime|${mode}|${action}|${snapshot.endpoint}|${this.context.capture().environment.name}`,
+          grantKey: `realtime|${mode}|${action}|${
+            snapshot.endpoint.includes("<<")
+              ? parsed.data.expectedRevision
+              : safeTarget(snapshot.endpoint)
+          }|${this.context.capture().environment.name}|${this.context.capture().workspace.type}`,
         },
         signal
       )
@@ -2071,6 +2079,9 @@ export class WebMCPService extends Service {
         environment: this.context.capture().environment.name,
         workspace: this.context.capture().workspace.type,
         grantKey: `script-read:${crypto.randomUUID()}`,
+        description:
+          "An agent wants to read a bounded window of request script source. Script content can contain sensitive data.",
+        allowSession: false,
       },
       signal
     )

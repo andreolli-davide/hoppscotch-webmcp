@@ -11,6 +11,10 @@ export type AgentApprovalRequest = {
   environment: string
   workspace: string
   grantKey: string
+  /** Explain the exact disclosure or consequential operation to the user. */
+  description?: string
+  /** Sensitive reads must always require an explicit per-operation decision. */
+  allowSession?: boolean
 }
 
 type ApprovalDecision = "once" | "session" | "deny"
@@ -53,7 +57,8 @@ export class AgentActionApprovalService extends Service {
     const pending = this.state.value
     if (!pending) return
 
-    if (decision === "session") this.grants.add(pending.grantKey)
+    if (decision === "session" && pending.allowSession !== false)
+      this.grants.add(pending.grantKey)
     this.state.value = null
     pending.resolve(decision !== "deny")
   }

@@ -44,6 +44,24 @@ describe("WebMCP human control", () => {
     expect(service.pending.value).toBeNull()
   })
 
+  it("does not persist a sensitive per-operation approval", async () => {
+    const service = new TestContainer().bind(AgentActionApprovalService)
+    const request = {
+      ...approvalRequest,
+      action: "Read script source",
+      grantKey: "sensitive-read",
+      allowSession: false,
+    }
+    const first = service.request(request, new AbortController().signal)
+    service.resolve("session")
+    await expect(first).resolves.toBe(true)
+
+    const second = service.request(request, new AbortController().signal)
+    expect(service.pending.value?.grantKey).toBe("sensitive-read")
+    service.resolve("deny")
+    await expect(second).resolves.toBe(false)
+  })
+
   it("keeps bounded activity and makes undo one-shot", () => {
     const service = new TestContainer().bind(AgentActivityService)
     let value = "changed"

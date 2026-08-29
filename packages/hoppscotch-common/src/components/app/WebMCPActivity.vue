@@ -9,8 +9,10 @@
     <template #body>
       <div class="flex flex-col space-y-3 px-2 text-secondaryLight">
         <p>
-          An agent wants to execute a request. This can change data on a remote
-          system.
+          {{
+            approval.pending.value.description ??
+            "An agent wants to execute a request. This can change data on a remote system."
+          }}
         </p>
         <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
           <dt class="font-semibold text-secondary">Action</dt>
@@ -35,6 +37,7 @@
           @click="approval.resolve('once')"
         />
         <HoppButtonSecondary
+          v-if="approval.pending.value.allowSession !== false"
           label="Allow this session"
           outline
           filled
