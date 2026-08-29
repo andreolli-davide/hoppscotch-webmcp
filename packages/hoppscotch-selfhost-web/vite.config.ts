@@ -40,10 +40,18 @@ export default defineConfig({
   server: {
     port: 3000,
     allowedHosts: DEV_ALLOWED_HOSTS,
+    headers: {
+      "Permissions-Policy": "tools=(self)",
+      "Origin-Agent-Cluster": "?1",
+    },
   },
   preview: {
     port: 3000,
     allowedHosts: DEV_ALLOWED_HOSTS,
+    headers: {
+      "Permissions-Policy": "tools=(self)",
+      "Origin-Agent-Cluster": "?1",
+    },
   },
   publicDir: path.resolve(__dirname, "../hoppscotch-common/public"),
   build: {

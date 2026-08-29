@@ -12,6 +12,8 @@
   [headers.values]
     X-Frame-Options = "SAMEORIGIN"
     X-XSS-Protection = "1; mode=block"
+    Permissions-Policy = "tools=(self)"
+    Origin-Agent-Cluster = "?1"
 
 [[redirects]]
   from = "/discord"

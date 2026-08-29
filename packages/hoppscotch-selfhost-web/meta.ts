@@ -127,4 +127,12 @@ export const META_TAGS = (env: Record<string, string>): IHTMLTag[] => [
     content: "/icon.png",
     color: APP_INFO.app.background,
   },
+  ...(env.VITE_WEBMCP_ORIGIN_TRIAL_TOKEN
+    ? [
+        {
+          "http-equiv": "origin-trial",
+          content: env.VITE_WEBMCP_ORIGIN_TRIAL_TOKEN,
+        },
+      ]
+    : []),
 ]
