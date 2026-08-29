@@ -377,5 +377,3 @@ describe("WebMCP Live Artifact input schemas", () => {
     ).toBe(false)
   })
 })
-
-

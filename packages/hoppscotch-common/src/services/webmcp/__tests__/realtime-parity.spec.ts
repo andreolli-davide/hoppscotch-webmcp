@@ -131,6 +131,8 @@ describe("WebMCP Realtime Session Parity", () => {
     expect(mqttSchema.properties.patch.properties).toHaveProperty("username")
     expect(mqttSchema.properties.patch.properties).toHaveProperty("password")
     expect(mqttSchema.properties.patch.properties).toHaveProperty("keepAlive")
-    expect(mqttSchema.properties.patch.properties).toHaveProperty("cleanSession")
+    expect(mqttSchema.properties.patch.properties).toHaveProperty(
+      "cleanSession"
+    )
   })
 })

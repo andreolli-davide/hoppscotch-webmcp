@@ -442,7 +442,10 @@ const toggleConnection = () => {
   if (connectionState.value === "DISCONNECTED") {
     const envVars = getAggregateEnvsWithCurrentValue()
     const resolvedUrl = parseTemplateString(url.value, envVars)
-    const resolvedPath = parseTemplateString(path.value || "/socket.io", envVars)
+    const resolvedPath = parseTemplateString(
+      path.value || "/socket.io",
+      envVars
+    )
     const resolvedToken = parseTemplateString(
       bearerToken.value,
       envVars,

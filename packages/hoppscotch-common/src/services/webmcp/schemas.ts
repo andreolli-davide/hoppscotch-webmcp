@@ -1191,5 +1191,3 @@ export const deleteEnvironmentInputSchema = {
   required: ["expectedRevision", "environmentIndex", "confirmationName"],
   additionalProperties: false,
 } as const
-
-

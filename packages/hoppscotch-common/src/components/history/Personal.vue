@@ -322,8 +322,8 @@ const useHistory = (entry: RESTHistoryEntry) => {
 }
 
 const isRESTHistoryEntry = (
-  entries: TimedHistoryEntry[]
-): entries is Array<TimedHistoryEntry & { entry: RESTHistoryEntry }> =>
+  _entries: TimedHistoryEntry[]
+): _entries is Array<TimedHistoryEntry & { entry: RESTHistoryEntry }> =>
   // If the page is rest, then we can guarantee what we have is a RESTHistoryEnry
   props.page === "rest"
 

@@ -179,11 +179,7 @@ export class RealtimeSessionService extends Service {
       if (typeof patch.lwTopic === "string") configPatch.lwTopic = patch.lwTopic
       if (typeof patch.lwMessage === "string")
         configPatch.lwMessage = patch.lwMessage
-      if (
-        patch.lwQos === 0 ||
-        patch.lwQos === 1 ||
-        patch.lwQos === 2
-      )
+      if (patch.lwQos === 0 || patch.lwQos === 1 || patch.lwQos === 2)
         configPatch.lwQos = patch.lwQos
       if (typeof patch.lwRetain === "boolean")
         configPatch.lwRetain = patch.lwRetain
@@ -310,10 +306,7 @@ export class RealtimeSessionService extends Service {
         signal
       )
       const resolvedUrl = parseTemplateString(state.endpoint, envVars)
-      socket.start(
-        resolvedUrl,
-        String(state.configuration.eventType || "data")
-      )
+      socket.start(resolvedUrl, String(state.configuration.eventType || "data"))
       try {
         await completion
       } catch (error) {
@@ -336,10 +329,20 @@ export class RealtimeSessionService extends Service {
       const rawConfig = state.configuration as Record<string, unknown>
       const resolvedConfig: MQTTConnectionConfig = {
         username: rawConfig.username
-          ? parseTemplateString(String(rawConfig.username), envVars, false, false)
+          ? parseTemplateString(
+              String(rawConfig.username),
+              envVars,
+              false,
+              false
+            )
           : undefined,
         password: rawConfig.password
-          ? parseTemplateString(String(rawConfig.password), envVars, false, false)
+          ? parseTemplateString(
+              String(rawConfig.password),
+              envVars,
+              false,
+              false
+            )
           : undefined,
         keepAlive: String(rawConfig.keepAlive ?? "60"),
         cleanSession: rawConfig.cleanSession !== false,
@@ -347,16 +350,17 @@ export class RealtimeSessionService extends Service {
           ? parseTemplateString(String(rawConfig.lwTopic), envVars)
           : undefined,
         lwMessage: rawConfig.lwMessage
-          ? parseTemplateString(String(rawConfig.lwMessage), envVars, false, false)
+          ? parseTemplateString(
+              String(rawConfig.lwMessage),
+              envVars,
+              false,
+              false
+            )
           : "",
         lwQos: (rawConfig.lwQos as 0 | 1 | 2) ?? 0,
         lwRetain: Boolean(rawConfig.lwRetain),
       }
-      socket.connect(
-        resolvedUrl,
-        resolvedClientID,
-        resolvedConfig
-      )
+      socket.connect(resolvedUrl, resolvedClientID, resolvedConfig)
       try {
         await completion
       } catch (error) {

@@ -36,10 +36,7 @@ import {
   removeRESTFolder,
   cascadeParentCollectionForProperties,
 } from "~/newstore/collections"
-import {
-  restHistoryStore,
-  graphqlHistoryStore,
-} from "~/newstore/history"
+import { restHistoryStore, graphqlHistoryStore } from "~/newstore/history"
 import { HoppTab } from "~/services/tab"
 import {
   HoppRequestDocument,
@@ -157,9 +154,9 @@ import {
 } from "./types"
 
 const MAX_INPUT_BYTES = 128 * 1024
-// Chrome recommends keeping each individual tool result near 1.5K characters.
-// Payload details are available through the bounded read_rest_payload tool.
-const MAX_OUTPUT_BYTES = 1536
+// Bounded tool output limit (8 KiB) protecting LLM context and IPC transport.
+// Payload inspection details remain accessible via bounded read_rest_payload windows.
+const MAX_OUTPUT_BYTES = 8192
 
 const isPlainData = (value: unknown): boolean => {
   if (value === null || typeof value !== "object") return true
@@ -210,8 +207,7 @@ const extractRunnerResults = (
   for (const request of collection.requests as TestRunnerRequest[]) {
     if (results.length >= 50) break
     const response = request.response
-    const statusCode =
-      response && "status" in response ? response.status : null
+    const statusCode = response && "status" in response ? response.status : null
     const duration =
       response && "meta" in response && response.meta?.responseDuration
         ? response.meta.responseDuration
@@ -2658,8 +2654,7 @@ export class WebMCPService extends Service {
         {
           name: "list_gql_history",
           title: "List GraphQL execution history",
-          description:
-            "List recent GraphQL request history entries.",
+          description: "List recent GraphQL request history entries.",
           inputSchema: listHistoryInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
@@ -2915,10 +2910,15 @@ export class WebMCPService extends Service {
         ),
       revision,
     })
-    const observation = this.gqlObservation()
-    return observation.ok
-      ? { ...observation, changedFields: Object.keys(parsed.data.patch) }
-      : observation
+    const changedFields = Object.keys(parsed.data.patch)
+    return this.result("graphql-document", {
+      updated: true,
+      changedFields,
+      draft: {
+        dirty: gql.tab.document.isDirty,
+        provenance: gql.tab.document.saveContext?.originLocation ?? "unsaved",
+      },
+    })
   }
 
   private async editGraphQLVariables(input: Record<string, unknown>) {
@@ -2984,10 +2984,14 @@ export class WebMCPService extends Service {
           return true
         }
       )
-      const observation = this.gqlObservation()
-      return observation.ok
-        ? { ...observation, changedFields: ["variables"] }
-        : observation
+      return this.result("graphql-document", {
+        updated: true,
+        changedFields: ["variables"],
+        draft: {
+          dirty: gql.tab.document.isDirty,
+          provenance: gql.tab.document.saveContext?.originLocation ?? "unsaved",
+        },
+      })
     } catch (error) {
       return this.failure(
         "INVALID_INPUT",
@@ -3035,7 +3039,14 @@ export class WebMCPService extends Service {
         summary: `Configured GraphQL ${configuration.authType} authorization`,
         revision: this.context.revision("graphql-document"),
       })
-      return this.gqlObservation()
+      return this.result("graphql-document", {
+        updated: true,
+        changedFields: ["auth"],
+        draft: {
+          dirty: gql.tab.document.isDirty,
+          provenance: gql.tab.document.saveContext?.originLocation ?? "unsaved",
+        },
+      })
     } catch (error) {
       return this.failure(
         "INVALID_INPUT",
@@ -3188,8 +3199,7 @@ export class WebMCPService extends Service {
       typeof rawConfig.auth === "object"
     ) {
       const auth = rawConfig.auth as Record<string, unknown>
-      const token =
-        typeof auth.bearerToken === "string" ? auth.bearerToken : ""
+      const token = typeof auth.bearerToken === "string" ? auth.bearerToken : ""
       safeConfiguration.auth = {
         authType: auth.authType ?? "None",
         authActive: auth.authActive ?? true,
@@ -3395,7 +3405,10 @@ export class WebMCPService extends Service {
       summary: `Changed ${mode} ${fields.join(", ")}`.slice(0, 256),
       revision: this.context.revision("realtime-session"),
     })
-    return this.realtimeObservation(mode)
+    return this.result("realtime-session", {
+      updated: true,
+      changedFields: fields,
+    })
   }
 
   private async readRealtimeLog(
@@ -3740,8 +3753,14 @@ export class WebMCPService extends Service {
       }
     )
 
-    const observation = await this.observation()
-    return observation.ok ? { ...observation, changedFields } : observation
+    return this.result("rest-document", {
+      updated: true,
+      changedFields,
+      draft: {
+        dirty: rest.tab.document.isDirty,
+        provenance: rest.tab.document.saveContext?.originLocation ?? "unsaved",
+      },
+    })
   }
 
   private async configureRESTAuth(input: Record<string, unknown>) {
@@ -4200,8 +4219,14 @@ export class WebMCPService extends Service {
         return true
       }
     )
-    const observation = await this.observation()
-    return observation.ok ? { ...observation, changedFields } : observation
+    return this.result("rest-document", {
+      updated: true,
+      changedFields,
+      draft: {
+        dirty: rest.tab.document.isDirty,
+        provenance: rest.tab.document.saveContext?.originLocation ?? "unsaved",
+      },
+    })
   }
 
   private async executeRESTRequest(

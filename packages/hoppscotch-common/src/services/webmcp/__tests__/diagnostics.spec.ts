@@ -38,4 +38,3 @@ describe("WebMCP structured diagnostics helpers", () => {
     ).toThrow("Invalid JSON Pointer array index")
   })
 })
-

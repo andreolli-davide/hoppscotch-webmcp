@@ -61,10 +61,7 @@ export class GQLRequestExecutionService extends Service {
     }
   }
 
-  public async connect(
-    tab: HoppTab<HoppGQLDocument>,
-    signal?: AbortSignal
-  ) {
+  public async connect(tab: HoppTab<HoppGQLDocument>, signal?: AbortSignal) {
     const options = this.baseOptions(tab)
     await connect(
       {

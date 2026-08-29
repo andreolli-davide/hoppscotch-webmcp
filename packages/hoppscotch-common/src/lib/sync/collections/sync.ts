@@ -83,7 +83,7 @@ const addDescriptionField = (candidate: Array<Record<string, unknown>>) =>
     description: "description" in item ? item.description : "",
   }))
 
-const exportedCollectionToHoppCollection = (
+const _exportedCollectionToHoppCollection = (
   collection: ExportedCollectionFolder
 ): HoppCollection => {
   const data =
@@ -102,7 +102,7 @@ const exportedCollectionToHoppCollection = (
     _ref_id: data._ref_id ?? generateUniqueRefId("coll"),
     name: collection.name,
     folders: collection.folders.map((folder) =>
-      exportedCollectionToHoppCollection(folder)
+      _exportedCollectionToHoppCollection(folder)
     ),
     requests: collection.requests.map((request) => ({ ...request })),
     auth: data.auth,

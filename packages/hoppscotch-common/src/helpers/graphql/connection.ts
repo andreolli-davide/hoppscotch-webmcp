@@ -525,7 +525,10 @@ export const runGQLOperation = async (
 
       const relayResponse = result.right
 
-      const parsedResponse = await GQLResponse.toResponse(relayResponse, options)
+      const parsedResponse = await GQLResponse.toResponse(
+        relayResponse,
+        options
+      )
 
       if (parsedResponse.type === "error") {
         throw new Error(parsedResponse.error.message)

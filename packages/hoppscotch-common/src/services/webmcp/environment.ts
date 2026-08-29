@@ -178,12 +178,10 @@ export class WebMCPEnvironmentService extends Service {
         this.handles.delete(key)
       }
     }
-    const currentLoad = this.teamEnvironments
-      .changeTeamID(teamID)
-      .catch(() => {
-        // The adapter already reports and logs its application error. Keep
-        // personal environments available if the team list cannot be loaded.
-      })
+    const currentLoad = this.teamEnvironments.changeTeamID(teamID).catch(() => {
+      // The adapter already reports and logs its application error. Keep
+      // personal environments available if the team list cannot be loaded.
+    })
     this.teamLoad = currentLoad
     await currentLoad
     if (this.teamLoad === currentLoad) {

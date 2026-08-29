@@ -9,10 +9,7 @@ import {
   getCurrentEnvironment,
   getSelectedEnvironmentType,
 } from "~/newstore/environments"
-import {
-  restCollections$,
-  graphqlCollections$,
-} from "~/newstore/collections"
+import { restCollections$, graphqlCollections$ } from "~/newstore/collections"
 import { restHistory$, graphqlHistory$ } from "~/newstore/history"
 import { CurrentValueService } from "~/services/current-environment-value.service"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
@@ -75,7 +72,8 @@ export class ActiveAppContextService extends Service {
             ? this.restTabs.currentActiveTab.value?.document?.request
             : null,
           this.restTabs.currentActiveTab.value?.document?.type === "request"
-            ? this.restTabs.currentActiveTab.value?.document?.inheritedProperties
+            ? this.restTabs.currentActiveTab.value?.document
+                ?.inheritedProperties
             : null,
           this.restTabs.currentActiveTab.value?.document?.type === "request"
             ? this.restTabs.currentActiveTab.value?.document?.saveContext

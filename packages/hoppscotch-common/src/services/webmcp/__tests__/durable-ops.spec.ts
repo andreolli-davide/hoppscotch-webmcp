@@ -114,13 +114,17 @@ describe("WebMCP Durable / Destructive Operations", () => {
         id: "env-1",
         name: "Staging",
         v: 2,
-        variables: [{ key: "BASE_URL", value: "https://staging.test", secret: false }],
+        variables: [
+          { key: "BASE_URL", value: "https://staging.test", secret: false },
+        ],
       },
       {
         id: "env-2",
         name: "Production",
         v: 2,
-        variables: [{ key: "BASE_URL", value: "https://api.test", secret: false }],
+        variables: [
+          { key: "BASE_URL", value: "https://api.test", secret: false },
+        ],
       },
     ])
 

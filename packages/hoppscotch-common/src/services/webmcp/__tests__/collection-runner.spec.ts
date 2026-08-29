@@ -7,7 +7,10 @@ import * as E from "fp-ts/Either"
 import { setPlatformDef } from "~/platform"
 import { getService } from "~/modules/dioc"
 import { TestRunnerService } from "~/services/test-runner/test-runner.service"
-import { KernelInterceptorService, KernelInterceptor } from "~/services/kernel-interceptor.service"
+import {
+  KernelInterceptorService,
+  KernelInterceptor,
+} from "~/services/kernel-interceptor.service"
 import { HoppTestRunnerDocument } from "~/helpers/rest/document"
 import { HoppTab } from "~/services/tab"
 import { getDefaultRESTRequest } from "~/helpers/rest/default"
@@ -116,7 +119,9 @@ describe("WebMCP Collection Runner Service", () => {
     expect(runnerTabRef.value.document.status).toBe("stopped")
     expect(runnerTabRef.value.document.testRunnerMeta.completedRequests).toBe(1)
     expect(runnerTabRef.value.document.resultCollection).toBeDefined()
-    expect(runnerTabRef.value.document.resultCollection?.name).toBe("Runner Test Collection")
+    expect(runnerTabRef.value.document.resultCollection?.name).toBe(
+      "Runner Test Collection"
+    )
   })
 
   it("handles early cancellation via stopRef", async () => {

@@ -6,7 +6,6 @@ import { BehaviorSubject } from "rxjs"
 
 import { setPlatformDef } from "~/platform"
 import { RESTTabService } from "~/services/tab/rest"
-import { GQLTabService } from "~/services/tab/graphql"
 import { WorkspaceService } from "~/services/workspace.service"
 import { getDefaultRESTRequest } from "~/helpers/rest/default"
 import { getDefaultGQLRequest, makeCollection } from "@hoppscotch/data"
@@ -121,12 +120,16 @@ describe("WebMCP Live Artifact Workflows", () => {
       const insertionIndex = saveRESTRequestAs("0", req)
       expect(insertionIndex).toBe(0)
       expect(restCollectionStore.value.state[0].requests.length).toBe(1)
-      expect(restCollectionStore.value.state[0].requests[0].name).toBe("Get Users")
+      expect(restCollectionStore.value.state[0].requests[0].name).toBe(
+        "Get Users"
+      )
 
       // Update existing request in collection
       const updatedReq = { ...req, name: "Get Users V2" }
       editRESTRequest("0", 0, updatedReq)
-      expect(restCollectionStore.value.state[0].requests[0].name).toBe("Get Users V2")
+      expect(restCollectionStore.value.state[0].requests[0].name).toBe(
+        "Get Users V2"
+      )
     })
 
     it("saves a GraphQL request to a collection and updates it", () => {
@@ -147,11 +150,15 @@ describe("WebMCP Live Artifact Workflows", () => {
       const insertionIndex = saveGraphqlRequestAs("0", req)
       expect(insertionIndex).toBe(0)
       expect(graphqlCollectionStore.value.state[0].requests.length).toBe(1)
-      expect(graphqlCollectionStore.value.state[0].requests[0].name).toBe("Get Schema Query")
+      expect(graphqlCollectionStore.value.state[0].requests[0].name).toBe(
+        "Get Schema Query"
+      )
 
       const updatedReq = { ...req, name: "Get Schema Query V2" }
       editGraphqlRequest("0", 0, updatedReq)
-      expect(graphqlCollectionStore.value.state[0].requests[0].name).toBe("Get Schema Query V2")
+      expect(graphqlCollectionStore.value.state[0].requests[0].name).toBe(
+        "Get Schema Query V2"
+      )
     })
   })
 
@@ -173,7 +180,9 @@ describe("WebMCP Live Artifact Workflows", () => {
 
       setRESTHistoryEntries([entry])
       expect(restHistoryStore.value.state.length).toBe(1)
-      expect(restHistoryStore.value.state[0].request.endpoint).toBe("https://api.example.test/history")
+      expect(restHistoryStore.value.state[0].request.endpoint).toBe(
+        "https://api.example.test/history"
+      )
       expect(restHistoryStore.value.state[0].responseMeta.statusCode).toBe(200)
     })
 
@@ -191,7 +200,9 @@ describe("WebMCP Live Artifact Workflows", () => {
 
       setGraphqlHistoryEntries([entry])
       expect(graphqlHistoryStore.value.state.length).toBe(1)
-      expect(graphqlHistoryStore.value.state[0].request.url).toBe("https://api.example.test/graphql")
+      expect(graphqlHistoryStore.value.state[0].request.url).toBe(
+        "https://api.example.test/graphql"
+      )
       expect(graphqlHistoryStore.value.state[0].star).toBe(true)
     })
   })
@@ -212,8 +223,12 @@ describe("WebMCP Live Artifact Workflows", () => {
 
       expect(workspaceService.currentWorkspace.value.type).toBe("team")
       if (workspaceService.currentWorkspace.value.type === "team") {
-        expect(workspaceService.currentWorkspace.value.teamID).toBe("team-test-123")
-        expect(workspaceService.currentWorkspace.value.teamName).toBe("Engineering Team")
+        expect(workspaceService.currentWorkspace.value.teamID).toBe(
+          "team-test-123"
+        )
+        expect(workspaceService.currentWorkspace.value.teamName).toBe(
+          "Engineering Team"
+        )
       }
 
       workspaceService.changeWorkspace({ type: "personal" })
