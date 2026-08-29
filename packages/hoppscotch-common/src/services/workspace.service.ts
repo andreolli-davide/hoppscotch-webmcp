@@ -215,13 +215,15 @@ export class WorkspaceService extends Service<WorkspaceServiceEvent> {
    * @param pollDuration The duration between polls in milliseconds. If null, the team list adapter will not poll.
    */
   public acquireTeamListAdapter(pollDuration: number | null) {
-    const lockID = this.teamListAdapterLockTicker++
+    if (pollDuration !== null) {
+      const lockID = this.teamListAdapterLockTicker++
 
-    this.teamListAdapterLocks.set(lockID, pollDuration)
+      this.teamListAdapterLocks.set(lockID, pollDuration)
 
-    tryOnScopeDispose(() => {
-      this.teamListAdapterLocks.delete(lockID)
-    })
+      tryOnScopeDispose(() => {
+        this.teamListAdapterLocks.delete(lockID)
+      })
+    }
 
     return this.managedTeamListAdapter
   }
