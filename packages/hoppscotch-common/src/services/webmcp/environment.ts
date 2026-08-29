@@ -173,13 +173,22 @@ export class WebMCPEnvironmentService extends Service {
     }
 
     this.activeTeamID = teamID
-    this.handles.clear()
-    this.teamLoad = this.teamEnvironments.changeTeamID(teamID).catch(() => {
-      // The adapter already reports and logs its application error. Keep
-      // personal environments available if the team list cannot be loaded.
-    })
-    await this.teamLoad
-    this.teamLoad = null
+    for (const [key] of Array.from(this.handles.entries())) {
+      if (key.startsWith("team:")) {
+        this.handles.delete(key)
+      }
+    }
+    const currentLoad = this.teamEnvironments
+      .changeTeamID(teamID)
+      .catch(() => {
+        // The adapter already reports and logs its application error. Keep
+        // personal environments available if the team list cannot be loaded.
+      })
+    this.teamLoad = currentLoad
+    await currentLoad
+    if (this.teamLoad === currentLoad) {
+      this.teamLoad = null
+    }
   }
 
   private teamChoice(teamEnvironment: TeamEnvironment, editable: boolean) {
