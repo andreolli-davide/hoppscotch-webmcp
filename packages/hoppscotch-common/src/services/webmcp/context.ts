@@ -65,16 +65,16 @@ export class ActiveAppContextService extends Service {
     watch(
       () => [
         this.restTabs.currentTabID.value,
-        this.restTabs.currentActiveTab.value.document.type,
-        this.restTabs.currentActiveTab.value.document.isDirty,
-        this.restTabs.currentActiveTab.value.document.type === "request"
-          ? this.restTabs.currentActiveTab.value.document.request
+        this.restTabs.currentActiveTab.value?.document?.type,
+        this.restTabs.currentActiveTab.value?.document?.isDirty,
+        this.restTabs.currentActiveTab.value?.document?.type === "request"
+          ? this.restTabs.currentActiveTab.value?.document?.request
           : null,
-        this.restTabs.currentActiveTab.value.document.type === "request"
-          ? this.restTabs.currentActiveTab.value.document.inheritedProperties
+        this.restTabs.currentActiveTab.value?.document?.type === "request"
+          ? this.restTabs.currentActiveTab.value?.document?.inheritedProperties
           : null,
-        this.restTabs.currentActiveTab.value.document.type === "request"
-          ? this.restTabs.currentActiveTab.value.document.saveContext
+        this.restTabs.currentActiveTab.value?.document?.type === "request"
+          ? this.restTabs.currentActiveTab.value?.document?.saveContext
           : null,
       ],
       () => {
@@ -87,10 +87,10 @@ export class ActiveAppContextService extends Service {
     watch(
       () => [
         this.gqlTabs.currentTabID.value,
-        this.gqlTabs.currentActiveTab.value.document.request,
-        this.gqlTabs.currentActiveTab.value.document.isDirty,
-        this.gqlTabs.currentActiveTab.value.document.saveContext,
-        this.gqlTabs.currentActiveTab.value.document.inheritedProperties,
+        this.gqlTabs.currentActiveTab.value?.document?.request,
+        this.gqlTabs.currentActiveTab.value?.document?.isDirty,
+        this.gqlTabs.currentActiveTab.value?.document?.saveContext,
+        this.gqlTabs.currentActiveTab.value?.document?.inheritedProperties,
       ],
       () => {
         this.bump("app-context")
@@ -106,10 +106,10 @@ export class ActiveAppContextService extends Service {
 
     watch(
       () =>
-        this.restTabs.currentActiveTab.value.document.type === "request"
+        this.restTabs.currentActiveTab.value?.document?.type === "request"
           ? [
-              this.restTabs.currentActiveTab.value.document.response,
-              this.restTabs.currentActiveTab.value.document.testResults,
+              this.restTabs.currentActiveTab.value?.document?.response,
+              this.restTabs.currentActiveTab.value?.document?.testResults,
             ]
           : null,
       () => this.bump("rest-response"),

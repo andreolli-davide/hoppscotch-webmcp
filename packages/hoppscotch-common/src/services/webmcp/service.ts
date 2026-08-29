@@ -285,7 +285,7 @@ export class WebMCPService extends Service {
       () => [
         router.currentRoute.value.path,
         this.restTabs.currentTabID.value,
-        this.restTabs.currentActiveTab.value.document.type,
+        this.restTabs.currentActiveTab.value?.document?.type,
         this.gqlTabs.currentTabID.value,
       ],
       () => void this.syncCapabilityPacks(),
