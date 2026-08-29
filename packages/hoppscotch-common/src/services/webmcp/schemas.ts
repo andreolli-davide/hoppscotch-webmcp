@@ -450,6 +450,118 @@ export const editRESTScriptsInputSchema = {
   additionalProperties: false,
 } as const
 
+const jsonPointerOperation = z
+  .object({
+    op: z.enum(["add", "replace", "remove"]),
+    path: z.string().max(2048),
+    value: z.unknown().optional(),
+  })
+  .strict()
+
+const bodyEntry = z
+  .object({
+    key: z.string().max(256),
+    value: z.string().max(8192),
+    active: z.boolean(),
+  })
+  .strict()
+
+export const editRESTBodyParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    operation: z.discriminatedUnion("kind", [
+      z
+        .object({ kind: z.literal("replace_document"), document: z.unknown() })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("json_pointer"),
+          operations: z.array(jsonPointerOperation).min(1).max(50),
+        })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("set_urlencoded_entries"),
+          entries: z.array(bodyEntry).max(100),
+        })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("set_multipart_text_entries"),
+          entries: z.array(bodyEntry).max(100),
+        })
+        .strict(),
+    ]),
+  })
+  .strict()
+
+export const editRESTBodyInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    operation: {
+      oneOf: [
+        {
+          type: "object",
+          properties: { kind: { const: "replace_document" }, document: {} },
+          required: ["kind", "document"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { const: "json_pointer" },
+            operations: { type: "array", minItems: 1, maxItems: 50 },
+          },
+          required: ["kind", "operations"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { const: "set_urlencoded_entries" },
+            entries: { type: "array", maxItems: 100 },
+          },
+          required: ["kind", "entries"],
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          properties: {
+            kind: { const: "set_multipart_text_entries" },
+            entries: { type: "array", maxItems: 100 },
+          },
+          required: ["kind", "entries"],
+          additionalProperties: false,
+        },
+      ],
+    },
+  },
+  required: ["expectedRevision", "operation"],
+  additionalProperties: false,
+} as const
+
+export const readRESTScriptParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    sourceHandle: z.string().min(1).max(128),
+    offset: z.number().int().min(0).max(32768).default(0),
+    maxChars: z.number().int().min(1).max(768).default(384),
+  })
+  .strict()
+
+export const readRESTScriptInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    sourceHandle: { type: "string", minLength: 1, maxLength: 128 },
+    offset: { type: "integer", minimum: 0, maximum: 32768, default: 0 },
+    maxChars: { type: "integer", minimum: 1, maximum: 768, default: 384 },
+  },
+  required: ["expectedRevision", "sourceHandle"],
+  additionalProperties: false,
+} as const
+
 export const inspectEnvironmentParser = z
   .object({ referencedOnly: z.boolean().default(false) })
   .strict()
@@ -563,6 +675,33 @@ export const editGraphQLOperationInputSchema = {
     },
   },
   required: ["expectedRevision", "patch"],
+  additionalProperties: false,
+} as const
+
+export const editGraphQLVariablesParser = z
+  .object({
+    expectedRevision: z.string().min(1).max(128),
+    operation: z.discriminatedUnion("kind", [
+      z
+        .object({ kind: z.literal("replace_document"), document: z.unknown() })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("json_pointer"),
+          operations: z.array(jsonPointerOperation).min(1).max(50),
+        })
+        .strict(),
+    ]),
+  })
+  .strict()
+
+export const editGraphQLVariablesInputSchema = {
+  type: "object",
+  properties: {
+    expectedRevision: revisionProperty,
+    operation: { type: "object" },
+  },
+  required: ["expectedRevision", "operation"],
   additionalProperties: false,
 } as const
 
@@ -702,6 +841,7 @@ export const realtimeMessageParser = z
     expectedRevision: z.string().min(1).max(128),
     message: z.string().min(1).max(65536),
     eventName: z.string().max(256).default(""),
+    format: z.enum(["text", "json"]).default("text"),
   })
   .strict()
 
@@ -711,6 +851,7 @@ export const realtimeMessageInputSchema = {
     expectedRevision: revisionProperty,
     message: { type: "string", minLength: 1, maxLength: 65536 },
     eventName: { type: "string", maxLength: 256, default: "" },
+    format: { type: "string", enum: ["text", "json"], default: "text" },
   },
   required: ["expectedRevision", "message"],
   additionalProperties: false,
@@ -722,6 +863,7 @@ export const mqttTopicParser = z
     topic: z.string().min(1).max(512),
     message: z.string().max(65536).optional(),
     qos: z.union([z.literal(0), z.literal(1), z.literal(2)]).default(0),
+    format: z.enum(["text", "json"]).default("text"),
   })
   .strict()
 
@@ -732,6 +874,7 @@ export const mqttTopicInputSchema = {
     topic: { type: "string", minLength: 1, maxLength: 512 },
     message: { type: "string", maxLength: 65536 },
     qos: { type: "integer", enum: [0, 1, 2], default: 0 },
+    format: { type: "string", enum: ["text", "json"], default: "text" },
   },
   required: ["expectedRevision", "topic"],
   additionalProperties: false,

@@ -132,12 +132,20 @@ const projectBody = async (
   redactor: SecretRedactor
 ) => {
   const body = request.body
-  if (body.contentType === null) return { contentType: null, length: 0 }
+  if (body.contentType === null)
+    return {
+      contentType: null,
+      length: 0,
+      representation: "empty",
+      diagnostics: [],
+    }
   if (body.contentType === "application/octet-stream") {
     const file = body.body
     return {
       contentType: body.contentType,
       kind: "binary",
+      representation: "binary",
+      diagnostics: [],
       name: file?.name ? redactor.scrub(file.name, 64) : undefined,
       size: file?.size ?? 0,
       digest: file
@@ -149,6 +157,8 @@ const projectBody = async (
     return {
       contentType: body.contentType,
       kind: "multipart",
+      representation: "multipart",
+      diagnostics: [],
       parts: await Promise.all(
         body.body.slice(0, SUMMARY_LIST_ITEMS).map(async (part, index) => {
           if (!part.isFile) {
@@ -186,12 +196,51 @@ const projectBody = async (
   }
 
   const bytes = encode(body.body)
+  const parseDiagnostic = (() => {
+    if (/json/i.test(body.contentType)) {
+      try {
+        JSON.parse(body.body)
+      } catch (error) {
+        return {
+          code: "MALFORMED_JSON",
+          severity: "warning" as const,
+          phase: "payload" as const,
+          message: redactor.scrub(
+            error instanceof Error ? error.message : "JSON cannot be parsed.",
+            128
+          ),
+          location: "request.body",
+          untrustedContent: true,
+        }
+      }
+    }
+    if (
+      body.contentType === "application/x-www-form-urlencoded" &&
+      /%(?![0-9a-f]{2})/i.test(body.body)
+    ) {
+      return {
+        code: "MALFORMED_URLENCODED",
+        severity: "warning" as const,
+        phase: "payload" as const,
+        message: "The URL-encoded body contains an invalid percent escape.",
+        location: "request.body",
+        untrustedContent: true,
+      }
+    }
+    return undefined
+  })()
   return {
     contentType: body.contentType,
     kind: "text",
     length: body.body.length,
     truncated: body.body.length > 0,
     digest: await digest(bytes),
+    representation: /json/i.test(body.contentType)
+      ? "json"
+      : body.contentType === "application/x-www-form-urlencoded"
+        ? "urlencoded"
+        : "raw-text",
+    diagnostics: parseDiagnostic ? [parseDiagnostic] : [],
   }
 }
 
@@ -414,8 +463,15 @@ const diagnostics = (
     .map(({ code, severity, location, message }) => ({
       code,
       severity,
+      phase:
+        location === "response"
+          ? "execution"
+          : location === "request"
+            ? "payload"
+            : "configuration",
       location,
       message: message.slice(0, SUMMARY_DIAGNOSTIC_CHARS),
+      untrustedContent: true,
     }))
 }
 
@@ -466,6 +522,7 @@ export const projectRESTExchange = async (
       scripts: {
         preRequestLength: request.preRequestScript.length,
         postRequestLength: request.testScript.length,
+        executionMode: "javascript",
       },
       body: await projectBody(request, redactor),
     },

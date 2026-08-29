@@ -77,7 +77,18 @@ import {
   realtimeLogParser,
   realtimeMessageInputSchema,
   realtimeMessageParser,
+  editRESTBodyInputSchema,
+  editRESTBodyParser,
+  readRESTScriptInputSchema,
+  readRESTScriptParser,
+  editGraphQLVariablesInputSchema,
+  editGraphQLVariablesParser,
 } from "./schemas"
+import {
+  applyJSONPointerOperations,
+  diagnosticForError,
+  diagnosticForFailure,
+} from "./diagnostics"
 import {
   RESTRequestPatch,
   WEBMCP_PROTOCOL_VERSION,
@@ -259,6 +270,7 @@ export class WebMCPService extends Service {
         code,
         message: this.redactor().scrub(message, 512),
         retryable,
+        diagnostics: [diagnosticForFailure(code, message, this.redactor())],
       },
     }
   }
@@ -472,6 +484,52 @@ export class WebMCPService extends Service {
       ),
       this.adapter.register(
         {
+          name: "inspect_rest_scripting",
+          title: "Inspect REST scripting",
+          description:
+            "Inspect visible request and inherited JavaScript script-chain metadata and static diagnostics without disclosing source text.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.validBoundary(input) && Object.keys(input).length === 0
+              ? this.inspectRESTScripting()
+              : this.failure(
+                  "INVALID_INPUT",
+                  "This tool accepts an empty object only."
+                ),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "read_rest_script",
+          title: "Read approved REST script window",
+          description:
+            "Disclose one bounded, revision-bound redacted script window after explicit per-read approval. Approval is never reusable.",
+          inputSchema: readRESTScriptInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (
+            input: Record<string, unknown>,
+            { signal: actionSignal }: { signal: AbortSignal }
+          ) => this.readRESTScript(input, actionSignal),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_rest_body",
+          title: "Edit structured REST body",
+          description:
+            "Apply revision-bound JSON, URL-encoded, or multipart text-part body edits. File and binary content remain opaque and read-only.",
+          inputSchema: editRESTBodyInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input: Record<string, unknown>) =>
+            this.editRESTBody(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
           name: "read_rest_payload",
           title: "Read REST payload window",
           description:
@@ -587,6 +645,33 @@ export class WebMCPService extends Service {
       response && response !== "reset" && response.type === "response"
         ? redactor.scrub(response.data, 256)
         : undefined
+    const variablesDiagnostics = [] as Array<Record<string, unknown>>
+    try {
+      if (document.request.variables.trim())
+        JSON.parse(document.request.variables)
+    } catch (error) {
+      variablesDiagnostics.push({
+        ...diagnosticForError(error, redactor, {
+          code: "MALFORMED_GRAPHQL_VARIABLES",
+          phase: "payload",
+          location: "variables",
+        }),
+        severity: "warning",
+      })
+    }
+    const queryDiagnostics =
+      document.request.query.trim() && !/[{}]/.test(document.request.query)
+        ? [
+            {
+              code: "MALFORMED_GRAPHQL_QUERY",
+              severity: "warning",
+              phase: "validation",
+              message: "The GraphQL document appears incomplete.",
+              location: "query",
+              untrustedContent: true,
+            },
+          ]
+        : []
     return {
       draft: {
         dirty: document.isDirty,
@@ -600,6 +685,10 @@ export class WebMCPService extends Service {
         auth: {
           type: document.request.auth?.authType ?? "none",
           active: document.request.auth?.authActive ?? false,
+        },
+        diagnostics: {
+          query: queryDiagnostics,
+          variables: variablesDiagnostics,
         },
       },
       connection: {
@@ -687,6 +776,18 @@ export class WebMCPService extends Service {
           inputSchema: editGraphQLOperationInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => this.editGraphQLOperation(input),
+        },
+        signal
+      ),
+      this.adapter.register(
+        {
+          name: "edit_graphql_variables",
+          title: "Edit structured GraphQL variables",
+          description:
+            "Apply revision-bound whole-document or JSON Pointer edits to GraphQL variables without changing the legacy raw editor.",
+          inputSchema: editGraphQLVariablesInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => this.editGraphQLVariables(input),
         },
         signal
       ),
@@ -913,6 +1014,84 @@ export class WebMCPService extends Service {
       : observation
   }
 
+  private async editGraphQLVariables(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = editGraphQLVariablesParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const gql = this.visibleGQL()
+    if ("ok" in gql) return gql
+    if (!this.context.matches("graphql-document", parsed.data.expectedRevision))
+      return this.failure(
+        "STATE_CHANGED",
+        "The GraphQL draft changed; inspect it again.",
+        "graphql-document",
+        true
+      )
+    try {
+      const original = cloneDeep(gql.tab.document.request)
+      const originalDirty = gql.tab.document.isDirty
+      const document =
+        parsed.data.operation.kind === "replace_document"
+          ? parsed.data.operation.document
+          : applyJSONPointerOperations(
+              JSON.parse(original.variables || "{}"),
+              parsed.data.operation.operations
+            )
+      const candidate = {
+        ...original,
+        variables: JSON.stringify(document, null, 2),
+      }
+      const validated = HoppGQLRequest.safeParse(candidate)
+      if (validated.type !== "ok")
+        return this.failure(
+          "INVALID_INPUT",
+          "The variables edit does not produce a valid GraphQL request.",
+          "graphql-document"
+        )
+      gql.tab.document.request = validated.value
+      gql.tab.document.isDirty = true
+      const revision = this.context.revision("graphql-document")
+      const token = gql.token
+      this.activity.record(
+        {
+          tool: "edit_graphql_variables",
+          outcome: "changed",
+          summary: "Edited structured GraphQL variables",
+          revision,
+        },
+        () => {
+          const current = this.context.captureVisibleGQL()
+          if (
+            !current ||
+            current.token !== token ||
+            !this.context.matches("graphql-document", revision)
+          )
+            return false
+          current.tab.document.request = original
+          current.tab.document.isDirty = originalDirty
+          return true
+        }
+      )
+      const observation = this.gqlObservation()
+      return observation.ok
+        ? { ...observation, changedFields: ["variables"] }
+        : observation
+    } catch (error) {
+      return this.failure(
+        "INVALID_INPUT",
+        error instanceof Error
+          ? error.message
+          : "Invalid GraphQL variables edit.",
+        "graphql-document"
+      )
+    }
+  }
+
   private async configureGraphQLAuth(input: Record<string, unknown>) {
     if (!this.validBoundary(input)) {
       return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
@@ -1064,12 +1243,28 @@ export class WebMCPService extends Service {
     if (visible !== true) return visible
     const snapshot = await this.realtime.snapshot(mode)
     const redactor = this.redactor()
+    const configurationDiagnostics: Array<Record<string, unknown>> = []
+    try {
+      new URL(snapshot.endpoint)
+    } catch {
+      if (snapshot.endpoint.trim()) {
+        configurationDiagnostics.push({
+          code: "INVALID_REALTIME_ENDPOINT",
+          severity: "warning",
+          phase: "configuration",
+          message: "The realtime endpoint is not a complete URL.",
+          location: "endpoint",
+          untrustedContent: true,
+        })
+      }
+    }
     return this.result("realtime-session", {
       session: {
         mode,
         endpoint: redactor.scrub(snapshot.endpoint, 128),
         state: snapshot.state,
         configuration: snapshot.configuration,
+        diagnostics: configurationDiagnostics,
         log: {
           total: snapshot.log.length,
           tail: snapshot.log.slice(-3).map((line) => ({
@@ -1369,6 +1564,23 @@ export class WebMCPService extends Service {
       }
     }
     try {
+      const format = "format" in parsed.data ? parsed.data.format : "text"
+      const message = "message" in parsed.data ? parsed.data.message : undefined
+      const actionDiagnostics: Array<Record<string, unknown>> = []
+      if (format === "json" && typeof message === "string") {
+        try {
+          JSON.parse(message)
+        } catch (error) {
+          actionDiagnostics.push({
+            ...diagnosticForError(error, this.redactor(), {
+              code: "MALFORMED_JSON_MESSAGE",
+              phase: "payload",
+              location: "message",
+            }),
+            severity: "warning",
+          })
+        }
+      }
       if (action === "connect") {
         await this.realtime.connect(mode, signal)
       } else if (action === "disconnect") await this.realtime.disconnect(mode)
@@ -1393,7 +1605,10 @@ export class WebMCPService extends Service {
         summary: `${action} ${mode}`.slice(0, 256),
         revision: this.context.revision("realtime-session"),
       })
-      return this.realtimeObservation(mode)
+      const observation = await this.realtimeObservation(mode)
+      return observation.ok
+        ? { ...observation, actionDiagnostics }
+        : observation
     } catch (error) {
       return this.failure(
         "EXECUTION_FAILED",
@@ -1696,10 +1911,303 @@ export class WebMCPService extends Service {
     }
   }
 
+  private scriptSources(rest: VisibleRESTContext) {
+    const own = [
+      {
+        handle: "request:pre",
+        origin: "request",
+        phase: "pre_request",
+        source: rest.tab.document.request.preRequestScript,
+      },
+      {
+        handle: "request:post",
+        origin: "request",
+        phase: "post_request",
+        source: rest.tab.document.request.testScript,
+      },
+    ]
+    const inherited = (
+      rest.tab.document.inheritedProperties?.scripts ?? []
+    ).flatMap((script, index) => [
+      {
+        handle: `inherited:${index}:pre`,
+        origin: "inherited",
+        phase: "pre_request",
+        source: script.preRequestScript ?? "",
+      },
+      {
+        handle: `inherited:${index}:post`,
+        origin: "inherited",
+        phase: "post_request",
+        source: script.testScript ?? "",
+      },
+    ])
+    return [...inherited, ...own]
+  }
+
+  private scriptDiagnostics(source: string, sourceHandle: string) {
+    const result: Array<Record<string, unknown>> = []
+    const typeScript =
+      /(^|[;\n]\s*)(interface|type|enum)\s+|\sas\s+[A-Z_$]|:\s*(string|number|boolean|unknown|any)\b/.exec(
+        source
+      )
+    if (typeScript)
+      result.push({
+        code: "TYPESCRIPT_UNSUPPORTED",
+        severity: "error",
+        phase: "script",
+        message:
+          "TypeScript syntax is not supported; scripts execute as JavaScript.",
+        range: {
+          start: typeScript.index,
+          end: typeScript.index + typeScript[0].length,
+        },
+        sourceHandle,
+        untrustedContent: true,
+      })
+    const imported = /\b(import|export)\b/.exec(source)
+    if (imported)
+      result.push({
+        code: "MODULE_SYNTAX_UNSUPPORTED",
+        severity: "error",
+        phase: "script",
+        message:
+          "ES module imports and exports are not supported by the request sandbox.",
+        range: {
+          start: imported.index,
+          end: imported.index + imported[0].length,
+        },
+        sourceHandle,
+        untrustedContent: true,
+      })
+    const reserved =
+      /\b(?:const|let|var|function|class)\s+(hopp|pw|request|response)\b/.exec(
+        source
+      )
+    if (reserved)
+      result.push({
+        code: "RESERVED_BINDING",
+        severity: "error",
+        phase: "script",
+        message: "This binding is reserved by the request scripting sandbox.",
+        range: {
+          start: reserved.index,
+          end: reserved.index + reserved[0].length,
+        },
+        sourceHandle,
+        untrustedContent: true,
+      })
+    if (!typeScript && !imported) {
+      try {
+        new Function(source)
+      } catch (error) {
+        result.push({
+          ...diagnosticForError(error, this.redactor(), {
+            code: "JAVASCRIPT_SYNTAX",
+            phase: "script",
+            sourceHandle,
+          }),
+          range: undefined,
+        })
+      }
+    }
+    return result
+  }
+
+  private async inspectRESTScripting() {
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    const sources = this.scriptSources(rest)
+    return this.result("rest-document", {
+      executionMode: "javascript",
+      scripts: sources.map(({ handle, origin, phase, source }) => ({
+        sourceHandle: handle,
+        origin,
+        phase,
+        length: source.length,
+        // Handle rather than source text keeps script disclosure approval-gated.
+        digest: `${source.length}:${[...source].reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) >>> 0, 0).toString(16)}`,
+        diagnostics: this.scriptDiagnostics(source, handle),
+      })),
+    })
+  }
+
+  private async readRESTScript(
+    input: Record<string, unknown>,
+    signal: AbortSignal
+  ) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = readRESTScriptParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (!this.context.matches("rest-document", parsed.data.expectedRevision))
+      return this.failure(
+        "STATE_CHANGED",
+        "The REST draft changed; inspect it again.",
+        "rest-document",
+        true
+      )
+    const source = this.scriptSources(rest).find(
+      ({ handle }) => handle === parsed.data.sourceHandle
+    )
+    if (!source)
+      return this.failure(
+        "INVALID_INPUT",
+        "The script source handle is no longer available.",
+        "rest-document"
+      )
+    // The nonce deliberately makes a session decision unusable for later disclosures.
+    const approved = await this.approval.request(
+      {
+        action: "Allow script source read",
+        method: "READ",
+        target: source.handle,
+        environment: this.context.capture().environment.name,
+        workspace: this.context.capture().workspace.type,
+        grantKey: `script-read:${crypto.randomUUID()}`,
+      },
+      signal
+    )
+    if (!approved) {
+      this.activity.record({
+        tool: "read_rest_script",
+        outcome: signal.aborted ? "cancelled" : "denied",
+        summary: `Script disclosure ${source.handle}`,
+        revision: this.context.revision("rest-document"),
+      })
+      return this.failure(
+        signal.aborted ? "CANCELLED" : "APPROVAL_DENIED",
+        signal.aborted
+          ? "The script disclosure was cancelled."
+          : "The user denied script disclosure.",
+        "rest-document"
+      )
+    }
+    if (!this.context.matches("rest-document", parsed.data.expectedRevision))
+      return this.failure(
+        "STATE_CHANGED",
+        "The REST draft changed while approval was open.",
+        "rest-document",
+        true
+      )
+    const text = this.redactor().scrub(
+      source.source,
+      parsed.data.offset + parsed.data.maxChars
+    )
+    this.activity.record({
+      tool: "read_rest_script",
+      outcome: "executed",
+      summary: `Disclosed script window ${source.handle}`,
+      revision: this.context.revision("rest-document"),
+    })
+    return this.result("rest-document", {
+      sourceHandle: source.handle,
+      offset: parsed.data.offset,
+      text: text.slice(
+        parsed.data.offset,
+        parsed.data.offset + parsed.data.maxChars
+      ),
+      totalChars: text.length,
+      truncated: parsed.data.offset + parsed.data.maxChars < text.length,
+    })
+  }
+
+  private async editRESTBody(input: Record<string, unknown>) {
+    if (!this.validBoundary(input))
+      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    const parsed = editRESTBodyParser.safeParse(input)
+    if (!parsed.success)
+      return this.failure(
+        "INVALID_INPUT",
+        parsed.error.issues[0]?.message ?? "Invalid input"
+      )
+    const rest = this.visibleREST()
+    if ("ok" in rest) return rest
+    if (!this.context.matches("rest-document", parsed.data.expectedRevision))
+      return this.failure(
+        "STATE_CHANGED",
+        "The REST draft changed; inspect it again.",
+        "rest-document",
+        true
+      )
+    try {
+      const body = cloneDeep(rest.tab.document.request.body)
+      const operation = parsed.data.operation
+      if (body.contentType === "application/octet-stream")
+        throw new Error("Binary request bodies are read-only.")
+      if (operation.kind === "set_urlencoded_entries") {
+        if (body.contentType !== "application/x-www-form-urlencoded")
+          throw new Error("This operation requires a URL-encoded body.")
+        body.body = operation.entries
+          .filter(({ active }) => active)
+          .map(
+            ({ key, value }) =>
+              `${encodeURIComponent(key)}=${encodeURIComponent(value)}`
+          )
+          .join("&")
+      } else if (operation.kind === "set_multipart_text_entries") {
+        if (body.contentType !== "multipart/form-data")
+          throw new Error("This operation requires a multipart body.")
+        const files = body.body.filter((part) => part.isFile)
+        body.body = [
+          ...operation.entries.map(({ key, value, active }) => ({
+            key,
+            value,
+            active,
+            isFile: false as const,
+          })),
+          ...files,
+        ]
+      } else {
+        if (!/json/i.test(body.contentType ?? ""))
+          throw new Error("Structured JSON edits require a JSON request body.")
+        const document =
+          operation.kind === "replace_document"
+            ? operation.document
+            : applyJSONPointerOperations(
+                JSON.parse(String(body.body)),
+                operation.operations
+              )
+        body.body = JSON.stringify(document, null, 2)
+      }
+      const validated = HoppRESTRequest.safeParse({
+        ...cloneDeep(rest.tab.document.request),
+        body,
+      })
+      if (validated.type !== "ok")
+        throw new Error("The body edit does not produce a valid REST request.")
+      return this.commitRESTDraft(
+        rest,
+        validated.value,
+        "edit_rest_body",
+        "Edited structured REST body",
+        ["body"]
+      )
+    } catch (error) {
+      return this.failure(
+        "INVALID_INPUT",
+        error instanceof Error
+          ? error.message
+          : "Invalid structured body edit.",
+        "rest-document"
+      )
+    }
+  }
+
   private async commitRESTDraft(
     rest: VisibleRESTContext,
     request: HoppRESTRequest,
-    tool: "configure_rest_auth" | "edit_rest_variables" | "edit_rest_scripts",
+    tool:
+      | "configure_rest_auth"
+      | "edit_rest_variables"
+      | "edit_rest_scripts"
+      | "edit_rest_body",
     summary: string,
     changedFields: string[]
   ) {

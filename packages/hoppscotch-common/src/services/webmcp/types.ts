@@ -23,6 +23,18 @@ export type WebMCPErrorCode =
   | "SCRIPT_FAILED"
   | "EXECUTION_FAILED"
 
+/** A bounded, redacted diagnostic. Locations are source-relative when present. */
+export type WebMCPDiagnostic = {
+  code: string
+  severity: "info" | "warning" | "error"
+  phase: "validation" | "configuration" | "execution" | "script" | "payload"
+  message: string
+  location?: string
+  range?: { start: number; end: number }
+  sourceHandle?: string
+  untrustedContent?: boolean
+}
+
 export type ActiveAppContextDTO = {
   surface: "rest" | "graphql" | "realtime" | "other"
   mode: string
@@ -62,6 +74,7 @@ export type WebMCPToolFailure = ResultBase & {
     code: WebMCPErrorCode
     message: string
     retryable: boolean
+    diagnostics?: WebMCPDiagnostic[]
   }
 }
 
