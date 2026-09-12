@@ -53,6 +53,7 @@ import {
   RealtimeSessionService,
 } from "~/services/realtime-session.service"
 import {
+  getCurrentEnvironment,
   getSelectedEnvironmentIndex,
   setSelectedEnvironmentIndex,
   deleteEnvironment,
@@ -4841,13 +4842,18 @@ export class WebMCPService extends Service {
     const safeMethod = redactor.scrub(rest.tab.document.request.method, 32)
     const environment = this.context.capture().environment.name
     const workspace = this.context.capture().workspace.type
-    const grantKey = [
+    // Authorization identity must not use the redacted display target. Bind
+    // grants to the inspected draft and stable context, including method/query.
+    const grantKey = JSON.stringify([
       "execute",
       "rest",
-      endpoint.includes("<<") ? parsed.data.expectedRevision : target,
-      environment,
-      workspace,
-    ].join("|")
+      parsed.data.expectedRevision,
+      rest.tab.document.request.method,
+      endpoint,
+      getCurrentEnvironment().id,
+      getSelectedEnvironmentIndex(),
+      this.workspace.currentWorkspace.value,
+    ])
     const approved = await this.approval.request(
       {
         action: "Execute REST request",
