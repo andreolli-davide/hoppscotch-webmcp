@@ -12,10 +12,31 @@ export type WebMCPToolDefinition = {
   ) => unknown | Promise<unknown>
 }
 
+type BrowserWebMCPToolDefinition = Omit<WebMCPToolDefinition, "execute"> & {
+  execute: (
+    input: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ) => unknown | Promise<unknown>
+}
+
+const composeExecutionSignal = (
+  packSignal: AbortSignal,
+  callerSignal?: AbortSignal
+): AbortSignal => {
+  // Keep the pack signal itself for the usual browser invocation path. This
+  // allows handlers that return a live background subscription to continue
+  // observing pack disposal after execute has settled.
+  if (!callerSignal || callerSignal === packSignal) {
+    return packSignal
+  }
+
+  return AbortSignal.any([packSignal, callerSignal])
+}
+
 type ModelContextDocument = Document & {
   modelContext?: {
     registerTool: (
-      tool: WebMCPToolDefinition,
+      tool: BrowserWebMCPToolDefinition,
       options?: { signal?: AbortSignal }
     ) => Promise<void>
   }
@@ -128,8 +149,22 @@ export class WebMCPAdapter {
   public async register(tool: WebMCPToolDefinition, signal: AbortSignal) {
     if (!this.isAvailable()) return false
     try {
+      const registeredTool: BrowserWebMCPToolDefinition = {
+        ...tool,
+        execute: async (input, options) => {
+          const executionSignal = composeExecutionSignal(
+            signal,
+            options?.signal
+          )
+          if (executionSignal.aborted) {
+            throw executionSignal.reason
+          }
+          return await tool.execute(input, { signal: executionSignal })
+        },
+      }
+
       await (document as ModelContextDocument).modelContext!.registerTool(
-        tool,
+        registeredTool,
         {
           signal,
         }

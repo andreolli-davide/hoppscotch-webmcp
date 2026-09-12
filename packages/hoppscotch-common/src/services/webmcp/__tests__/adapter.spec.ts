@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { WebMCPAdapter } from "../adapter"
+import { WebMCPAdapter, type WebMCPToolDefinition } from "../adapter"
 
 const setModelContext = (value: unknown) =>
   Object.defineProperty(document, "modelContext", {
@@ -92,9 +92,158 @@ describe("WebMCPAdapter", () => {
     }
 
     await expect(adapter.register(tool, controller.signal)).resolves.toBe(true)
-    expect(registerTool).toHaveBeenCalledWith(tool, {
-      signal: controller.signal,
+    expect(registerTool).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: tool.name,
+        description: tool.description,
+        execute: expect.any(Function),
+      }),
+      { signal: controller.signal }
+    )
+    expect(registerTool.mock.calls[0][0]).not.toBe(tool)
+    expect(adapter.diagnostic.value).toBe("ready")
+  })
+
+  it("normalizes omitted and empty execution options", async () => {
+    const registerTool = vi.fn().mockResolvedValue(undefined)
+    const execute = vi.fn().mockResolvedValue("ok")
+    setModelContext({ registerTool })
+    const adapter = new WebMCPAdapter(true)
+    const packController = new AbortController()
+    const tool = {
+      name: "inspect_app_context",
+      description: "Inspect context",
+      execute,
+    }
+
+    await adapter.register(tool, packController.signal)
+    const registeredTool = registerTool.mock.calls[0][0]
+
+    await expect(registeredTool.execute({})).resolves.toBe("ok")
+    await expect(registeredTool.execute({}, {})).resolves.toBe("ok")
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(execute.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal)
+    expect(execute.mock.calls[1][1].signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it("does not invoke an already aborted pack or caller", async () => {
+    const registerTool = vi.fn().mockResolvedValue(undefined)
+    const execute = vi.fn()
+    setModelContext({ registerTool })
+    const adapter = new WebMCPAdapter(true)
+    const packController = new AbortController()
+    packController.abort("pack stopped")
+    const tool = {
+      name: "inspect_app_context",
+      description: "Inspect context",
+      execute,
+    }
+
+    await adapter.register(tool, packController.signal)
+    const registeredTool = registerTool.mock.calls[0][0]
+    await expect(registeredTool.execute({})).rejects.toBe("pack stopped")
+    expect(execute).not.toHaveBeenCalled()
+
+    const activePackController = new AbortController()
+    const callerController = new AbortController()
+    await adapter.register(tool, activePackController.signal)
+    const secondRegisteredTool = registerTool.mock.calls[1][0]
+    callerController.abort("caller stopped")
+    await expect(
+      secondRegisteredTool.execute({}, { signal: callerController.signal })
+    ).rejects.toBe("caller stopped")
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it("composes caller and pack cancellation for in-flight work", async () => {
+    const registerTool = vi.fn().mockResolvedValue(undefined)
+    let receivedSignal: AbortSignal | undefined
+    let resolveExecution: (() => void) | undefined
+    const execute = vi.fn((_input, options: { signal: AbortSignal }) => {
+      receivedSignal = options.signal
+      return new Promise<void>((resolve) => {
+        resolveExecution = resolve
+      })
     })
+    setModelContext({ registerTool })
+    const adapter = new WebMCPAdapter(true)
+    const packController = new AbortController()
+    const callerController = new AbortController()
+    const tool = {
+      name: "inspect_app_context",
+      description: "Inspect context",
+      execute,
+    }
+
+    await adapter.register(tool, packController.signal)
+    const registeredTool = registerTool.mock.calls[0][0]
+    const execution = registeredTool.execute(
+      {},
+      { signal: callerController.signal }
+    )
+    expect(receivedSignal?.aborted).toBe(false)
+    callerController.abort("caller stopped")
+    expect(receivedSignal?.aborted).toBe(true)
+    expect(receivedSignal?.reason).toBe("caller stopped")
+    packController.abort("pack stopped")
+    resolveExecution!()
+    await expect(execution).resolves.toBeUndefined()
+  })
+
+  it.each(["caller", "pack"] as const)(
+    "keeps the composed signal observable after settlement when %s aborts",
+    async (source) => {
+      const registerTool = vi.fn().mockResolvedValue(undefined)
+      let receivedSignal: AbortSignal | undefined
+      const execute = vi.fn((_input, options: { signal: AbortSignal }) => {
+        receivedSignal = options.signal
+        return "ok"
+      })
+      setModelContext({ registerTool })
+      const adapter = new WebMCPAdapter(true)
+      const packController = new AbortController()
+      const callerController = new AbortController()
+      await adapter.register(
+        {
+          name: "inspect_app_context",
+          description: "Inspect context",
+          execute,
+        },
+        packController.signal
+      )
+      const registeredTool = registerTool.mock.calls[0][0]
+      await expect(
+        registeredTool.execute({}, { signal: callerController.signal })
+      ).resolves.toBe("ok")
+      expect(receivedSignal?.aborted).toBe(false)
+      const controller = source === "caller" ? callerController : packController
+      controller.abort(`${source} stopped`)
+      expect(receivedSignal?.aborted).toBe(true)
+      expect(receivedSignal?.reason).toBe(`${source} stopped`)
+    }
+  )
+
+  it("propagates synchronous throws and async rejections without registration failure", async () => {
+    const registerTool = vi.fn().mockResolvedValue(undefined)
+    const syncError = new Error("sync failure")
+    const asyncError = new Error("async failure")
+    const execute = vi
+      .fn((_input, _options: { signal: AbortSignal }) => {
+        throw syncError
+      })
+      .mockRejectedValueOnce(asyncError)
+    setModelContext({ registerTool })
+    const adapter = new WebMCPAdapter(true)
+    const controller = new AbortController()
+    const tool: WebMCPToolDefinition = {
+      name: "inspect_app_context",
+      description: "Inspect context",
+      execute,
+    }
+    await expect(adapter.register(tool, controller.signal)).resolves.toBe(true)
+    const registeredTool = registerTool.mock.calls[0][0]
+    await expect(registeredTool.execute({})).rejects.toBe(asyncError)
+    await expect(registeredTool.execute({})).rejects.toBe(syncError)
     expect(adapter.diagnostic.value).toBe("ready")
   })
 
