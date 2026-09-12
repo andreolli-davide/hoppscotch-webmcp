@@ -647,19 +647,27 @@ export const readRESTPayload = async (
     const maskedBytes = encode(
       redactor.mask(new TextDecoder().decode(bytes), true)
     )
-    const responseWindow = maskedBytes.slice(offset, offset + maxChars * 4)
-    const responseText = new TextDecoder().decode(responseWindow)
+    // Accept byte offsets, but never start inside a UTF-8 code point.
+    let start = Math.min(offset, maskedBytes.length)
+    while (start < maskedBytes.length && (maskedBytes[start] & 0xc0) === 0x80)
+      start++
+    const decoded = new TextDecoder().decode(
+      maskedBytes.subarray(start, start + maxChars * 4),
+      { stream: true }
+    )
+    const text = Array.from(decoded).slice(0, maxChars).join("")
+    const windowByteLength = encode(text).byteLength
     return {
       source,
       mimeType: redactor.scrub(mimeType as string, SUMMARY_MIME_CHARS),
       kind: "text",
-      offset,
+      offset: start,
       offsetUnit: "byte",
-      text: redactor.scrub(responseText, maxChars),
-      windowByteLength: responseWindow.byteLength,
-      nextOffset: offset + responseWindow.byteLength,
+      text,
+      windowByteLength,
+      nextOffset: start + windowByteLength,
       byteLength,
-      truncated: offset + responseWindow.byteLength < byteLength,
+      truncated: start + windowByteLength < maskedBytes.length,
       digest: await digest(bytes),
     }
   }
