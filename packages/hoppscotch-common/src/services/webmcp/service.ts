@@ -677,6 +677,7 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
+            const approvalRevision = this.context.revision("app-context")
             const approved = await this.approval.request(
               {
                 action: "DELETE collection",
@@ -684,7 +685,8 @@ export class WebMCPService extends Service {
                 target: collection.name,
                 environment: envName,
                 workspace: workspaceType,
-                grantKey: `delete-collection|${collection.name}|${envName}|${workspaceType}`,
+                grantKey: `delete_collection:${crypto.randomUUID()}`,
+                allowSession: false,
               },
               executionSignal
             )
@@ -700,6 +702,26 @@ export class WebMCPService extends Service {
                 "APPROVAL_DENIED",
                 "The user rejected deleting the collection.",
                 "app-context"
+              )
+            }
+
+            if (executionSignal.aborted) {
+              return this.failure(
+                "CANCELLED",
+                "The deletion was cancelled.",
+                "app-context"
+              )
+            }
+            if (
+              !this.context.matches("app-context", approvalRevision) ||
+              restCollectionStore.value.state[pathIndex] !== collection ||
+              collection.name !== parsed.data.confirmationName
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The collection or application context changed while approval was open.",
+                "app-context",
+                true
               )
             }
 
@@ -799,6 +821,7 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
+            const approvalRevision = this.context.revision("app-context")
             const approved = await this.approval.request(
               {
                 action: "DELETE folder",
@@ -806,7 +829,8 @@ export class WebMCPService extends Service {
                 target: target.name,
                 environment: envName,
                 workspace: workspaceType,
-                grantKey: `delete-folder|${target.name}|${envName}|${workspaceType}`,
+                grantKey: `delete_folder:${crypto.randomUUID()}`,
+                allowSession: false,
               },
               executionSignal
             )
@@ -822,6 +846,29 @@ export class WebMCPService extends Service {
                 "APPROVAL_DENIED",
                 "The user rejected deleting the folder.",
                 "app-context"
+              )
+            }
+
+            if (executionSignal.aborted) {
+              return this.failure(
+                "CANCELLED",
+                "The deletion was cancelled.",
+                "app-context"
+              )
+            }
+            if (
+              !this.context.matches("app-context", approvalRevision) ||
+              navigateToFolderWithIndexPath(
+                restCollectionStore.value.state,
+                pathSegments
+              ) !== target ||
+              target.name !== parsed.data.confirmationName
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The folder or application context changed while approval was open.",
+                "app-context",
+                true
               )
             }
 
@@ -1145,6 +1192,7 @@ export class WebMCPService extends Service {
             const currentEnvName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
+            const approvalRevision = this.context.revision("app-context")
             const approved = await this.approval.request(
               {
                 action: "DELETE environment",
@@ -1152,7 +1200,8 @@ export class WebMCPService extends Service {
                 target: targetEnv.name,
                 environment: currentEnvName,
                 workspace: workspaceType,
-                grantKey: `delete-environment|${targetEnv.name}|${currentEnvName}|${workspaceType}`,
+                grantKey: `delete_environment:${crypto.randomUUID()}`,
+                allowSession: false,
               },
               executionSignal
             )
@@ -1168,6 +1217,28 @@ export class WebMCPService extends Service {
                 "APPROVAL_DENIED",
                 "The user rejected deleting the environment.",
                 "app-context"
+              )
+            }
+
+            if (executionSignal.aborted) {
+              return this.failure(
+                "CANCELLED",
+                "The deletion was cancelled.",
+                "app-context"
+              )
+            }
+            if (
+              !this.context.matches("app-context", approvalRevision) ||
+              environmentsStore.value.environments[
+                parsed.data.environmentIndex
+              ] !== targetEnv ||
+              targetEnv.name !== parsed.data.confirmationName
+            ) {
+              return this.failure(
+                "STATE_CHANGED",
+                "The environment or application context changed while approval was open.",
+                "app-context",
+                true
               )
             }
 
