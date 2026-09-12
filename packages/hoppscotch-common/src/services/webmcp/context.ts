@@ -62,6 +62,11 @@ export class ActiveAppContextService extends Service {
   private readonly watchStops: Array<() => void> = []
 
   override onServiceInit() {
+    this.start()
+  }
+
+  public start() {
+    if (this.watchStops.length || this.subscriptions.length) return
     this.watchStops.push(
       watch(
         () => [
@@ -189,6 +194,7 @@ export class ActiveAppContextService extends Service {
   }
 
   public attachRouter(router: Router) {
+    this.start()
     this.router.value = router
     this.stopRouteWatch?.()
     this.stopRouteWatch = watch(
