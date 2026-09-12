@@ -61,6 +61,18 @@ export class SecretRedactor {
     this.values = [...values].sort((a, b) => b.length - a.length)
   }
 
+  /** Mask complete secret spans before selecting windows, preserving source offsets. */
+  public mask(value: string, byteOffsets = false) {
+    let result = value
+    for (const secret of this.values) {
+      const length = byteOffsets
+        ? new TextEncoder().encode(secret).length
+        : secret.length
+      result = result.split(secret).join("*".repeat(length))
+    }
+    return result
+  }
+
   public scrub(value: string, maxChars = 8192) {
     let result = value
     for (const secret of this.values)
@@ -632,7 +644,10 @@ export const readRESTPayload = async (
         digest: await digest(bytes),
       }
     }
-    const responseWindow = bytes.slice(offset, offset + maxChars * 4)
+    const maskedBytes = encode(
+      redactor.mask(new TextDecoder().decode(bytes), true)
+    )
+    const responseWindow = maskedBytes.slice(offset, offset + maxChars * 4)
     const responseText = new TextDecoder().decode(responseWindow)
     return {
       source,
@@ -652,7 +667,7 @@ export const readRESTPayload = async (
   if (text === null)
     throw new Error("The current request has no readable payload")
   const bytes = encode(text)
-  const window = redactor.scrub(text.slice(offset, offset + maxChars), maxChars)
+  const window = redactor.mask(text).slice(offset, offset + maxChars)
   return {
     source,
     partIndex,
