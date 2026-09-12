@@ -3177,10 +3177,7 @@ export class WebMCPService extends Service {
           : response && response !== "reset" && response.type === "response"
             ? response.data
             : ""
-    const text = this.redactor().scrub(
-      value,
-      parsed.data.offset + parsed.data.maxChars
-    )
+    const text = this.redactor().scrub(value, Infinity)
     return this.result(scope, {
       payload: {
         source: parsed.data.source,
