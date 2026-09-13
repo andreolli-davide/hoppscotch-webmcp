@@ -62,6 +62,20 @@ describe("WebMCP human control", () => {
     await expect(second).resolves.toBe(false)
   })
 
+  it("prompts again when a session grant is followed by allowSession false", async () => {
+    const service = new TestContainer().bind(AgentActionApprovalService)
+    const first = service.request(approvalRequest, new AbortController().signal)
+    service.resolve("session")
+    await expect(first).resolves.toBe(true)
+    const sensitive = service.request(
+      { ...approvalRequest, allowSession: false },
+      new AbortController().signal
+    )
+    expect(service.pending.value).not.toBeNull()
+    service.resolve("deny")
+    await expect(sensitive).resolves.toBe(false)
+  })
+
   it("keeps bounded activity and makes undo one-shot", () => {
     const service = new TestContainer().bind(AgentActivityService)
     let value = "changed"

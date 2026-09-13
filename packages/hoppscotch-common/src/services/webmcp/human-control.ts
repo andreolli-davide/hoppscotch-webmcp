@@ -33,7 +33,8 @@ export class AgentActionApprovalService extends Service {
 
   public request(request: AgentApprovalRequest, signal: AbortSignal) {
     if (signal.aborted) return Promise.resolve(false)
-    if (this.grants.has(request.grantKey)) return Promise.resolve(true)
+    if (request.allowSession !== false && this.grants.has(request.grantKey))
+      return Promise.resolve(true)
 
     return new Promise<boolean>((resolve) => {
       // WebMCP executes one consequential operation at a time in the page.

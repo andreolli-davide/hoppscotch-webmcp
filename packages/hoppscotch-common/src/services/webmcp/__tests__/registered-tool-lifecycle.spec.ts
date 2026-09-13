@@ -9,6 +9,7 @@ import { getDefaultRESTRequest } from "~/helpers/rest/default"
 import { makeCollection } from "@hoppscotch/data"
 import { setRESTCollections, restCollectionStore } from "~/newstore/collections"
 import { GQLTabService } from "~/services/tab/graphql"
+import { RESTTabService } from "~/services/tab/rest"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { TestRunnerService } from "~/services/test-runner/test-runner.service"
 import { ActiveAppContextService } from "../context"
@@ -154,6 +155,40 @@ describe("registered WebMCP lifecycle guards", () => {
       const result = await pending
       expect(result.error.code).toBe("STATE_CHANGED")
       expect(executeConnected).not.toHaveBeenCalled()
+    } finally {
+      setupState.service.stop()
+      setupState.available.mockRestore()
+      setupState.register.mockRestore()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it("reports script metadata in redacted UTF-16 coordinates", async () => {
+    const setupState = await setup()
+    try {
+      const { context, approval, tools, container } = setupState
+      const tabs = container.bind(RESTTabService)
+      const secrets = container.bind(SecretEnvironmentService)
+      tabs.currentActiveTab.value!.document.request.preRequestScript =
+        "prefix secret suffix"
+      secrets.addSecretEnvironment("managed", [
+        { key: "TOKEN", value: "secret", varIndex: 0 },
+      ])
+      const pending = tools.get("read_rest_script").execute(
+        {
+          expectedRevision: context.revision("rest-document"),
+          sourceHandle: "request:pre",
+          offset: 0,
+          maxChars: 100,
+        },
+        { signal: new AbortController().signal }
+      )
+      approval.resolve("once")
+      const result = await pending
+      expect(result.ok).toBe(true)
+      expect(result.totalChars).toBe("prefix [REDACTED] suffix".length)
+      expect(result.truncated).toBe(false)
+      expect(result.text).toBe("prefix [REDACTED] suffix")
     } finally {
       setupState.service.stop()
       setupState.available.mockRestore()

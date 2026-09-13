@@ -5,6 +5,17 @@ import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { readRESTPayload, SecretRedactor } from "../projections"
 
 describe("WebMCP secret redaction", () => {
+  it("merges overlapping secret spans for scrub and mask", () => {
+    const service = new TestContainer().bind(SecretEnvironmentService)
+    service.addSecretEnvironment("env", [
+      { key: "A", value: "abcd", initialValue: "", varIndex: 0 },
+      { key: "B", value: "cdef", initialValue: "", varIndex: 1 },
+    ])
+    const redactor = new SecretRedactor(service)
+    expect(redactor.scrub("abcdef")).toBe("[REDACTED]")
+    expect(redactor.mask("abcdef")).toBe("******")
+  })
+
   it("scrubs managed current and initial secret values", () => {
     const service = new TestContainer().bind(SecretEnvironmentService)
     service.addSecretEnvironment("env", [

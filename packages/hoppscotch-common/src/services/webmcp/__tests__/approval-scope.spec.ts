@@ -27,6 +27,38 @@ import { WebMCPService } from "../service"
 import { WebMCPAdapter } from "../adapter"
 
 import { AgentActionApprovalService } from "../human-control"
+import { approvalIdentity } from "../approval-scope"
+
+it("binds approval identities to stable workspace, environment, and action details", () => {
+  const base = {
+    operation: "realtime",
+    workspaceID: { type: "team" as const, teamID: "team-a" },
+    environmentID: "env-a",
+    environmentScope: "MY_ENV",
+    revision: "rest-document:1",
+    target: "mqtt://example.test",
+    action: "publish",
+    details: { topic: "events", message: "hello", qos: 0 },
+  }
+  expect(approvalIdentity(base)).not.toBe(
+    approvalIdentity({
+      ...base,
+      workspaceID: { type: "team", teamID: "team-b" },
+    })
+  )
+  expect(approvalIdentity(base)).not.toBe(
+    approvalIdentity({ ...base, environmentID: "env-b" })
+  )
+  expect(approvalIdentity(base)).not.toBe(
+    approvalIdentity({ ...base, details: { ...base.details, qos: 1 } })
+  )
+  expect(approvalIdentity(base)).not.toBe(
+    approvalIdentity({
+      ...base,
+      details: { ...base.details, eventName: "changed" },
+    })
+  )
+})
 
 it("does not reuse REST session approval after method, query or draft changes", async () => {
   const available = vi

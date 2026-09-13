@@ -54,6 +54,7 @@ import {
 } from "~/services/realtime-session.service"
 import {
   getCurrentEnvironment,
+  getSelectedEnvironmentType,
   getSelectedEnvironmentIndex,
   setSelectedEnvironmentIndex,
   deleteEnvironment,
@@ -73,6 +74,8 @@ import {
   readRESTPayload,
   SecretRedactor,
 } from "./projections"
+import { readSafeTextWindow } from "./payload-windows"
+import { approvalIdentity } from "./approval-scope"
 import {
   configureGQLAuth,
   configureRESTAuth,
@@ -713,7 +716,14 @@ export class WebMCPService extends Service {
                 target: collection.name,
                 environment: envName,
                 workspace: workspaceType,
-                grantKey: `delete_collection:${crypto.randomUUID()}`,
+                grantKey: approvalIdentity({
+                  operation: "delete_collection",
+                  workspaceID: this.workspace.currentWorkspace.value,
+                  environmentScope: getSelectedEnvironmentType(),
+                  revision: this.context.revision("app-context"),
+                  target: collection.name,
+                  allowSession: false,
+                }),
                 allowSession: false,
               },
               signal: executionSignal,
@@ -866,7 +876,14 @@ export class WebMCPService extends Service {
                 target: target.name,
                 environment: envName,
                 workspace: workspaceType,
-                grantKey: `delete_folder:${crypto.randomUUID()}`,
+                grantKey: approvalIdentity({
+                  operation: "delete_folder",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.workspace.currentWorkspace.value,
+                  revision: this.context.revision("app-context"),
+                  target: parsed.data.folderPath,
+                  allowSession: false,
+                }),
                 allowSession: false,
               },
               signal: executionSignal,
@@ -984,7 +1001,14 @@ export class WebMCPService extends Service {
                 environment: envName,
                 workspace: workspaceType,
                 allowSession: true,
-                grantKey: `create-collection|${envName}|${workspaceType}`,
+                grantKey: approvalIdentity({
+                  operation: "create_collection",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.workspace.currentWorkspace.value,
+                  environmentID: getCurrentEnvironment().id,
+                  revision: parsed.data.expectedRevision,
+                  target: parsed.data.name,
+                }),
               },
               signal: executionSignal,
               capture: () => ({
@@ -1144,7 +1168,15 @@ export class WebMCPService extends Service {
                 environment: envName,
                 workspace: workspaceType,
                 allowSession: true,
-                grantKey: `create-folder|${envName}|${workspaceType}`,
+                grantKey: approvalIdentity({
+                  operation: "create_folder",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.workspace.currentWorkspace.value,
+                  environmentID: getCurrentEnvironment().id,
+                  revision: parsed.data.expectedRevision,
+                  target: parsed.data.name,
+                  details: { parent: parsed.data.collectionPath },
+                }),
               },
               signal: executionSignal,
               capture: () => ({
@@ -1293,7 +1325,15 @@ export class WebMCPService extends Service {
                 target: targetEnv.name,
                 environment: currentEnvName,
                 workspace: workspaceType,
-                grantKey: `delete_environment:${crypto.randomUUID()}`,
+                grantKey: approvalIdentity({
+                  operation: "delete_environment",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.workspace.currentWorkspace.value,
+                  environmentID: targetEnv.id,
+                  revision: this.context.revision("app-context"),
+                  target: targetEnv.name,
+                  allowSession: false,
+                }),
                 allowSession: false,
               },
               signal: executionSignal,
@@ -2286,7 +2326,17 @@ export class WebMCPService extends Service {
                 target: `${resolvedCollection.name} (${totalReqs} requests)`,
                 environment: envName,
                 workspace: workspaceType,
-                grantKey: `run-collection|${resolvedCollection.name}|${envName}|${workspaceType}`,
+                grantKey: approvalIdentity({
+                  operation: "run_collection",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.workspace.currentWorkspace.value,
+                  environmentID: getCurrentEnvironment().id,
+                  revision: collectionRevision,
+                  target: resolvedCollection.name,
+                  details: {
+                    collectionID: resolvedCollection._ref_id ?? undefined,
+                  },
+                }),
               },
               signal,
               capture: () => ({
@@ -3318,17 +3368,21 @@ export class WebMCPService extends Service {
           : response && response !== "reset" && response.type === "response"
             ? response.data
             : ""
-    const text = this.redactor().scrub(value, Infinity)
+    const window = readSafeTextWindow(
+      value,
+      this.redactor(),
+      parsed.data.offset,
+      parsed.data.maxChars,
+      "redacted-utf16"
+    )
     return this.result(scope, {
       payload: {
         source: parsed.data.source,
-        offset: parsed.data.offset,
-        text: text.slice(
-          parsed.data.offset,
-          parsed.data.offset + parsed.data.maxChars
-        ),
-        totalChars: text.length,
-        truncated: parsed.data.offset + parsed.data.maxChars < text.length,
+        offset: window.offset,
+        text: window.text,
+        totalChars: window.totalChars,
+        nextOffset: window.nextOffset,
+        truncated: window.truncated,
       },
     })
   }
@@ -3640,7 +3694,17 @@ export class WebMCPService extends Service {
         ),
         environment: appContext.environment.name,
         workspace: appContext.workspace.type,
-        grantKey: `graphql|${action}|${gql.tab.document.request.url.includes("<<") ? parsed.data.expectedRevision : safeTarget(gql.tab.document.request.url)}|${appContext.environment.name}|${appContext.workspace.type}`,
+        grantKey: approvalIdentity({
+          operation: "graphql",
+          environmentScope: getSelectedEnvironmentType(),
+          workspaceID: this.workspace.currentWorkspace.value,
+          environmentID: getCurrentEnvironment().id,
+          scope: action,
+          revision: parsed.data.expectedRevision,
+          dependencyRevision,
+          target: gql.tab.document.request.url,
+          action,
+        }),
       },
       signal,
       capture: () => ({
@@ -4024,6 +4088,12 @@ export class WebMCPService extends Service {
     const dependencyRevision = this.context.revision("rest-document")
     const realtimeRevision = this.context.revision("realtime-session")
     const snapshot = await this.realtime.snapshot(mode)
+    const typedMessage =
+      action === "send" ? realtimeMessageParser.parse(input) : null
+    const typedTopic =
+      action === "publish" || action === "subscribe" || action === "unsubscribe"
+        ? mqttTopicParser.parse(input)
+        : null
     const executeAction = async () => {
       try {
         const format = "format" in parsed.data ? parsed.data.format : "text"
@@ -4089,7 +4159,24 @@ export class WebMCPService extends Service {
         target: this.redactor().scrub(safeTarget(snapshot.endpoint), 256),
         environment: appContext.environment.name,
         workspace: appContext.workspace.type,
-        grantKey: `realtime|${mode}|${action}|${snapshot.endpoint.includes("<<") ? parsed.data.expectedRevision : safeTarget(snapshot.endpoint)}|${appContext.environment.name}|${appContext.workspace.type}`,
+        grantKey: approvalIdentity({
+          operation: "realtime",
+          environmentScope: getSelectedEnvironmentType(),
+          workspaceID: this.workspace.currentWorkspace.value,
+          environmentID: getCurrentEnvironment().id,
+          scope: mode,
+          revision: parsed.data.expectedRevision,
+          dependencyRevision,
+          target: snapshot.endpoint,
+          action,
+          details: {
+            format: typedMessage?.format ?? typedTopic?.format ?? "text",
+            topic: typedTopic?.topic,
+            message: typedMessage?.message ?? typedTopic?.message,
+            eventName: typedMessage?.eventName,
+            qos: typedTopic?.qos,
+          },
+        }),
       },
       signal,
       capture: () => ({
@@ -4344,7 +4431,14 @@ export class WebMCPService extends Service {
         target: parsed.data.name,
         environment: currentEnvName,
         workspace: workspaceType,
-        grantKey: `create-environment|${parsed.data.name}|${parsed.data.scope}|${workspaceType}`,
+        grantKey: approvalIdentity({
+          operation: "create_environment",
+          environmentScope: getSelectedEnvironmentType(),
+          workspaceID: this.workspace.currentWorkspace.value,
+          scope: parsed.data.scope,
+          revision: this.context.revision("app-context"),
+          target: parsed.data.name,
+        }),
         description: hasSecrets
           ? `Create environment '${parsed.data.name}' containing secret variable(s)`
           : `Create team environment '${parsed.data.name}' in team workspace`,
@@ -4524,7 +4618,14 @@ export class WebMCPService extends Service {
         target: `${choice.environment.name} (${keysAffected})`,
         environment: currentEnvName,
         workspace: workspaceType,
-        grantKey: `edit-env-vars|${choice.environment.id}|${keysAffected}|${workspaceType}`,
+        grantKey: approvalIdentity({
+          operation: "edit_environment_variables",
+          environmentScope: getSelectedEnvironmentType(),
+          workspaceID: this.workspace.currentWorkspace.value,
+          environmentID: choice.environment.id,
+          revision: appContextRevision,
+          details: { keys: keysAffected },
+        }),
         description: isTeam
           ? `Modify variables in team environment '${choice.environment.name}'`
           : `Modify secret variable(s) in environment '${choice.environment.name}'`,
@@ -4973,7 +5074,18 @@ export class WebMCPService extends Service {
         target: source.handle,
         environment: this.context.capture().environment.name,
         workspace: this.context.capture().workspace.type,
-        grantKey: `script-read:${crypto.randomUUID()}`,
+        grantKey: approvalIdentity({
+          operation: "read_rest_script",
+          environmentScope: getSelectedEnvironmentType(),
+          workspaceID: this.workspace.currentWorkspace.value,
+          revision: parsed.data.expectedRevision,
+          target: source.handle,
+          details: {
+            offset: parsed.data.offset,
+            maxChars: parsed.data.maxChars,
+          },
+          allowSession: false,
+        }),
         description:
           "An agent wants to read a bounded window of request script source. Script content can contain sensitive data.",
         allowSession: false,
@@ -5018,9 +5130,12 @@ export class WebMCPService extends Service {
           "rest-document"
         ),
       execute: (snapshot) => {
-        const text = this.redactor().scrub(
+        const window = readSafeTextWindow(
           snapshot.source.source,
-          parsed.data.offset + parsed.data.maxChars
+          this.redactor(),
+          parsed.data.offset,
+          parsed.data.maxChars,
+          "redacted-utf16"
         )
         this.activity.record({
           tool: "read_rest_script",
@@ -5030,13 +5145,11 @@ export class WebMCPService extends Service {
         })
         return this.result("rest-document", {
           sourceHandle: snapshot.source.handle,
-          offset: parsed.data.offset,
-          text: text.slice(
-            parsed.data.offset,
-            parsed.data.offset + parsed.data.maxChars
-          ),
-          totalChars: text.length,
-          truncated: parsed.data.offset + parsed.data.maxChars < text.length,
+          offset: window.offset,
+          text: window.text,
+          totalChars: window.totalChars,
+          nextOffset: window.nextOffset,
+          truncated: window.truncated,
         })
       },
     })
@@ -5204,16 +5317,16 @@ export class WebMCPService extends Service {
     const workspace = this.context.capture().workspace.type
     // Authorization identity must not use the redacted display target. Bind
     // grants to the inspected draft and stable context, including method/query.
-    const grantKey = JSON.stringify([
-      "execute",
-      "rest",
-      parsed.data.expectedRevision,
-      rest.tab.document.request.method,
-      endpoint,
-      getCurrentEnvironment().id,
-      getSelectedEnvironmentIndex(),
-      this.workspace.currentWorkspace.value,
-    ])
+    const grantKey = approvalIdentity({
+      operation: "execute_rest",
+      environmentScope: getSelectedEnvironmentType(),
+      workspaceID: this.workspace.currentWorkspace.value,
+      environmentID: getCurrentEnvironment().id,
+      revision: parsed.data.expectedRevision,
+      target: endpoint,
+      action: rest.tab.document.request.method,
+      details: { query: endpoint },
+    })
     return runWebMCPExecution({
       approval: this.approval,
       request: {

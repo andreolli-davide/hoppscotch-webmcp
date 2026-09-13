@@ -12,9 +12,12 @@ import {
   getAggregateEnvsWithCurrentValue,
   getCurrentEnvironment,
 } from "~/newstore/environments"
-import { SecretEnvironmentService } from "~/services/secret-environment.service"
 import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
 import { getEffectiveVariablesForRequest } from "~/helpers/utils/environments"
+import { SecretRedactor } from "./redaction"
+import { readSafeByteWindow, readSafeTextWindow } from "./payload-windows"
+
+export { SecretRedactor } from "./redaction"
 
 const SENSITIVE_HEADER =
   /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key)$/i
@@ -45,40 +48,6 @@ const AUTH_CREDENTIAL_FIELDS: Record<string, readonly string[]> = {
   hawk: ["authId", "authKey"],
   "akamai-eg": ["accessToken", "clientToken", "clientSecret"],
   jwt: ["secret", "privateKey"],
-}
-
-export class SecretRedactor {
-  private readonly values: string[]
-
-  constructor(secretService: SecretEnvironmentService) {
-    const values = new Set<string>()
-    for (const variables of secretService.secretEnvironments.values()) {
-      for (const variable of variables) {
-        if (variable.value) values.add(variable.value)
-        if (variable.initialValue) values.add(variable.initialValue)
-      }
-    }
-    this.values = [...values].sort((a, b) => b.length - a.length)
-  }
-
-  /** Mask complete secret spans before selecting windows, preserving source offsets. */
-  public mask(value: string, byteOffsets = false) {
-    let result = value
-    for (const secret of this.values) {
-      const length = byteOffsets
-        ? new TextEncoder().encode(secret).length
-        : secret.length
-      result = result.split(secret).join("*".repeat(length))
-    }
-    return result
-  }
-
-  public scrub(value: string, maxChars = 8192) {
-    let result = value
-    for (const secret of this.values)
-      result = result.split(secret).join("[REDACTED]")
-    return result.slice(0, maxChars)
-  }
 }
 
 const digest = async (bytes: Uint8Array) => {
@@ -644,30 +613,18 @@ export const readRESTPayload = async (
         digest: await digest(bytes),
       }
     }
-    const maskedBytes = encode(
-      redactor.mask(new TextDecoder().decode(bytes), true)
-    )
-    // Accept byte offsets, but never start inside a UTF-8 code point.
-    let start = Math.min(offset, maskedBytes.length)
-    while (start < maskedBytes.length && (maskedBytes[start] & 0xc0) === 0x80)
-      start++
-    const decoded = new TextDecoder().decode(
-      maskedBytes.subarray(start, start + maxChars * 4),
-      { stream: true }
-    )
-    const text = Array.from(decoded).slice(0, maxChars).join("")
-    const windowByteLength = encode(text).byteLength
+    const window = readSafeByteWindow(bytes, redactor, offset, maxChars)
     return {
       source,
       mimeType: redactor.scrub(mimeType as string, SUMMARY_MIME_CHARS),
       kind: "text",
-      offset: start,
+      offset: window.offset,
       offsetUnit: "byte",
-      text,
-      windowByteLength,
-      nextOffset: start + windowByteLength,
+      text: window.text,
+      windowByteLength: window.windowByteLength,
+      nextOffset: window.nextOffset,
       byteLength,
-      truncated: start + windowByteLength < maskedBytes.length,
+      truncated: window.truncated,
       digest: await digest(bytes),
     }
   }
@@ -675,19 +632,25 @@ export const readRESTPayload = async (
   if (text === null)
     throw new Error("The current request has no readable payload")
   const bytes = encode(text)
-  const window = redactor.mask(text).slice(offset, offset + maxChars)
+  const window = readSafeTextWindow(
+    text,
+    redactor,
+    offset,
+    maxChars,
+    "masked-utf16"
+  )
   return {
     source,
     partIndex,
     mimeType: mimeType ? redactor.scrub(mimeType, SUMMARY_MIME_CHARS) : null,
     kind: "text",
-    offset,
+    offset: window.offset,
     offsetUnit: "character",
-    text: window,
-    nextOffset: offset + Math.min(maxChars, Math.max(0, text.length - offset)),
+    text: window.text,
+    nextOffset: window.nextOffset,
     length: text.length,
     byteLength: byteLength || bytes.byteLength,
-    truncated: offset + maxChars < text.length,
+    truncated: window.truncated,
     digest: await digest(bytes),
   }
 }
