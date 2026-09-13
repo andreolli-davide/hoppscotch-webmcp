@@ -159,6 +159,7 @@ import {
   diagnosticForError,
   diagnosticForFailure,
 } from "./diagnostics"
+import { runWebMCPExecution } from "./execution-lifecycle"
 import {
   RESTRequestPatch,
   WEBMCP_PROTOCOL_VERSION,
@@ -175,9 +176,23 @@ const MAX_OUTPUT_BYTES = 8192
 
 const isPlainData = (value: unknown): boolean => {
   if (value === null || typeof value !== "object") return true
-  if (Array.isArray(value)) return value.every(isPlainData)
-  if (Object.getPrototypeOf(value) !== Object.prototype) return false
-  return Object.values(value).every(isPlainData)
+  const seen = new WeakSet<object>()
+  const pending: object[] = [value]
+  let visited = 0
+  while (pending.length) {
+    const current = pending.pop()!
+    if (++visited > 10_000 || seen.has(current)) return false
+    seen.add(current)
+    if (
+      !Array.isArray(current) &&
+      Object.getPrototypeOf(current) !== Object.prototype
+    )
+      return false
+    for (const child of Object.values(current)) {
+      if (child !== null && typeof child === "object") pending.push(child)
+    }
+  }
+  return true
 }
 
 const safeTarget = (endpoint: string) => {
@@ -203,6 +218,19 @@ const countCollectionRequests = (collection: HoppCollection): number => {
     count += countCollectionRequests(folder)
   }
   return count
+}
+
+const collectionHasIdentity = (
+  root: HoppCollection,
+  target: HoppCollection
+): boolean => {
+  const targetIdentity = target._ref_id || target.id
+  if (
+    root === target ||
+    (targetIdentity && (root._ref_id || root.id) === targetIdentity)
+  )
+    return true
+  return root.folders.some((folder) => collectionHasIdentity(folder, target))
 }
 
 const extractRunnerResults = (
@@ -677,9 +705,9 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
-            const approvalRevision = this.context.revision("app-context")
-            const approved = await this.approval.request(
-              {
+            return runWebMCPExecution({
+              approval: this.approval,
+              request: {
                 action: "DELETE collection",
                 method: "DELETE",
                 target: collection.name,
@@ -688,56 +716,65 @@ export class WebMCPService extends Service {
                 grantKey: `delete_collection:${crypto.randomUUID()}`,
                 allowSession: false,
               },
-              executionSignal
-            )
-
-            if (!approved) {
-              this.activity.record({
-                tool: "delete_collection",
-                outcome: "denied",
-                summary: `Denied deleting collection '${collection.name}'`,
+              signal: executionSignal,
+              capture: () => ({
+                collection,
                 revision: this.context.revision("app-context"),
-              })
-              return this.failure(
-                "APPROVAL_DENIED",
-                "The user rejected deleting the collection.",
-                "app-context"
-              )
-            }
+              }),
+              revalidate: (snapshot) =>
+                this.context.matches("app-context", snapshot.revision) &&
+                restCollectionStore.value.state[pathIndex] ===
+                  snapshot.collection &&
+                snapshot.collection.name === parsed.data.confirmationName,
+              denied: (cancelled) => {
+                this.activity.record({
+                  tool: "delete_collection",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied deleting collection '${collection.name}'`,
+                  revision: this.context.revision("app-context"),
+                })
+                return this.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The deletion was cancelled."
+                    : "The user rejected deleting the collection.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.failure(
+                  "STATE_CHANGED",
+                  "The collection or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.failure(
+                  "EXECUTION_FAILED",
+                  error instanceof Error
+                    ? error.message
+                    : "Collection deletion failed",
+                  "app-context"
+                ),
+              execute: (snapshot) => {
+                const deletedName = snapshot.collection.name
+                removeRESTCollection(
+                  pathIndex,
+                  snapshot.collection._ref_id || snapshot.collection.id
+                )
 
-            if (executionSignal.aborted) {
-              return this.failure(
-                "CANCELLED",
-                "The deletion was cancelled.",
-                "app-context"
-              )
-            }
-            if (
-              !this.context.matches("app-context", approvalRevision) ||
-              restCollectionStore.value.state[pathIndex] !== collection ||
-              collection.name !== parsed.data.confirmationName
-            ) {
-              return this.failure(
-                "STATE_CHANGED",
-                "The collection or application context changed while approval was open.",
-                "app-context",
-                true
-              )
-            }
+                this.activity.record({
+                  tool: "delete_collection",
+                  outcome: "changed",
+                  summary: `Permanently deleted collection '${deletedName}'`,
+                  revision: this.context.revision("app-context"),
+                })
 
-            const deletedName = collection.name
-            removeRESTCollection(pathIndex, collection._ref_id || collection.id)
-
-            this.activity.record({
-              tool: "delete_collection",
-              outcome: "changed",
-              summary: `Permanently deleted collection '${deletedName}'`,
-              revision: this.context.revision("app-context"),
-            })
-
-            return this.result("app-context", {
-              success: true,
-              deletedCollection: deletedName,
+                return this.result("app-context", {
+                  success: true,
+                  deletedCollection: deletedName,
+                })
+              },
             })
           },
         },
@@ -821,9 +858,9 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
-            const approvalRevision = this.context.revision("app-context")
-            const approved = await this.approval.request(
-              {
+            return runWebMCPExecution({
+              approval: this.approval,
+              request: {
                 action: "DELETE folder",
                 method: "DELETE",
                 target: target.name,
@@ -832,59 +869,64 @@ export class WebMCPService extends Service {
                 grantKey: `delete_folder:${crypto.randomUUID()}`,
                 allowSession: false,
               },
-              executionSignal
-            )
-
-            if (!approved) {
-              this.activity.record({
-                tool: "delete_folder",
-                outcome: "denied",
-                summary: `Denied deleting folder '${target.name}'`,
+              signal: executionSignal,
+              capture: () => ({
+                target,
                 revision: this.context.revision("app-context"),
-              })
-              return this.failure(
-                "APPROVAL_DENIED",
-                "The user rejected deleting the folder.",
-                "app-context"
-              )
-            }
+              }),
+              revalidate: (snapshot) =>
+                this.context.matches("app-context", snapshot.revision) &&
+                navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  pathSegments
+                ) === snapshot.target &&
+                snapshot.target.name === parsed.data.confirmationName,
+              denied: (cancelled) => {
+                this.activity.record({
+                  tool: "delete_folder",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied deleting folder '${target.name}'`,
+                  revision: this.context.revision("app-context"),
+                })
+                return this.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The deletion was cancelled."
+                    : "The user rejected deleting the folder.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.failure(
+                  "STATE_CHANGED",
+                  "The folder or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.failure(
+                  "INVALID_INPUT",
+                  error instanceof Error
+                    ? error.message
+                    : "Folder deletion failed",
+                  "app-context"
+                ),
+              execute: (snapshot) => {
+                const deletedName = snapshot.target.name
+                removeRESTFolder(parsed.data.folderPath, snapshot.target.id)
 
-            if (executionSignal.aborted) {
-              return this.failure(
-                "CANCELLED",
-                "The deletion was cancelled.",
-                "app-context"
-              )
-            }
-            if (
-              !this.context.matches("app-context", approvalRevision) ||
-              navigateToFolderWithIndexPath(
-                restCollectionStore.value.state,
-                pathSegments
-              ) !== target ||
-              target.name !== parsed.data.confirmationName
-            ) {
-              return this.failure(
-                "STATE_CHANGED",
-                "The folder or application context changed while approval was open.",
-                "app-context",
-                true
-              )
-            }
+                this.activity.record({
+                  tool: "delete_folder",
+                  outcome: "changed",
+                  summary: `Permanently deleted folder '${deletedName}'`,
+                  revision: this.context.revision("app-context"),
+                })
 
-            const deletedName = target.name
-            removeRESTFolder(parsed.data.folderPath, target.id)
-
-            this.activity.record({
-              tool: "delete_folder",
-              outcome: "changed",
-              summary: `Permanently deleted folder '${deletedName}'`,
-              revision: this.context.revision("app-context"),
-            })
-
-            return this.result("app-context", {
-              success: true,
-              deletedFolder: deletedName,
+                return this.result("app-context", {
+                  success: true,
+                  deletedFolder: deletedName,
+                })
+              },
             })
           },
         },
@@ -933,8 +975,9 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
-            const approved = await this.approval.request(
-              {
+            return runWebMCPExecution({
+              approval: this.approval,
+              request: {
                 action: "CREATE collection",
                 method: "POST",
                 target: parsed.data.name,
@@ -943,59 +986,81 @@ export class WebMCPService extends Service {
                 allowSession: true,
                 grantKey: `create-collection|${envName}|${workspaceType}`,
               },
-              executionSignal
-            )
-
-            if (!approved) {
-              this.activity.record({
-                tool: "create_collection",
-                outcome: "denied",
-                summary: `Denied creating collection '${parsed.data.name}'`,
+              signal: executionSignal,
+              capture: () => ({
                 revision: this.context.revision("app-context"),
-              })
-              return this.failure(
-                "APPROVAL_DENIED",
-                "The user rejected creating the collection.",
-                "app-context"
-              )
-            }
-
-            const newCollection = makeCollection({
-              name: parsed.data.name,
-              folders: [],
-              requests: [],
-              headers: [],
-              variables: [],
-              description: null,
-              preRequestScript: "",
-              testScript: "",
-              auth: { authType: "inherit", authActive: false },
-            })
-            addRESTCollection(newCollection)
-
-            const newIndex = restCollectionStore.value.state.length - 1
-
-            const activityId = this.activity.record(
-              {
-                tool: "create_collection",
-                outcome: "changed",
-                summary: `Created collection '${parsed.data.name}' at path ${newIndex}`,
-                revision: this.context.revision("app-context"),
-              },
-              () => {
-                removeRESTCollection(
-                  newIndex,
-                  newCollection._ref_id || newCollection.id
+              }),
+              revalidate: (snapshot) =>
+                this.context.matches("app-context", snapshot.revision),
+              denied: (cancelled) => {
+                this.activity.record({
+                  tool: "create_collection",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied creating collection '${parsed.data.name}'`,
+                  revision: this.context.revision("app-context"),
+                })
+                return this.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The creation was cancelled."
+                    : "The user rejected creating the collection.",
+                  "app-context"
                 )
-                return true
-              }
-            )
-            void activityId
+              },
+              stale: () =>
+                this.failure(
+                  "STATE_CHANGED",
+                  "The application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.failure(
+                  "EXECUTION_FAILED",
+                  error instanceof Error
+                    ? error.message
+                    : "Collection creation failed",
+                  "app-context"
+                ),
+              execute: () => {
+                const newCollection = makeCollection({
+                  name: parsed.data.name,
+                  folders: [],
+                  requests: [],
+                  headers: [],
+                  variables: [],
+                  description: null,
+                  preRequestScript: "",
+                  testScript: "",
+                  auth: { authType: "inherit", authActive: false },
+                })
+                addRESTCollection(newCollection)
 
-            return this.result("app-context", {
-              success: true,
-              collectionPath: String(newIndex),
-              name: parsed.data.name,
+                const newIndex = restCollectionStore.value.state.length - 1
+
+                const activityId = this.activity.record(
+                  {
+                    tool: "create_collection",
+                    outcome: "changed",
+                    summary: `Created collection '${parsed.data.name}' at path ${newIndex}`,
+                    revision: this.context.revision("app-context"),
+                  },
+                  () => {
+                    removeRESTCollection(
+                      newIndex,
+                      newCollection._ref_id || newCollection.id
+                    )
+                    return true
+                  }
+                )
+                void activityId
+
+                return this.result("app-context", {
+                  success: true,
+                  collectionPath: String(newIndex),
+                  name: parsed.data.name,
+                })
+              },
             })
           },
         },
@@ -1070,8 +1135,9 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
-            const approved = await this.approval.request(
-              {
+            return runWebMCPExecution({
+              approval: this.approval,
+              request: {
                 action: "CREATE folder",
                 method: "POST",
                 target: `${parsed.data.name} inside ${parent.name}`,
@@ -1080,52 +1146,79 @@ export class WebMCPService extends Service {
                 allowSession: true,
                 grantKey: `create-folder|${envName}|${workspaceType}`,
               },
-              executionSignal
-            )
-
-            if (!approved) {
-              this.activity.record({
-                tool: "create_folder",
-                outcome: "denied",
-                summary: `Denied creating folder '${parsed.data.name}' in '${parent.name}'`,
+              signal: executionSignal,
+              capture: () => ({
+                parent,
                 revision: this.context.revision("app-context"),
-              })
-              return this.failure(
-                "APPROVAL_DENIED",
-                "The user rejected creating the folder.",
-                "app-context"
-              )
-            }
-
-            addRESTFolder(parsed.data.name, parsed.data.collectionPath)
-
-            const updatedParent = navigateToFolderWithIndexPath(
-              restCollectionStore.value.state,
-              pathSegments
-            )
-            const newFolderIndex = updatedParent
-              ? updatedParent.folders.length - 1
-              : 0
-            const newFolderPath = `${parsed.data.collectionPath}/${newFolderIndex}`
-
-            const activityId = this.activity.record(
-              {
-                tool: "create_folder",
-                outcome: "changed",
-                summary: `Created folder '${parsed.data.name}' at path ${newFolderPath}`,
-                revision: this.context.revision("app-context"),
+              }),
+              revalidate: (snapshot) =>
+                this.context.matches("app-context", snapshot.revision) &&
+                navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  pathSegments
+                ) === snapshot.parent,
+              denied: (cancelled) => {
+                this.activity.record({
+                  tool: "create_folder",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied creating folder '${parsed.data.name}' in '${parent.name}'`,
+                  revision: this.context.revision("app-context"),
+                })
+                return this.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The creation was cancelled."
+                    : "The user rejected creating the folder.",
+                  "app-context"
+                )
               },
-              () => {
-                removeRESTFolder(newFolderPath)
-                return true
-              }
-            )
-            void activityId
+              stale: () =>
+                this.failure(
+                  "STATE_CHANGED",
+                  "The folder parent or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.failure(
+                  "INVALID_INPUT",
+                  error instanceof Error
+                    ? error.message
+                    : "Folder creation failed",
+                  "app-context"
+                ),
+              execute: () => {
+                addRESTFolder(parsed.data.name, parsed.data.collectionPath)
 
-            return this.result("app-context", {
-              success: true,
-              folderPath: newFolderPath,
-              name: parsed.data.name,
+                const updatedParent = navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  pathSegments
+                )
+                const newFolderIndex = updatedParent
+                  ? updatedParent.folders.length - 1
+                  : 0
+                const newFolderPath = `${parsed.data.collectionPath}/${newFolderIndex}`
+
+                const activityId = this.activity.record(
+                  {
+                    tool: "create_folder",
+                    outcome: "changed",
+                    summary: `Created folder '${parsed.data.name}' at path ${newFolderPath}`,
+                    revision: this.context.revision("app-context"),
+                  },
+                  () => {
+                    removeRESTFolder(newFolderPath)
+                    return true
+                  }
+                )
+                void activityId
+
+                return this.result("app-context", {
+                  success: true,
+                  folderPath: newFolderPath,
+                  name: parsed.data.name,
+                })
+              },
             })
           },
         },
@@ -1192,9 +1285,9 @@ export class WebMCPService extends Service {
             const currentEnvName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
-            const approvalRevision = this.context.revision("app-context")
-            const approved = await this.approval.request(
-              {
+            return runWebMCPExecution({
+              approval: this.approval,
+              request: {
                 action: "DELETE environment",
                 method: "DELETE",
                 target: targetEnv.name,
@@ -1203,62 +1296,70 @@ export class WebMCPService extends Service {
                 grantKey: `delete_environment:${crypto.randomUUID()}`,
                 allowSession: false,
               },
-              executionSignal
-            )
-
-            if (!approved) {
-              this.activity.record({
-                tool: "delete_environment",
-                outcome: "denied",
-                summary: `Denied deleting environment '${targetEnv.name}'`,
+              signal: executionSignal,
+              capture: () => ({
+                targetEnv,
                 revision: this.context.revision("app-context"),
-              })
-              return this.failure(
-                "APPROVAL_DENIED",
-                "The user rejected deleting the environment.",
-                "app-context"
-              )
-            }
+              }),
+              revalidate: (snapshot) =>
+                this.context.matches("app-context", snapshot.revision) &&
+                environmentsStore.value.environments[
+                  parsed.data.environmentIndex
+                ] === snapshot.targetEnv &&
+                snapshot.targetEnv.name === parsed.data.confirmationName,
+              denied: (cancelled) => {
+                this.activity.record({
+                  tool: "delete_environment",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied deleting environment '${targetEnv.name}'`,
+                  revision: this.context.revision("app-context"),
+                })
+                return this.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The deletion was cancelled."
+                    : "The user rejected deleting the environment.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.failure(
+                  "STATE_CHANGED",
+                  "The environment or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.failure(
+                  "INVALID_INPUT",
+                  error instanceof Error
+                    ? error.message
+                    : "Environment deletion failed",
+                  "app-context"
+                ),
+              execute: (snapshot) => {
+                const deletedName = snapshot.targetEnv.name
+                deleteEnvironment(
+                  parsed.data.environmentIndex,
+                  snapshot.targetEnv.id
+                )
+                if (snapshot.targetEnv.id) {
+                  this.currentValues.deleteEnvironment(snapshot.targetEnv.id)
+                  this.secrets.deleteSecretEnvironment(snapshot.targetEnv.id)
+                }
 
-            if (executionSignal.aborted) {
-              return this.failure(
-                "CANCELLED",
-                "The deletion was cancelled.",
-                "app-context"
-              )
-            }
-            if (
-              !this.context.matches("app-context", approvalRevision) ||
-              environmentsStore.value.environments[
-                parsed.data.environmentIndex
-              ] !== targetEnv ||
-              targetEnv.name !== parsed.data.confirmationName
-            ) {
-              return this.failure(
-                "STATE_CHANGED",
-                "The environment or application context changed while approval was open.",
-                "app-context",
-                true
-              )
-            }
+                this.activity.record({
+                  tool: "delete_environment",
+                  outcome: "changed",
+                  summary: `Permanently deleted environment '${deletedName}'`,
+                  revision: this.context.revision("app-context"),
+                })
 
-            const deletedName = targetEnv.name
-            deleteEnvironment(parsed.data.environmentIndex, targetEnv.id)
-            if (targetEnv.id) {
-              this.currentValues.deleteEnvironment(targetEnv.id)
-              this.secrets.deleteSecretEnvironment(targetEnv.id)
-            }
-
-            this.activity.record({
-              tool: "delete_environment",
-              outcome: "changed",
-              summary: `Permanently deleted environment '${deletedName}'`,
-              revision: this.context.revision("app-context"),
-            })
-
-            return this.result("app-context", {
-              success: true,
-              deletedEnvironment: deletedName,
+                return this.result("app-context", {
+                  success: true,
+                  deletedEnvironment: deletedName,
+                })
+              },
             })
           },
         },
@@ -2138,6 +2239,7 @@ export class WebMCPService extends Service {
               )
             }
 
+            const collectionRevision = this.context.revision("rest-document")
             let collection: HoppCollection | undefined
             if (parsed.data.collectionPath) {
               collection =
@@ -2163,7 +2265,8 @@ export class WebMCPService extends Service {
               )
             }
 
-            const totalReqs = countCollectionRequests(collection)
+            const resolvedCollection = collection
+            const totalReqs = countCollectionRequests(resolvedCollection)
             if (totalReqs === 0) {
               return this.failure(
                 "INVALID_INPUT",
@@ -2175,122 +2278,160 @@ export class WebMCPService extends Service {
             const envName = this.context.capture().environment.name
             const workspaceType = this.context.capture().workspace.type
 
-            const approved = await this.approval.request(
-              {
+            return runWebMCPExecution({
+              approval: this.approval,
+              request: {
                 action: "Run REST collection",
                 method: "POST",
-                target: `${collection.name} (${totalReqs} requests)`,
+                target: `${resolvedCollection.name} (${totalReqs} requests)`,
                 environment: envName,
                 workspace: workspaceType,
-                grantKey: `run-collection|${collection.name}|${envName}|${workspaceType}`,
+                grantKey: `run-collection|${resolvedCollection.name}|${envName}|${workspaceType}`,
               },
-              signal
-            )
-
-            if (!approved) {
-              this.activity.record({
-                tool: "run_collection",
-                outcome: "denied",
-                summary: `Denied running collection '${collection.name}'`,
-                revision: this.context.revision("rest-document"),
-              })
-              return this.failure(
-                "APPROVAL_DENIED",
-                "The user rejected running the collection.",
-                "rest-document"
-              )
-            }
-
-            const stopRef = ref(false)
-            const abortHandler = () => {
-              stopRef.value = true
-            }
-            if (signal.aborted) {
-              stopRef.value = true
-            } else {
-              signal.addEventListener("abort", abortHandler, {
-                once: true,
-              })
-            }
-
-            const runnerDoc: HoppTestRunnerDocument = {
-              type: "test-runner",
-              collectionType: "my-collections",
-              collectionID: collection._ref_id || collection.id || "",
-              collection: cloneDeep(collection),
-              isDirty: false,
-              config: {
-                iterations: 1,
-                delay: parsed.data.delay,
-                stopOnError: parsed.data.stopOnError,
-                persistResponses: parsed.data.persistResponses,
-                keepVariableValues: parsed.data.keepVariableValues,
-              },
-              status: "idle",
-              request: null,
-              testRunnerMeta: {
-                completedRequests: 0,
-                totalRequests: totalReqs,
-                totalTime: 0,
-                failedTests: 0,
-                passedTests: 0,
-                totalTests: 0,
-              },
-            }
-
-            const runnerTabRef = ref<HoppTab<HoppTestRunnerDocument>>({
-              id: "webmcp-runner-tab",
-              document: runnerDoc,
-            })
-
-            try {
-              await this.testRunner.runTests(runnerTabRef, collection, {
-                ...runnerDoc.config,
-                stopRef,
-              })
-            } catch (err) {
-              if (
-                !(
-                  err instanceof Error &&
-                  err.message === "Test execution stopped"
+              signal,
+              capture: () => ({
+                collection: resolvedCollection,
+                revision: collectionRevision,
+              }),
+              revalidate: (snapshot) =>
+                this.context.matches("rest-document", snapshot.revision) &&
+                restCollectionStore.value.state.some((item) =>
+                  collectionHasIdentity(item, snapshot.collection)
+                ),
+              denied: (cancelled) => {
+                this.activity.record({
+                  tool: "run_collection",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied running collection '${resolvedCollection.name}'`,
+                  revision: this.context.revision("rest-document"),
+                })
+                return this.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The collection run was cancelled."
+                    : "The user rejected running the collection.",
+                  "rest-document"
                 )
-              ) {
-                console.error("Collection runner error:", err)
-              }
-            } finally {
-              signal.removeEventListener("abort", abortHandler)
-            }
+              },
+              stale: () =>
+                this.failure(
+                  "STATE_CHANGED",
+                  "The collection changed while approval was open.",
+                  "rest-document",
+                  true
+                ),
+              error: (error) =>
+                this.failure(
+                  "EXECUTION_FAILED",
+                  error instanceof Error
+                    ? error.message
+                    : "Collection run failed",
+                  "rest-document"
+                ),
+              execute: async (snapshot) => {
+                const executionCollection = snapshot.collection
 
-            const redactor = this.redactor()
-            const results = extractRunnerResults(
-              runnerTabRef.value.document.resultCollection ?? collection,
-              redactor
-            )
+                const stopRef = ref(false)
+                const abortHandler = () => {
+                  stopRef.value = true
+                }
+                if (signal.aborted) {
+                  stopRef.value = true
+                } else {
+                  signal.addEventListener("abort", abortHandler, {
+                    once: true,
+                  })
+                }
 
-            const meta = runnerTabRef.value.document.testRunnerMeta
-            const outcomeStatus = stopRef.value
-              ? "stopped"
-              : runnerTabRef.value.document.status
+                const runnerDoc: HoppTestRunnerDocument = {
+                  type: "test-runner",
+                  collectionType: "my-collections",
+                  collectionID:
+                    executionCollection._ref_id || executionCollection.id || "",
+                  collection: cloneDeep(executionCollection),
+                  isDirty: false,
+                  config: {
+                    iterations: 1,
+                    delay: parsed.data.delay,
+                    stopOnError: parsed.data.stopOnError,
+                    persistResponses: parsed.data.persistResponses,
+                    keepVariableValues: parsed.data.keepVariableValues,
+                  },
+                  status: "idle",
+                  request: null,
+                  testRunnerMeta: {
+                    completedRequests: 0,
+                    totalRequests: totalReqs,
+                    totalTime: 0,
+                    failedTests: 0,
+                    passedTests: 0,
+                    totalTests: 0,
+                  },
+                }
 
-            this.activity.record({
-              tool: "run_collection",
-              outcome: "executed",
-              summary: `Ran collection '${collection.name}': ${meta.completedRequests}/${totalReqs} completed (${meta.passedTests} passed, ${meta.failedTests} failed)`,
-              revision: this.context.revision("rest-document"),
-            })
+                const runnerTabRef = ref<HoppTab<HoppTestRunnerDocument>>({
+                  id: "webmcp-runner-tab",
+                  document: runnerDoc,
+                })
 
-            return this.result("rest-document", {
-              summary: {
-                status: outcomeStatus,
-                collectionName: redactor.scrub(collection.name, 64),
-                metrics: {
-                  totalRequests: totalReqs,
-                  completedRequests: meta.completedRequests,
-                  passedTests: meta.passedTests,
-                  failedTests: meta.failedTests,
-                  totalTime: meta.totalTime,
-                },
-                results,
+                try {
+                  await this.testRunner.runTests(
+                    runnerTabRef,
+                    executionCollection,
+                    {
+                      ...runnerDoc.config,
+                      stopRef,
+                    }
+                  )
+                } catch (err) {
+                  if (
+                    !(
+                      err instanceof Error &&
+                      err.message === "Test execution stopped"
+                    )
+                  ) {
+                    console.error("Collection runner error:", err)
+                  }
+                } finally {
+                  signal.removeEventListener("abort", abortHandler)
+                }
+
+                const redactor = this.redactor()
+                const results = extractRunnerResults(
+                  runnerTabRef.value.document.resultCollection ??
+                    executionCollection,
+                  redactor
+                )
+
+                const meta = runnerTabRef.value.document.testRunnerMeta
+                const outcomeStatus = stopRef.value
+                  ? "stopped"
+                  : runnerTabRef.value.document.status
+
+                this.activity.record({
+                  tool: "run_collection",
+                  outcome: "executed",
+                  summary: `Ran collection '${executionCollection.name}': ${meta.completedRequests}/${totalReqs} completed (${meta.passedTests} passed, ${meta.failedTests} failed)`,
+                  revision: this.context.revision("rest-document"),
+                })
+
+                return this.result("rest-document", {
+                  summary: {
+                    status: outcomeStatus,
+                    collectionName: redactor.scrub(
+                      executionCollection.name,
+                      64
+                    ),
+                    metrics: {
+                      totalRequests: totalReqs,
+                      completedRequests: meta.completedRequests,
+                      passedTests: meta.passedTests,
+                      failedTests: meta.failedTests,
+                      totalTime: meta.totalTime,
+                    },
+                    results,
+                  },
+                })
               },
             })
           },
@@ -3448,81 +3589,98 @@ export class WebMCPService extends Service {
     }
     const consequential =
       action === "connect" || action === "execute" || action === "subscribe"
-    if (consequential) {
-      const approved = await this.approval.request(
-        {
-          action: `${action === "execute" ? "Execute" : action === "subscribe" ? "Start" : "Connect"} GraphQL`,
-          method: "POST",
-          target: this.redactor().scrub(
-            safeTarget(gql.tab.document.request.url),
-            256
-          ),
-          environment: this.context.capture().environment.name,
-          workspace: this.context.capture().workspace.type,
-          grantKey: `graphql|${action}|${
-            gql.tab.document.request.url.includes("<<")
-              ? parsed.data.expectedRevision
-              : safeTarget(gql.tab.document.request.url)
-          }|${this.context.capture().environment.name}|${this.context.capture().workspace.type}`,
-        },
-        signal
-      )
-      if (!approved)
+    const appContext = this.context.capture()
+    const appContextRevision = this.context.revision("app-context")
+    const dependencyRevision = this.context.revision("rest-document")
+    const executeAction = async () => {
+      try {
+        if (action === "connect")
+          await this.gqlExecution.connect(gql.tab, signal)
+        else if (action === "disconnect") this.gqlExecution.disconnect()
+        else if (action === "execute")
+          await this.gqlExecution.executeConnected(gql.tab, null, signal)
+        else if (action === "subscribe")
+          this.gqlExecution.startSubscriptionConnected(gql.tab, signal)
+        else this.gqlExecution.stopSubscription()
+        this.activity.record({
+          tool: `${action}_graphql`,
+          outcome: action === "execute" ? "executed" : "changed",
+          summary: `GraphQL ${action}`,
+          revision: this.context.revision("graphql-document"),
+        })
+        return this.gqlObservation()
+      } catch (error) {
+        if (
+          signal.aborted ||
+          (error instanceof Error &&
+            error.message.toLowerCase().includes("cancelled"))
+        ) {
+          return this.failure(
+            "CANCELLED",
+            "The GraphQL action was cancelled.",
+            "graphql-document"
+          )
+        }
         return this.failure(
-          signal.aborted ? "CANCELLED" : "APPROVAL_DENIED",
-          signal.aborted
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "GraphQL action failed.",
+          "graphql-document"
+        )
+      }
+    }
+    if (!consequential) return executeAction()
+    return runWebMCPExecution({
+      approval: this.approval,
+      request: {
+        action: `${action === "execute" ? "Execute" : action === "subscribe" ? "Start" : "Connect"} GraphQL`,
+        method: "POST",
+        target: this.redactor().scrub(
+          safeTarget(gql.tab.document.request.url),
+          256
+        ),
+        environment: appContext.environment.name,
+        workspace: appContext.workspace.type,
+        grantKey: `graphql|${action}|${gql.tab.document.request.url.includes("<<") ? parsed.data.expectedRevision : safeTarget(gql.tab.document.request.url)}|${appContext.environment.name}|${appContext.workspace.type}`,
+      },
+      signal,
+      capture: () => ({
+        token: gql.token,
+        revision: this.context.revision("graphql-document"),
+        appContextRevision,
+        dependencyRevision,
+        environment: appContext.environment.name,
+        workspace: appContext.workspace.type,
+      }),
+      revalidate: (snapshot) =>
+        this.context.matches("graphql-document", snapshot.revision) &&
+        this.context.matches("app-context", snapshot.appContextRevision) &&
+        this.context.matches("rest-document", snapshot.dependencyRevision) &&
+        this.context.captureVisibleGQL()?.token === snapshot.token &&
+        this.context.capture().environment.name === snapshot.environment &&
+        this.context.capture().workspace.type === snapshot.workspace,
+      denied: (cancelled) =>
+        this.failure(
+          cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+          cancelled
             ? "The action was cancelled."
             : "The user denied the action.",
           "graphql-document"
-        )
-      if (
-        !this.context.matches(
-          "graphql-document",
-          parsed.data.expectedRevision
-        ) ||
-        this.context.captureVisibleGQL()?.token !== gql.token
-      ) {
-        return this.failure(
+        ),
+      stale: () =>
+        this.failure(
           "STATE_CHANGED",
           "The GraphQL draft changed while approval was open.",
           "graphql-document",
           true
-        )
-      }
-    }
-    try {
-      if (action === "connect") await this.gqlExecution.connect(gql.tab, signal)
-      else if (action === "disconnect") this.gqlExecution.disconnect()
-      else if (action === "execute")
-        await this.gqlExecution.executeConnected(gql.tab, null, signal)
-      else if (action === "subscribe")
-        this.gqlExecution.startSubscriptionConnected(gql.tab, signal)
-      else this.gqlExecution.stopSubscription()
-      this.activity.record({
-        tool: `${action}_graphql`,
-        outcome: action === "execute" ? "executed" : "changed",
-        summary: `GraphQL ${action}`,
-        revision: this.context.revision("graphql-document"),
-      })
-      return this.gqlObservation()
-    } catch (error) {
-      if (
-        signal.aborted ||
-        (error instanceof Error &&
-          error.message.toLowerCase().includes("cancelled"))
-      ) {
-        return this.failure(
-          "CANCELLED",
-          "The GraphQL action was cancelled.",
+        ),
+      error: (error) =>
+        this.failure(
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "GraphQL action failed.",
           "graphql-document"
-        )
-      }
-      return this.failure(
-        "EXECUTION_FAILED",
-        error instanceof Error ? error.message : "GraphQL action failed.",
-        "graphql-document"
-      )
-    }
+        ),
+      execute: () => executeAction(),
+    })
   }
 
   private visibleRealtime(mode: RealtimeMode) {
@@ -3861,99 +4019,117 @@ export class WebMCPService extends Service {
       )
     }
     const consequential = action !== "disconnect"
+    const appContext = this.context.capture()
+    const appContextRevision = this.context.revision("app-context")
+    const dependencyRevision = this.context.revision("rest-document")
+    const realtimeRevision = this.context.revision("realtime-session")
     const snapshot = await this.realtime.snapshot(mode)
-    if (consequential) {
-      const approved = await this.approval.request(
-        {
-          action: `${action[0].toUpperCase()}${action.slice(1)} ${mode}`,
-          method: action.toUpperCase(),
-          target: this.redactor().scrub(safeTarget(snapshot.endpoint), 256),
-          environment: this.context.capture().environment.name,
-          workspace: this.context.capture().workspace.type,
-          grantKey: `realtime|${mode}|${action}|${
-            snapshot.endpoint.includes("<<")
-              ? parsed.data.expectedRevision
-              : safeTarget(snapshot.endpoint)
-          }|${this.context.capture().environment.name}|${this.context.capture().workspace.type}`,
-        },
-        signal
-      )
-      if (!approved)
+    const executeAction = async () => {
+      try {
+        const format = "format" in parsed.data ? parsed.data.format : "text"
+        const message =
+          "message" in parsed.data ? parsed.data.message : undefined
+        const actionDiagnostics: Array<Record<string, unknown>> = []
+        if (format === "json" && typeof message === "string") {
+          try {
+            JSON.parse(message)
+          } catch (error) {
+            actionDiagnostics.push({
+              ...diagnosticForError(error, this.redactor(), {
+                code: "MALFORMED_JSON_MESSAGE",
+                phase: "payload",
+                location: "message",
+              }),
+              severity: "warning",
+            })
+          }
+        }
+        if (action === "connect") {
+          await this.realtime.connect(mode, signal)
+        } else if (action === "disconnect") await this.realtime.disconnect(mode)
+        else if (action === "send") {
+          const message = realtimeMessageParser.parse(input)
+          await this.realtime.send(
+            mode as "websocket" | "socketio",
+            message.message,
+            message.eventName
+          )
+        } else {
+          const topic = mqttTopicParser.parse(input)
+          if (action === "publish")
+            await this.realtime.publish(topic.topic, topic.message ?? "")
+          else if (action === "subscribe")
+            await this.realtime.subscribe(topic.topic, topic.qos)
+          else await this.realtime.unsubscribe(topic.topic)
+        }
+        this.activity.record({
+          tool: `${action}_${mode}`,
+          outcome: consequential ? "executed" : "changed",
+          summary: `${action} ${mode}`.slice(0, 256),
+          revision: this.context.revision("realtime-session"),
+        })
+        const observation = await this.realtimeObservation(mode)
+        return observation.ok
+          ? { ...observation, actionDiagnostics }
+          : observation
+      } catch (error) {
         return this.failure(
-          signal.aborted ? "CANCELLED" : "APPROVAL_DENIED",
-          signal.aborted
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "Realtime action failed.",
+          "realtime-session"
+        )
+      }
+    }
+    if (!consequential) return executeAction()
+    return runWebMCPExecution({
+      approval: this.approval,
+      request: {
+        action: `${action[0].toUpperCase()}${action.slice(1)} ${mode}`,
+        method: action.toUpperCase(),
+        target: this.redactor().scrub(safeTarget(snapshot.endpoint), 256),
+        environment: appContext.environment.name,
+        workspace: appContext.workspace.type,
+        grantKey: `realtime|${mode}|${action}|${snapshot.endpoint.includes("<<") ? parsed.data.expectedRevision : safeTarget(snapshot.endpoint)}|${appContext.environment.name}|${appContext.workspace.type}`,
+      },
+      signal,
+      capture: () => ({
+        snapshot,
+        revision: realtimeRevision,
+        appContextRevision,
+        dependencyRevision,
+        environment: appContext.environment.name,
+        workspace: appContext.workspace.type,
+      }),
+      revalidate: (captured) =>
+        this.context.matches("realtime-session", captured.revision) &&
+        this.context.matches("app-context", captured.appContextRevision) &&
+        this.context.matches("rest-document", captured.dependencyRevision) &&
+        this.visibleRealtime(mode) === true &&
+        this.context.capture().environment.name === captured.environment &&
+        this.context.capture().workspace.type === captured.workspace,
+      denied: (cancelled) =>
+        this.failure(
+          cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+          cancelled
             ? "The action was cancelled."
             : "The user denied the action.",
           "realtime-session"
-        )
-      if (
-        !this.context.matches(
-          "realtime-session",
-          parsed.data.expectedRevision
-        ) ||
-        this.visibleRealtime(mode) !== true
-      ) {
-        return this.failure(
+        ),
+      stale: () =>
+        this.failure(
           "STATE_CHANGED",
           "The realtime session changed while approval was open.",
           "realtime-session",
           true
-        )
-      }
-    }
-    try {
-      const format = "format" in parsed.data ? parsed.data.format : "text"
-      const message = "message" in parsed.data ? parsed.data.message : undefined
-      const actionDiagnostics: Array<Record<string, unknown>> = []
-      if (format === "json" && typeof message === "string") {
-        try {
-          JSON.parse(message)
-        } catch (error) {
-          actionDiagnostics.push({
-            ...diagnosticForError(error, this.redactor(), {
-              code: "MALFORMED_JSON_MESSAGE",
-              phase: "payload",
-              location: "message",
-            }),
-            severity: "warning",
-          })
-        }
-      }
-      if (action === "connect") {
-        await this.realtime.connect(mode, signal)
-      } else if (action === "disconnect") await this.realtime.disconnect(mode)
-      else if (action === "send") {
-        const message = realtimeMessageParser.parse(input)
-        await this.realtime.send(
-          mode as "websocket" | "socketio",
-          message.message,
-          message.eventName
-        )
-      } else {
-        const topic = mqttTopicParser.parse(input)
-        if (action === "publish")
-          await this.realtime.publish(topic.topic, topic.message ?? "")
-        else if (action === "subscribe")
-          await this.realtime.subscribe(topic.topic, topic.qos)
-        else await this.realtime.unsubscribe(topic.topic)
-      }
-      this.activity.record({
-        tool: `${action}_${mode}`,
-        outcome: consequential ? "executed" : "changed",
-        summary: `${action} ${mode}`.slice(0, 256),
-        revision: this.context.revision("realtime-session"),
-      })
-      const observation = await this.realtimeObservation(mode)
-      return observation.ok
-        ? { ...observation, actionDiagnostics }
-        : observation
-    } catch (error) {
-      return this.failure(
-        "EXECUTION_FAILED",
-        error instanceof Error ? error.message : "Realtime action failed.",
-        "realtime-session"
-      )
-    }
+        ),
+      error: (error) =>
+        this.failure(
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "Realtime action failed.",
+          "realtime-session"
+        ),
+      execute: () => executeAction(),
+    })
   }
 
   private async inspectEnvironment(input: Record<string, unknown>) {
@@ -4074,89 +4250,133 @@ export class WebMCPService extends Service {
     const currentEnvName = this.context.capture().environment.name
     const workspaceType = this.context.capture().workspace.type
 
-    if (isTeam || hasSecrets) {
-      const approved = await this.approval.request(
-        {
-          action: isTeam
-            ? "CREATE team environment"
-            : "CREATE personal environment with secrets",
-          method: "CREATE",
-          target: parsed.data.name,
-          environment: currentEnvName,
-          workspace: workspaceType,
-          grantKey: `create-environment|${parsed.data.name}|${parsed.data.scope}|${workspaceType}`,
-          description: hasSecrets
-            ? `Create environment '${parsed.data.name}' containing secret variable(s)`
-            : `Create team environment '${parsed.data.name}' in team workspace`,
-        },
-        executionSignal ?? new AbortController().signal
-      )
-
-      if (!approved) {
-        this.activity.record({
-          tool: "create_environment",
-          outcome: "denied",
-          summary: `Denied creating environment '${parsed.data.name}'`,
-          revision: this.context.revision("app-context"),
-        })
-        return this.failure(
-          "APPROVAL_DENIED",
-          "The user rejected creating the environment.",
-          "app-context"
-        )
+    const executeCreation = async () => {
+      let created: {
+        id: string
+        name: string
+        handle: string
+        variableCount: number
+        secretVariableCount: number
       }
-    }
 
-    let created: {
-      id: string
-      name: string
-      handle: string
-      variableCount: number
-      secretVariableCount: number
-    }
-
-    if (parsed.data.scope === "personal") {
-      created = this.environments.createPersonal(
-        parsed.data.name,
-        parsed.data.variables
-      )
-    } else {
-      const res = await this.environments.createTeam(
-        parsed.data.name,
-        parsed.data.variables
-      )
-      if ("error" in res) {
-        if (res.error === "PERMISSION_DENIED") {
+      if (parsed.data.scope === "personal") {
+        created = this.environments.createPersonal(
+          parsed.data.name,
+          parsed.data.variables
+        )
+      } else {
+        const res = await this.environments.createTeam(
+          parsed.data.name,
+          parsed.data.variables
+        )
+        if ("error" in res) {
+          if (res.error === "PERMISSION_DENIED") {
+            return this.failure(
+              "PERMISSION_DENIED",
+              "You do not have permission to create team environments.",
+              "app-context"
+            )
+          }
           return this.failure(
-            "PERMISSION_DENIED",
-            "You do not have permission to create team environments.",
+            "INVALID_INPUT",
+            `Failed to create team environment: ${res.error}`,
             "app-context"
           )
         }
-        return this.failure(
-          "INVALID_INPUT",
-          `Failed to create team environment: ${res.error}`,
-          "app-context"
-        )
+        created = res
       }
-      created = res
+
+      const resultingRevision = this.context.revision("app-context")
+      this.activity.record({
+        tool: "create_environment",
+        outcome: "changed",
+        summary: `Created ${parsed.data.scope} environment '${created.name}' with ${created.variableCount} variables`,
+        revision: resultingRevision,
+      })
+
+      return this.result("app-context", {
+        environmentHandle: created.handle,
+        name: this.redactor().scrub(created.name, 64),
+        scope: parsed.data.scope,
+        variableCount: created.variableCount,
+        secretVariableCount: created.secretVariableCount,
+        valuesOmitted: true,
+      })
     }
-
-    const resultingRevision = this.context.revision("app-context")
-    this.activity.record({
-      tool: "create_environment",
-      outcome: "changed",
-      summary: `Created ${parsed.data.scope} environment '${created.name}' with ${created.variableCount} variables`,
-      revision: resultingRevision,
-    })
-
-    return this.result("app-context", {
-      environmentHandle: created.handle,
-      name: this.redactor().scrub(created.name, 64),
-      scope: parsed.data.scope,
-      variableCount: created.variableCount,
-      secretVariableCount: created.secretVariableCount,
-      valuesOmitted: true,
+    if (!isTeam && !hasSecrets)
+      return runWebMCPExecution({
+        approval: this.approval,
+        request: null,
+        signal: executionSignal ?? new AbortController().signal,
+        capture: () => ({ revision: this.context.revision("app-context") }),
+        revalidate: (snapshot) =>
+          this.context.matches("app-context", snapshot.revision),
+        denied: (cancelled) =>
+          this.failure(
+            cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+            cancelled ? "The action was cancelled." : "The action was denied.",
+            "app-context"
+          ),
+        stale: () =>
+          this.failure(
+            "STATE_CHANGED",
+            "The application context changed.",
+            "app-context",
+            true
+          ),
+        error: (error) =>
+          this.failure(
+            "EXECUTION_FAILED",
+            error instanceof Error
+              ? error.message
+              : "Environment creation failed",
+            "app-context"
+          ),
+        execute: () => executeCreation(),
+      })
+    return runWebMCPExecution({
+      approval: this.approval,
+      request: {
+        action: isTeam
+          ? "CREATE team environment"
+          : "CREATE personal environment with secrets",
+        method: "CREATE",
+        target: parsed.data.name,
+        environment: currentEnvName,
+        workspace: workspaceType,
+        grantKey: `create-environment|${parsed.data.name}|${parsed.data.scope}|${workspaceType}`,
+        description: hasSecrets
+          ? `Create environment '${parsed.data.name}' containing secret variable(s)`
+          : `Create team environment '${parsed.data.name}' in team workspace`,
+      },
+      signal: executionSignal ?? new AbortController().signal,
+      capture: () => ({ revision: this.context.revision("app-context") }),
+      revalidate: (snapshot) =>
+        this.context.matches("app-context", snapshot.revision),
+      denied: (cancelled) =>
+        this.failure(
+          cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+          cancelled
+            ? "The action was cancelled."
+            : "The user rejected creating the environment.",
+          "app-context"
+        ),
+      stale: () =>
+        this.failure(
+          "STATE_CHANGED",
+          "The application context changed while approval was open.",
+          "app-context",
+          true
+        ),
+      error: (error) =>
+        this.failure(
+          "EXECUTION_FAILED",
+          error instanceof Error
+            ? error.message
+            : "Environment creation failed",
+          "app-context"
+        ),
+      execute: () => executeCreation(),
     })
   }
 
@@ -4188,6 +4408,8 @@ export class WebMCPService extends Service {
       )
     }
 
+    const appContextRevision = this.context.revision("app-context")
+    const dependencyRevision = this.context.revision("rest-document")
     const choice = await this.environments.resolveHandle(
       parsed.data.environmentHandle
     )
@@ -4219,74 +4441,126 @@ export class WebMCPService extends Service {
     const currentEnvName = this.context.capture().environment.name
     const workspaceType = this.context.capture().workspace.type
 
-    if (isTeam || hasSecretOps) {
-      const keysAffected = parsed.data.operations.map((o) => o.key).join(", ")
-      const approved = await this.approval.request(
-        {
-          action: isTeam
-            ? "EDIT team environment variables"
-            : "EDIT environment secrets",
-          method: "UPDATE",
-          target: `${choice.environment.name} (${keysAffected})`,
-          environment: currentEnvName,
-          workspace: workspaceType,
-          grantKey: `edit-env-vars|${choice.environment.id}|${keysAffected}|${workspaceType}`,
-          description: isTeam
-            ? `Modify variables in team environment '${choice.environment.name}'`
-            : `Modify secret variable(s) in environment '${choice.environment.name}'`,
-        },
-        executionSignal ?? new AbortController().signal
+    const executeEdit = async () => {
+      const res = await this.environments.mutateVariables(
+        parsed.data.environmentHandle,
+        parsed.data.operations
       )
 
-      if (!approved) {
-        this.activity.record({
+      if (!res.ok) {
+        if (res.code === "PERMISSION_DENIED") {
+          return this.failure("PERMISSION_DENIED", res.error, "app-context")
+        }
+        return this.failure("INVALID_INPUT", res.error, "app-context")
+      }
+
+      const resultingRevision = this.context.revision("app-context")
+      const envName = this.redactor().scrub(res.environmentName, 64)
+      this.activity.record(
+        {
           tool: "edit_environment_variables",
-          outcome: "denied",
-          summary: `Denied editing variables in environment '${choice.environment.name}'`,
-          revision: this.context.revision("app-context"),
-        })
-        return this.failure(
-          "APPROVAL_DENIED",
-          "The user rejected editing the environment variables.",
-          "app-context"
-        )
-      }
+          outcome: "changed",
+          summary: `Updated variables [${res.updatedKeys.join(", ")}] in environment '${envName}'`,
+          revision: resultingRevision,
+        },
+        () => {
+          const undoResult = res.undo()
+          return typeof undoResult === "boolean" ? undoResult : true
+        }
+      )
+
+      return this.result("app-context", {
+        environmentHandle: parsed.data.environmentHandle,
+        environmentName: envName,
+        updatedKeys: res.updatedKeys.map((k) => this.redactor().scrub(k, 64)),
+        variableCount: res.variableCount,
+        secretVariableCount: res.secretVariableCount,
+        valuesOmitted: true,
+      })
     }
-
-    const res = await this.environments.mutateVariables(
-      parsed.data.environmentHandle,
-      parsed.data.operations
-    )
-
-    if (!res.ok) {
-      if (res.code === "PERMISSION_DENIED") {
-        return this.failure("PERMISSION_DENIED", res.error, "app-context")
-      }
-      return this.failure("INVALID_INPUT", res.error, "app-context")
-    }
-
-    const resultingRevision = this.context.revision("app-context")
-    const envName = this.redactor().scrub(res.environmentName, 64)
-    this.activity.record(
-      {
-        tool: "edit_environment_variables",
-        outcome: "changed",
-        summary: `Updated variables [${res.updatedKeys.join(", ")}] in environment '${envName}'`,
-        revision: resultingRevision,
+    if (!isTeam && !hasSecretOps)
+      return runWebMCPExecution({
+        approval: this.approval,
+        request: null,
+        signal: executionSignal ?? new AbortController().signal,
+        capture: () => ({
+          choice,
+          revision: appContextRevision,
+          dependencyRevision,
+        }),
+        revalidate: (snapshot) =>
+          this.context.matches("app-context", snapshot.revision) &&
+          this.context.matches("rest-document", snapshot.dependencyRevision) &&
+          snapshot.choice.environment?.id === choice.environment?.id,
+        denied: (cancelled) =>
+          this.failure(
+            cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+            cancelled ? "The action was cancelled." : "The action was denied.",
+            "app-context"
+          ),
+        stale: () =>
+          this.failure(
+            "STATE_CHANGED",
+            "The environment changed.",
+            "app-context",
+            true
+          ),
+        error: (error) =>
+          this.failure(
+            "EXECUTION_FAILED",
+            error instanceof Error ? error.message : "Environment edit failed",
+            "app-context"
+          ),
+        execute: () => executeEdit(),
+      })
+    const keysAffected = parsed.data.operations.map((o) => o.key).join(", ")
+    return runWebMCPExecution({
+      approval: this.approval,
+      request: {
+        action: isTeam
+          ? "EDIT team environment variables"
+          : "EDIT environment secrets",
+        method: "UPDATE",
+        target: `${choice.environment.name} (${keysAffected})`,
+        environment: currentEnvName,
+        workspace: workspaceType,
+        grantKey: `edit-env-vars|${choice.environment.id}|${keysAffected}|${workspaceType}`,
+        description: isTeam
+          ? `Modify variables in team environment '${choice.environment.name}'`
+          : `Modify secret variable(s) in environment '${choice.environment.name}'`,
       },
-      () => {
-        const undoResult = res.undo()
-        return typeof undoResult === "boolean" ? undoResult : true
-      }
-    )
-
-    return this.result("app-context", {
-      environmentHandle: parsed.data.environmentHandle,
-      environmentName: envName,
-      updatedKeys: res.updatedKeys.map((k) => this.redactor().scrub(k, 64)),
-      variableCount: res.variableCount,
-      secretVariableCount: res.secretVariableCount,
-      valuesOmitted: true,
+      signal: executionSignal ?? new AbortController().signal,
+      capture: () => ({
+        choice,
+        revision: appContextRevision,
+        dependencyRevision,
+      }),
+      revalidate: (snapshot) =>
+        this.context.matches("app-context", snapshot.revision) &&
+        this.context.matches("rest-document", snapshot.dependencyRevision) &&
+        snapshot.choice.environment?.id === choice.environment?.id,
+      denied: (cancelled) =>
+        this.failure(
+          cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+          cancelled
+            ? "The action was cancelled."
+            : "The user rejected editing the environment variables.",
+          "app-context"
+        ),
+      stale: () =>
+        this.failure(
+          "STATE_CHANGED",
+          "The environment changed while approval was open.",
+          "app-context",
+          true
+        ),
+      error: (error) =>
+        this.failure(
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "Environment edit failed",
+          "app-context"
+        ),
+      execute: () => executeEdit(),
     })
   }
 
@@ -4691,9 +4965,9 @@ export class WebMCPService extends Service {
         "The script source handle is no longer available.",
         "rest-document"
       )
-    // The nonce deliberately makes a session decision unusable for later disclosures.
-    const approved = await this.approval.request(
-      {
+    return runWebMCPExecution({
+      approval: this.approval,
+      request: {
         action: "Allow script source read",
         method: "READ",
         target: source.handle,
@@ -4704,49 +4978,67 @@ export class WebMCPService extends Service {
           "An agent wants to read a bounded window of request script source. Script content can contain sensitive data.",
         allowSession: false,
       },
-      signal
-    )
-    if (!approved) {
-      this.activity.record({
-        tool: "read_rest_script",
-        outcome: signal.aborted ? "cancelled" : "denied",
-        summary: `Script disclosure ${source.handle}`,
+      signal,
+      capture: () => ({
+        source,
         revision: this.context.revision("rest-document"),
-      })
-      return this.failure(
-        signal.aborted ? "CANCELLED" : "APPROVAL_DENIED",
-        signal.aborted
-          ? "The script disclosure was cancelled."
-          : "The user denied script disclosure.",
-        "rest-document"
-      )
-    }
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision))
-      return this.failure(
-        "STATE_CHANGED",
-        "The REST draft changed while approval was open.",
-        "rest-document",
-        true
-      )
-    const text = this.redactor().scrub(
-      source.source,
-      parsed.data.offset + parsed.data.maxChars
-    )
-    this.activity.record({
-      tool: "read_rest_script",
-      outcome: "executed",
-      summary: `Disclosed script window ${source.handle}`,
-      revision: this.context.revision("rest-document"),
-    })
-    return this.result("rest-document", {
-      sourceHandle: source.handle,
-      offset: parsed.data.offset,
-      text: text.slice(
-        parsed.data.offset,
-        parsed.data.offset + parsed.data.maxChars
-      ),
-      totalChars: text.length,
-      truncated: parsed.data.offset + parsed.data.maxChars < text.length,
+      }),
+      revalidate: (snapshot) =>
+        this.context.matches("rest-document", snapshot.revision) &&
+        this.context.matches("rest-document", parsed.data.expectedRevision) &&
+        this.scriptSources(rest).some(
+          (candidate) => candidate.handle === snapshot.source.handle
+        ),
+      denied: (cancelled) => {
+        this.activity.record({
+          tool: "read_rest_script",
+          outcome: cancelled ? "cancelled" : "denied",
+          summary: `Script disclosure ${source.handle}`,
+          revision: this.context.revision("rest-document"),
+        })
+        return this.failure(
+          cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+          cancelled
+            ? "The script disclosure was cancelled."
+            : "The user denied script disclosure.",
+          "rest-document"
+        )
+      },
+      stale: () =>
+        this.failure(
+          "STATE_CHANGED",
+          "The REST draft changed while approval was open.",
+          "rest-document",
+          true
+        ),
+      error: (error) =>
+        this.failure(
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "Script disclosure failed.",
+          "rest-document"
+        ),
+      execute: (snapshot) => {
+        const text = this.redactor().scrub(
+          snapshot.source.source,
+          parsed.data.offset + parsed.data.maxChars
+        )
+        this.activity.record({
+          tool: "read_rest_script",
+          outcome: "executed",
+          summary: `Disclosed script window ${snapshot.source.handle}`,
+          revision: this.context.revision("rest-document"),
+        })
+        return this.result("rest-document", {
+          sourceHandle: snapshot.source.handle,
+          offset: parsed.data.offset,
+          text: text.slice(
+            parsed.data.offset,
+            parsed.data.offset + parsed.data.maxChars
+          ),
+          totalChars: text.length,
+          truncated: parsed.data.offset + parsed.data.maxChars < text.length,
+        })
+      },
     })
   }
 
@@ -4922,8 +5214,9 @@ export class WebMCPService extends Service {
       getSelectedEnvironmentIndex(),
       this.workspace.currentWorkspace.value,
     ])
-    const approved = await this.approval.request(
-      {
+    return runWebMCPExecution({
+      approval: this.approval,
+      request: {
         action: "Execute REST request",
         method: safeMethod,
         target,
@@ -4931,101 +5224,107 @@ export class WebMCPService extends Service {
         workspace,
         grantKey,
       },
-      signal
-    )
-    if (!approved) {
-      const cancelled = signal.aborted
-      this.activity.record({
-        tool: "execute_rest_request",
-        outcome: cancelled ? "cancelled" : "denied",
-        summary: `${safeMethod} ${target}`.slice(0, 256),
-        revision: this.context.revision("rest-document"),
-      })
-      return this.failure(
-        cancelled ? "CANCELLED" : "APPROVAL_DENIED",
-        cancelled
-          ? "The execution was cancelled."
-          : "The user denied execution.",
-        "rest-document"
-      )
-    }
-
-    const current = this.context.captureVisibleREST()
-    if (
-      !current ||
-      current.token !== rest.token ||
-      !this.context.matches("rest-document", parsed.data.expectedRevision)
-    ) {
-      return this.failure(
-        "STATE_CHANGED",
-        "The REST draft changed while approval was open.",
-        "rest-document",
-        true
-      )
-    }
-
-    try {
-      const tabRef = this.restTabs.getTabRef(rest.tab.id) as Ref<
-        HoppTab<HoppRequestDocument>
-      >
-      const outcome = await this.execution.send(tabRef, {
-        initiator: "webmcp",
-        signal,
-      })
-      const activityBase = {
-        tool: "execute_rest_request",
-        summary: `${safeMethod} ${target}`.slice(0, 256),
-        revision: this.context.revision("rest-document"),
-      }
-      if (outcome.type === "cancelled") {
-        this.activity.record({ ...activityBase, outcome: "cancelled" })
+      signal: signal,
+      capture: () => ({
+        token: rest.token,
+        tabID: rest.tab.id,
+        revision: parsed.data.expectedRevision,
+      }),
+      revalidate: (snapshot) => {
+        const current = this.context.captureVisibleREST()
+        return Boolean(
+          current &&
+          current.token === snapshot.token &&
+          this.context.matches("rest-document", snapshot.revision)
+        )
+      },
+      denied: (cancelled) => {
+        this.activity.record({
+          tool: "execute_rest_request",
+          outcome: cancelled ? "cancelled" : "denied",
+          summary: `${safeMethod} ${target}`.slice(0, 256),
+          revision: this.context.revision("rest-document"),
+        })
         return this.failure(
-          "CANCELLED",
-          "The REST execution was cancelled.",
+          cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+          cancelled
+            ? "The execution was cancelled."
+            : "The user denied execution.",
           "rest-document"
         )
-      }
-      if (outcome.type === "script_failed") {
-        this.activity.record({ ...activityBase, outcome: "failed" })
-        return this.failure(
-          "SCRIPT_FAILED",
-          "A request script failed.",
-          "rest-document"
-        )
-      }
-      if (outcome.type === "failed") {
-        this.activity.record({ ...activityBase, outcome: "failed" })
-        return this.failure(
-          "EXECUTION_FAILED",
-          outcome.error.message,
-          "rest-document"
-        )
-      }
-      this.activity.record({ ...activityBase, outcome: "executed" })
-      const exchange = await projectRESTExchange(
-        rest.tab.document,
-        this.redactor(),
-        this.interceptor
-      )
-      return this.result("rest-document", {
-        responseRevision: this.context.revision("rest-response"),
-        isStillCurrent: this.context.captureVisibleREST()?.token === rest.token,
-        exchange,
-      })
-    } catch (error) {
-      if (error instanceof RESTRequestAlreadyRunningError) {
-        return this.failure(
-          "REQUEST_ALREADY_RUNNING",
-          error.message,
+      },
+      stale: () =>
+        this.failure(
+          "STATE_CHANGED",
+          "The REST draft changed while approval was open.",
           "rest-document",
           true
+        ),
+      execute: async () => {
+        const tabRef = this.restTabs.getTabRef(rest.tab.id) as Ref<
+          HoppTab<HoppRequestDocument>
+        >
+        const outcome = await this.execution.send(tabRef, {
+          initiator: "webmcp",
+          signal: signal,
+        })
+        const activityBase = {
+          tool: "execute_rest_request",
+          summary: `${safeMethod} ${target}`.slice(0, 256),
+          revision: this.context.revision("rest-document"),
+        }
+        if (outcome.type === "cancelled") {
+          this.activity.record({ ...activityBase, outcome: "cancelled" })
+          return this.failure(
+            "CANCELLED",
+            "The REST execution was cancelled.",
+            "rest-document"
+          )
+        }
+        if (outcome.type === "script_failed") {
+          this.activity.record({ ...activityBase, outcome: "failed" })
+          return this.failure(
+            "SCRIPT_FAILED",
+            "A request script failed.",
+            "rest-document"
+          )
+        }
+        if (outcome.type === "failed") {
+          this.activity.record({ ...activityBase, outcome: "failed" })
+          return this.failure(
+            "EXECUTION_FAILED",
+            outcome.error.message,
+            "rest-document"
+          )
+        }
+        this.activity.record({ ...activityBase, outcome: "executed" })
+        const exchange = await projectRESTExchange(
+          rest.tab.document,
+          this.redactor(),
+          this.interceptor
         )
-      }
-      return this.failure(
-        "EXECUTION_FAILED",
-        error instanceof Error ? error.message : "REST execution failed.",
-        "rest-document"
-      )
-    }
+        return this.result("rest-document", {
+          responseRevision: this.context.revision("rest-response"),
+          isStillCurrent:
+            this.context.captureVisibleREST()?.token === rest.token,
+          exchange,
+        })
+      },
+      error: (error) => {
+        if (error instanceof RESTRequestAlreadyRunningError) {
+          return this.failure(
+            "REQUEST_ALREADY_RUNNING",
+            error.message,
+            "rest-document",
+            true
+          )
+        }
+        return this.failure(
+          "EXECUTION_FAILED",
+          error instanceof Error ? error.message : "REST execution failed.",
+          "rest-document"
+        )
+      },
+    })
   }
 }
