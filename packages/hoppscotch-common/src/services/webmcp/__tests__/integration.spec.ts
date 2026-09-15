@@ -309,4 +309,30 @@ describe("WebMCP browser integration lifecycle", () => {
       expect(fixture.active.size).toBe(0)
     }
   })
+
+  it("syncs a route change that happens while initial REST registration is pending", async () => {
+    const fixture = new ModelContextFixture()
+    const restRegistration = fixture.defer("inspect_rest_exchange")
+    installFixture(fixture)
+    const router = await createRouter()
+    const container = new Container()
+    const service = container.bind(WebMCPService)
+    try {
+      const starting = service.start(router)
+      await restRegistration.entered
+      await router.push("/graphql")
+      restRegistration.release()
+      await starting
+      await nextTick()
+      expect(fixture.tool("inspect_rest_exchange")).toBeUndefined()
+      expect(fixture.tool("inspect_graphql_operation")).toBeDefined()
+    } finally {
+      service.stop()
+      const callsAfterStop = fixture.calls.length
+      await router.push("/")
+      await nextTick()
+      expect(fixture.calls).toHaveLength(callsAfterStop)
+      expect(fixture.active.size).toBe(0)
+    }
+  })
 })

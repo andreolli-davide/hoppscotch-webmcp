@@ -57,8 +57,6 @@ export class WebMCPService extends Service {
       ])
       if (!isCurrentStartup()) return
     }
-    await this.syncCapabilityPacks()
-    if (!isCurrentStartup()) return
     this.stopCapabilityWatch = watch(
       () => [
         router.currentRoute.value.path,
@@ -69,6 +67,8 @@ export class WebMCPService extends Service {
       () => void this.syncCapabilityPacks(),
       { flush: "post" }
     )
+    await this.syncCapabilityPacks()
+    if (!isCurrentStartup()) return
   }
 
   public stop() {
