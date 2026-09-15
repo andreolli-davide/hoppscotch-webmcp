@@ -38,7 +38,13 @@ export class WebMCPService extends Service {
     }
 
     this.appController = new AbortController()
-    await this.registerAppPack(this.appController.signal)
+    const startupController = this.appController
+    const isCurrentStartup = () =>
+      this.appController === startupController &&
+      !startupController.signal.aborted
+
+    await this.registerAppPack(startupController.signal)
+    if (!isCurrentStartup()) return
     if (import.meta.env.VITE_ENABLE_WEBMCP_DURABLE_OPS === "true") {
       this.durableOpsController = new AbortController()
       await Promise.all([
@@ -49,8 +55,10 @@ export class WebMCPService extends Service {
           this.durableOpsController.signal
         ),
       ])
+      if (!isCurrentStartup()) return
     }
     await this.syncCapabilityPacks()
+    if (!isCurrentStartup()) return
     this.stopCapabilityWatch = watch(
       () => [
         router.currentRoute.value.path,
