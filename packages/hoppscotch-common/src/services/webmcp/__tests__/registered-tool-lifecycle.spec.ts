@@ -11,6 +11,7 @@ import { setRESTCollections, restCollectionStore } from "~/newstore/collections"
 import { GQLTabService } from "~/services/tab/graphql"
 import { RESTTabService } from "~/services/tab/rest"
 import { SecretEnvironmentService } from "~/services/secret-environment.service"
+import { GQLRequestExecutionService } from "~/services/graphql-execution.service"
 import { TestRunnerService } from "~/services/test-runner/test-runner.service"
 import { ActiveAppContextService } from "../context"
 import { WebMCPAdapter } from "../adapter"
@@ -138,8 +139,9 @@ describe("registered WebMCP lifecycle guards", () => {
       const { context, approval, tools, container } = setupState
       const tabs = container.bind(GQLTabService)
       const secrets = container.bind(SecretEnvironmentService)
+      const gqlExecution = container.bind(GQLRequestExecutionService)
       const executeConnected = vi
-        .spyOn((setupState.service as any).gqlExecution, "executeConnected")
+        .spyOn(gqlExecution, "executeConnected")
         .mockResolvedValue(undefined)
       tabs.currentActiveTab.value!.document.request.query = "query { viewer }"
       const pending = tools.get("execute_graphql_operation").execute(

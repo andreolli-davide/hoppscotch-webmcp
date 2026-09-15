@@ -10,19 +10,8 @@ import { cloneDeep } from "lodash-es"
 import { computed, ref, Ref, watch } from "vue"
 import { Router } from "vue-router"
 
-import {
-  RESTRequestExecutionService,
-  RESTRequestAlreadyRunningError,
-} from "~/services/rest-request-execution.service"
-import { RESTTabService } from "~/services/tab/rest"
-import { GQLTabService } from "~/services/tab/graphql"
-import { KernelInterceptorService } from "~/services/kernel-interceptor.service"
-import { SecretEnvironmentService } from "~/services/secret-environment.service"
-import { WorkspaceService } from "~/services/workspace.service"
-import {
-  TestRunnerService,
-  TestRunnerRequest,
-} from "~/services/test-runner/test-runner.service"
+import { RESTRequestAlreadyRunningError } from "~/services/rest-request-execution.service"
+import { TestRunnerRequest } from "~/services/test-runner/test-runner.service"
 import { getDefaultRESTRequest } from "~/helpers/rest/default"
 import {
   restCollectionStore,
@@ -47,11 +36,7 @@ import {
 } from "~/helpers/rest/document"
 import { HoppGQLDocument } from "~/helpers/graphql/document"
 import { connection, gqlMessageEvent } from "~/helpers/graphql/connection"
-import { GQLRequestExecutionService } from "~/services/graphql-execution.service"
-import {
-  RealtimeMode,
-  RealtimeSessionService,
-} from "~/services/realtime-session.service"
+import { RealtimeMode } from "~/services/realtime-session.service"
 import {
   getCurrentEnvironment,
   getSelectedEnvironmentType,
@@ -60,15 +45,10 @@ import {
   deleteEnvironment,
   environmentsStore,
 } from "~/newstore/environments"
-import { CurrentValueService } from "~/services/current-environment-value.service"
 
-import { WebMCPAdapter } from "./adapter"
-import { ActiveAppContextService, VisibleRESTContext } from "./context"
-import { WebMCPEnvironmentService } from "./environment"
-import {
-  AgentActionApprovalService,
-  AgentActivityService,
-} from "./human-control"
+import { WebMCPRuntime } from "./runtime"
+import { AppCapability } from "./capabilities/app"
+import { VisibleRESTContext } from "./context"
 import {
   projectRESTExchange,
   readRESTPayload,
@@ -139,8 +119,6 @@ import {
   listHistoryParser,
   loadHistoryEntryInputSchema,
   loadHistoryEntryParser,
-  switchWorkspaceInputSchema,
-  switchWorkspaceParser,
   runCollectionInputSchema,
   runCollectionParser,
   deleteCollectionInputSchema,
@@ -153,51 +131,10 @@ import {
   createCollectionParser,
   createFolderInputSchema,
   createFolderParser,
-  getSkillInputSchema,
-  getSkillParser,
 } from "./schemas"
-import { findSkill, listSkills } from "./skills"
-import {
-  applyJSONPointerOperations,
-  diagnosticForError,
-  diagnosticForFailure,
-} from "./diagnostics"
+import { applyJSONPointerOperations, diagnosticForError } from "./diagnostics"
 import { runWebMCPExecution } from "./execution-lifecycle"
-import {
-  RESTRequestPatch,
-  WEBMCP_PROTOCOL_VERSION,
-  WebMCPErrorCode,
-  WebMCPRevisionScope,
-  WebMCPToolFailure,
-  WebMCPToolResult,
-} from "./types"
-
-const MAX_INPUT_BYTES = 128 * 1024
-// Bounded tool output limit (8 KiB) protecting LLM context and IPC transport.
-// Payload inspection details remain accessible via bounded read_rest_payload windows.
-const MAX_OUTPUT_BYTES = 8192
-
-const isPlainData = (value: unknown): boolean => {
-  if (value === null || typeof value !== "object") return true
-  const seen = new WeakSet<object>()
-  const pending: object[] = [value]
-  let visited = 0
-  while (pending.length) {
-    const current = pending.pop()!
-    if (++visited > 10_000 || seen.has(current)) return false
-    seen.add(current)
-    if (
-      !Array.isArray(current) &&
-      Object.getPrototypeOf(current) !== Object.prototype
-    )
-      return false
-    for (const child of Object.values(current)) {
-      if (child !== null && typeof child === "object") pending.push(child)
-    }
-  }
-  return true
-}
-
+import { RESTRequestPatch } from "./types"
 const safeTarget = (endpoint: string) => {
   if (endpoint.includes("<<")) return "templated endpoint"
   try {
@@ -279,22 +216,7 @@ const extractRunnerResults = (
 export class WebMCPService extends Service {
   public static readonly ID = "WEBMCP_SERVICE"
 
-  private readonly enabled = import.meta.env.VITE_ENABLE_WEBMCP === "true"
-  private readonly adapter = new WebMCPAdapter(this.enabled)
-  private readonly context = this.bind(ActiveAppContextService)
-  private readonly restTabs = this.bind(RESTTabService)
-  private readonly gqlTabs = this.bind(GQLTabService)
-  private readonly workspace = this.bind(WorkspaceService)
-  private readonly interceptor = this.bind(KernelInterceptorService)
-  private readonly secrets = this.bind(SecretEnvironmentService)
-  private readonly execution = this.bind(RESTRequestExecutionService)
-  private readonly testRunner = this.bind(TestRunnerService)
-  private readonly gqlExecution = this.bind(GQLRequestExecutionService)
-  private readonly realtime = this.bind(RealtimeSessionService)
-  private readonly environments = this.bind(WebMCPEnvironmentService)
-  private readonly currentValues = this.bind(CurrentValueService)
-  private readonly approval = this.bind(AgentActionApprovalService)
-  private readonly activity = this.bind(AgentActivityService)
+  private readonly runtime = this.bind(WebMCPRuntime)
 
   private appController: AbortController | null = null
   private durableOpsController: AbortController | null = null
@@ -304,14 +226,16 @@ export class WebMCPService extends Service {
   private registeredRealtimeMode: RealtimeMode | null = null
   private stopCapabilityWatch: (() => void) | null = null
 
-  public readonly diagnostic = computed(() => this.adapter.diagnostic.value)
+  public readonly diagnostic = computed(
+    () => this.runtime.adapter.diagnostic.value
+  )
 
   public async start(router: Router) {
     this.stop()
-    this.context.attachRouter(router)
-    if (!this.adapter.isAvailable()) {
+    this.runtime.context.attachRouter(router)
+    if (!this.runtime.adapter.isAvailable()) {
       if (import.meta.env.DEV) {
-        console.info(`[WebMCP] ${this.adapter.diagnostic.value}`)
+        console.info(`[WebMCP] ${this.runtime.adapter.diagnostic.value}`)
       }
       return
     }
@@ -326,9 +250,9 @@ export class WebMCPService extends Service {
     this.stopCapabilityWatch = watch(
       () => [
         router.currentRoute.value.path,
-        this.restTabs.currentTabID.value,
-        this.restTabs.currentActiveTab.value?.document?.type,
-        this.gqlTabs.currentTabID.value,
+        this.runtime.restTabs.currentTabID.value,
+        this.runtime.restTabs.currentActiveTab.value?.document?.type,
+        this.runtime.gqlTabs.currentTabID.value,
       ],
       () => void this.syncCapabilityPacks(),
       { flush: "post" }
@@ -349,12 +273,12 @@ export class WebMCPService extends Service {
     this.registeredRealtimeMode = null
     this.appController?.abort()
     this.appController = null
-    this.approval.clear()
-    this.context.dispose()
+    this.runtime.approval.clear()
+    this.runtime.context.dispose()
   }
 
   private async syncRESTPack() {
-    const available = this.context.isRESTAvailable()
+    const available = this.runtime.context.isRESTAvailable()
     if (available && !this.restController) {
       this.restController = new AbortController()
       await this.registerRESTPack(this.restController.signal)
@@ -365,7 +289,7 @@ export class WebMCPService extends Service {
   }
 
   private async syncGraphQLPack() {
-    const available = this.context.isGQLAvailable()
+    const available = this.runtime.context.isGQLAvailable()
     if (available && !this.gqlController) {
       this.gqlController = new AbortController()
       await this.registerGraphQLPack(this.gqlController.signal)
@@ -384,7 +308,7 @@ export class WebMCPService extends Service {
   }
 
   private async syncRealtimePack() {
-    const mode = this.context.realtimeMode()
+    const mode = this.runtime.context.realtimeMode()
     if (mode === this.registeredRealtimeMode) return
     this.realtimeController?.abort()
     this.realtimeController = null
@@ -395,251 +319,25 @@ export class WebMCPService extends Service {
     await this.registerRealtimePack(mode, this.realtimeController.signal)
   }
 
-  private base(scope: WebMCPRevisionScope) {
-    const appContext = this.context.capture()
-    const redactor = this.redactor()
-    appContext.mode = redactor.scrub(appContext.mode, 32)
-    appContext.environment.name = redactor.scrub(
-      appContext.environment.name,
-      64
-    )
-    if (appContext.workspace.name) {
-      appContext.workspace.name = redactor.scrub(appContext.workspace.name, 64)
-    }
-    if (appContext.workspace.role) {
-      appContext.workspace.role = redactor.scrub(appContext.workspace.role, 32)
-    }
-    return {
-      protocolVersion: WEBMCP_PROTOCOL_VERSION,
-      appContext,
-      revisionScope: scope,
-      revision: this.context.revision(scope),
-    }
-  }
-
-  private failure(
-    code: WebMCPErrorCode,
-    message: string,
-    scope: WebMCPRevisionScope = "app-context",
-    retryable = false
-  ): WebMCPToolFailure {
-    return {
-      ...this.base(scope),
-      ok: false,
-      error: {
-        code,
-        message: this.redactor().scrub(message, 512),
-        retryable,
-        diagnostics: [diagnosticForFailure(code, message, this.redactor())],
-      },
-    }
-  }
-
-  private result<T extends object>(
-    scope: WebMCPRevisionScope,
-    payload: T
-  ): WebMCPToolResult<T> {
-    const result = { ...this.base(scope), ok: true as const, ...payload }
-    if (
-      new TextEncoder().encode(JSON.stringify(result)).byteLength >
-      MAX_OUTPUT_BYTES
-    ) {
-      return this.failure(
-        "OUTPUT_LIMIT_EXCEEDED",
-        "The safe projection exceeded the WebMCP output limit.",
-        scope
-      )
-    }
-    return result
-  }
-
-  private validBoundary(input: unknown) {
-    if (!isPlainData(input)) return false
-    try {
-      return (
-        new TextEncoder().encode(JSON.stringify(input)).byteLength <=
-        MAX_INPUT_BYTES
-      )
-    } catch {
-      return false
-    }
-  }
-
-  private visibleREST() {
-    const rest = this.context.captureVisibleREST()
-    return (
-      rest ??
-      this.failure(
-        "NO_ACTIVE_REST_REQUEST",
-        "The normal REST request editor is no longer visible.",
-        "app-context",
-        true
-      )
-    )
-  }
-
-  private redactor() {
-    return new SecretRedactor(this.secrets)
-  }
-
   private async observation() {
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    return this.result("rest-document", {
-      responseRevision: this.context.revision("rest-response"),
+    return this.runtime.result("rest-document", {
+      responseRevision: this.runtime.context.revision("rest-response"),
       exchange: await projectRESTExchange(
         rest.tab.document,
-        this.redactor(),
-        this.interceptor
+        this.runtime.redactor(),
+        this.runtime.interceptor
       ),
     })
   }
 
   private async registerAppPack(signal: AbortSignal) {
-    await Promise.all([
-      this.adapter.register(
-        {
-          name: "inspect_app_context",
-          title: "Inspect Hoppscotch context",
-          description:
-            "Inspect the visible Hoppscotch surface, workspace, selected environment, active live artifact, and capability packs. Results use bounded, redacted projections.",
-          inputSchema: emptyInputSchema,
-          annotations: { readOnlyHint: true, untrustedContentHint: true },
-          execute: async (input: Record<string, unknown>) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
-                "INVALID_INPUT",
-                "This tool accepts an empty object only."
-              )
-            }
-            return this.result("app-context", {})
-          },
-        },
-        signal
-      ),
-      this.adapter.register(
-        {
-          name: "list_workspaces",
-          title: "List available workspaces",
-          description:
-            "List personal and team workspaces with their names, roles, and current selection status.",
-          inputSchema: emptyInputSchema,
-          annotations: { readOnlyHint: true, untrustedContentHint: true },
-          execute: async (input: Record<string, unknown>) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
-                "INVALID_INPUT",
-                "This tool accepts an empty object only."
-              )
-            }
-            const current = this.workspace.currentWorkspace.value
-            const redactor = this.redactor()
-            const listAdapter = this.workspace.acquireTeamListAdapter(null)
-            const teams = listAdapter.teamList$.value
-            const workspaces = [
-              {
-                id: "personal",
-                name: "Personal Workspace",
-                type: "personal",
-                isCurrent: current.type === "personal",
-              },
-              ...teams.map((team) => ({
-                id: team.id,
-                name: redactor.scrub(team.name, 64),
-                type: "team",
-                role: team.myRole ? redactor.scrub(team.myRole, 32) : undefined,
-                isCurrent:
-                  current.type === "team" && current.teamID === team.id,
-              })),
-            ]
-            return this.result("app-context", { workspaces })
-          },
-        },
-        signal
-      ),
-      this.adapter.register(
-        {
-          name: "switch_workspace",
-          title: "Switch active workspace",
-          description:
-            "Switch to the personal workspace or a team workspace by workspace ID.",
-          inputSchema: switchWorkspaceInputSchema,
-          annotations: { readOnlyHint: false, untrustedContentHint: true },
-          execute: async (input: Record<string, unknown>) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
-                "INVALID_INPUT",
-                "The input is not safe JSON data."
-              )
-            }
-            const parsed = switchWorkspaceParser.safeParse(input)
-            if (!parsed.success) {
-              return this.failure(
-                "INVALID_INPUT",
-                parsed.error.issues[0]?.message ?? "Invalid input"
-              )
-            }
-            if (
-              !this.context.matches("app-context", parsed.data.expectedRevision)
-            ) {
-              return this.failure(
-                "STATE_CHANGED",
-                "The application context changed; inspect it again.",
-                "app-context",
-                true
-              )
-            }
-            if (parsed.data.workspaceID === "personal") {
-              this.workspace.changeWorkspace({ type: "personal" })
-            } else {
-              const listAdapter = this.workspace.acquireTeamListAdapter(null)
-              const team = listAdapter.teamList$.value.find(
-                (t) => t.id === parsed.data.workspaceID
-              )
-              if (!team) {
-                return this.failure(
-                  "INVALID_INPUT",
-                  "The requested team workspace was not found.",
-                  "app-context"
-                )
-              }
-              this.workspace.changeWorkspace({
-                type: "team",
-                teamID: team.id,
-                teamName: team.name,
-                role: team.myRole,
-              })
-            }
-            this.activity.record({
-              tool: "switch_workspace",
-              outcome: "changed",
-              summary: `Switched workspace to ${parsed.data.workspaceID}`,
-              revision: this.context.revision("app-context"),
-            })
-            return this.result("app-context", { switched: true })
-          },
-        },
-        signal
-      ),
-      this.adapter.register(
-        {
-          name: "get_skill",
-          title: "Get Hoppscotch skill or documentation",
-          description:
-            "Retrieve reference documentation, rules, API signatures, and code examples for Hoppscotch capabilities (e.g. 'scripting-sandbox', 'variables-and-environments', 'test-assertions', 'auth-configuration'). Omit name or pass 'list' to view the index of all available skills.",
-          inputSchema: getSkillInputSchema,
-          annotations: { readOnlyHint: true, untrustedContentHint: false },
-          execute: async (input: Record<string, unknown>) =>
-            this.getSkill(input),
-        },
-        signal
-      ),
-    ])
+    await new AppCapability(this.runtime).register(signal)
   }
-
   private async registerDurableOpsPack(signal: AbortSignal) {
     await Promise.all([
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "delete_collection",
           title: "Delete collection",
@@ -648,30 +346,30 @@ export class WebMCPService extends Service {
           inputSchema: deleteCollectionInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input, { signal: executionSignal }) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = deleteCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "app-context",
                 parsed.data.expectedRevision
               ) &&
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The application context changed; inspect it again.",
                 "app-context",
@@ -680,7 +378,7 @@ export class WebMCPService extends Service {
             }
 
             if (!/^\d+$/.test(parsed.data.collectionPath)) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "Collection path must be a top-level collection index (e.g. '0'). For subfolders, use delete_folder.",
                 "app-context"
@@ -690,7 +388,7 @@ export class WebMCPService extends Service {
             const pathIndex = parseInt(parsed.data.collectionPath, 10)
             const collection = restCollectionStore.value.state[pathIndex]
             if (!collection) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Collection at path ${parsed.data.collectionPath} not found.`,
                 "app-context"
@@ -698,18 +396,18 @@ export class WebMCPService extends Service {
             }
 
             if (collection.name !== parsed.data.confirmationName) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Confirmation name '${parsed.data.confirmationName}' does not match collection name '${collection.name}'.`,
                 "app-context"
               )
             }
 
-            const envName = this.context.capture().environment.name
-            const workspaceType = this.context.capture().workspace.type
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
 
             return runWebMCPExecution({
-              approval: this.approval,
+              approval: this.runtime.approval,
               request: {
                 action: "DELETE collection",
                 method: "DELETE",
@@ -718,9 +416,9 @@ export class WebMCPService extends Service {
                 workspace: workspaceType,
                 grantKey: approvalIdentity({
                   operation: "delete_collection",
-                  workspaceID: this.workspace.currentWorkspace.value,
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
                   environmentScope: getSelectedEnvironmentType(),
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                   target: collection.name,
                   allowSession: false,
                 }),
@@ -729,21 +427,24 @@ export class WebMCPService extends Service {
               signal: executionSignal,
               capture: () => ({
                 collection,
-                revision: this.context.revision("app-context"),
+                revision: this.runtime.context.revision("app-context"),
               }),
               revalidate: (snapshot) =>
-                this.context.matches("app-context", snapshot.revision) &&
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
                 restCollectionStore.value.state[pathIndex] ===
                   snapshot.collection &&
                 snapshot.collection.name === parsed.data.confirmationName,
               denied: (cancelled) => {
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "delete_collection",
                   outcome: cancelled ? "cancelled" : "denied",
                   summary: `Denied deleting collection '${collection.name}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
-                return this.failure(
+                return this.runtime.failure(
                   cancelled ? "CANCELLED" : "APPROVAL_DENIED",
                   cancelled
                     ? "The deletion was cancelled."
@@ -752,14 +453,14 @@ export class WebMCPService extends Service {
                 )
               },
               stale: () =>
-                this.failure(
+                this.runtime.failure(
                   "STATE_CHANGED",
                   "The collection or application context changed while approval was open.",
                   "app-context",
                   true
                 ),
               error: (error) =>
-                this.failure(
+                this.runtime.failure(
                   "EXECUTION_FAILED",
                   error instanceof Error
                     ? error.message
@@ -773,14 +474,14 @@ export class WebMCPService extends Service {
                   snapshot.collection._ref_id || snapshot.collection.id
                 )
 
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "delete_collection",
                   outcome: "changed",
                   summary: `Permanently deleted collection '${deletedName}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
 
-                return this.result("app-context", {
+                return this.runtime.result("app-context", {
                   success: true,
                   deletedCollection: deletedName,
                 })
@@ -790,7 +491,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "delete_folder",
           title: "Delete collection folder",
@@ -799,30 +500,30 @@ export class WebMCPService extends Service {
           inputSchema: deleteFolderInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input, { signal: executionSignal }) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = deleteFolderParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "app-context",
                 parsed.data.expectedRevision
               ) &&
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The application context changed; inspect it again.",
                 "app-context",
@@ -838,7 +539,7 @@ export class WebMCPService extends Service {
               pathSegments.some((n) => isNaN(n) || n < 0) ||
               !/^\d+(\/\d+)+$/.test(parsed.data.folderPath)
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "Folder path must specify both parent collection and subfolder index (e.g. '0/0').",
                 "app-context"
@@ -850,7 +551,7 @@ export class WebMCPService extends Service {
               pathSegments
             )
             if (!target) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Folder at path ${parsed.data.folderPath} not found.`,
                 "app-context"
@@ -858,18 +559,18 @@ export class WebMCPService extends Service {
             }
 
             if (target.name !== parsed.data.confirmationName) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Confirmation name '${parsed.data.confirmationName}' does not match folder name '${target.name}'.`,
                 "app-context"
               )
             }
 
-            const envName = this.context.capture().environment.name
-            const workspaceType = this.context.capture().workspace.type
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
 
             return runWebMCPExecution({
-              approval: this.approval,
+              approval: this.runtime.approval,
               request: {
                 action: "DELETE folder",
                 method: "DELETE",
@@ -879,8 +580,8 @@ export class WebMCPService extends Service {
                 grantKey: approvalIdentity({
                   operation: "delete_folder",
                   environmentScope: getSelectedEnvironmentType(),
-                  workspaceID: this.workspace.currentWorkspace.value,
-                  revision: this.context.revision("app-context"),
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
+                  revision: this.runtime.context.revision("app-context"),
                   target: parsed.data.folderPath,
                   allowSession: false,
                 }),
@@ -889,23 +590,26 @@ export class WebMCPService extends Service {
               signal: executionSignal,
               capture: () => ({
                 target,
-                revision: this.context.revision("app-context"),
+                revision: this.runtime.context.revision("app-context"),
               }),
               revalidate: (snapshot) =>
-                this.context.matches("app-context", snapshot.revision) &&
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
                 navigateToFolderWithIndexPath(
                   restCollectionStore.value.state,
                   pathSegments
                 ) === snapshot.target &&
                 snapshot.target.name === parsed.data.confirmationName,
               denied: (cancelled) => {
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "delete_folder",
                   outcome: cancelled ? "cancelled" : "denied",
                   summary: `Denied deleting folder '${target.name}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
-                return this.failure(
+                return this.runtime.failure(
                   cancelled ? "CANCELLED" : "APPROVAL_DENIED",
                   cancelled
                     ? "The deletion was cancelled."
@@ -914,14 +618,14 @@ export class WebMCPService extends Service {
                 )
               },
               stale: () =>
-                this.failure(
+                this.runtime.failure(
                   "STATE_CHANGED",
                   "The folder or application context changed while approval was open.",
                   "app-context",
                   true
                 ),
               error: (error) =>
-                this.failure(
+                this.runtime.failure(
                   "INVALID_INPUT",
                   error instanceof Error
                     ? error.message
@@ -932,14 +636,14 @@ export class WebMCPService extends Service {
                 const deletedName = snapshot.target.name
                 removeRESTFolder(parsed.data.folderPath, snapshot.target.id)
 
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "delete_folder",
                   outcome: "changed",
                   summary: `Permanently deleted folder '${deletedName}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
 
-                return this.result("app-context", {
+                return this.runtime.result("app-context", {
                   success: true,
                   deletedFolder: deletedName,
                 })
@@ -949,7 +653,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "create_collection",
           title: "Create collection",
@@ -958,30 +662,30 @@ export class WebMCPService extends Service {
           inputSchema: createCollectionInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: false },
           execute: async (input, { signal: executionSignal }) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = createCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "app-context",
                 parsed.data.expectedRevision
               ) &&
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The application context changed; inspect it again.",
                 "app-context",
@@ -989,11 +693,11 @@ export class WebMCPService extends Service {
               )
             }
 
-            const envName = this.context.capture().environment.name
-            const workspaceType = this.context.capture().workspace.type
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
 
             return runWebMCPExecution({
-              approval: this.approval,
+              approval: this.runtime.approval,
               request: {
                 action: "CREATE collection",
                 method: "POST",
@@ -1004,7 +708,7 @@ export class WebMCPService extends Service {
                 grantKey: approvalIdentity({
                   operation: "create_collection",
                   environmentScope: getSelectedEnvironmentType(),
-                  workspaceID: this.workspace.currentWorkspace.value,
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
                   environmentID: getCurrentEnvironment().id,
                   revision: parsed.data.expectedRevision,
                   target: parsed.data.name,
@@ -1012,18 +716,18 @@ export class WebMCPService extends Service {
               },
               signal: executionSignal,
               capture: () => ({
-                revision: this.context.revision("app-context"),
+                revision: this.runtime.context.revision("app-context"),
               }),
               revalidate: (snapshot) =>
-                this.context.matches("app-context", snapshot.revision),
+                this.runtime.context.matches("app-context", snapshot.revision),
               denied: (cancelled) => {
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "create_collection",
                   outcome: cancelled ? "cancelled" : "denied",
                   summary: `Denied creating collection '${parsed.data.name}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
-                return this.failure(
+                return this.runtime.failure(
                   cancelled ? "CANCELLED" : "APPROVAL_DENIED",
                   cancelled
                     ? "The creation was cancelled."
@@ -1032,14 +736,14 @@ export class WebMCPService extends Service {
                 )
               },
               stale: () =>
-                this.failure(
+                this.runtime.failure(
                   "STATE_CHANGED",
                   "The application context changed while approval was open.",
                   "app-context",
                   true
                 ),
               error: (error) =>
-                this.failure(
+                this.runtime.failure(
                   "EXECUTION_FAILED",
                   error instanceof Error
                     ? error.message
@@ -1062,12 +766,12 @@ export class WebMCPService extends Service {
 
                 const newIndex = restCollectionStore.value.state.length - 1
 
-                const activityId = this.activity.record(
+                const activityId = this.runtime.activity.record(
                   {
                     tool: "create_collection",
                     outcome: "changed",
                     summary: `Created collection '${parsed.data.name}' at path ${newIndex}`,
-                    revision: this.context.revision("app-context"),
+                    revision: this.runtime.context.revision("app-context"),
                   },
                   () => {
                     removeRESTCollection(
@@ -1079,7 +783,7 @@ export class WebMCPService extends Service {
                 )
                 void activityId
 
-                return this.result("app-context", {
+                return this.runtime.result("app-context", {
                   success: true,
                   collectionPath: String(newIndex),
                   name: parsed.data.name,
@@ -1090,7 +794,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "create_folder",
           title: "Create collection folder",
@@ -1099,30 +803,30 @@ export class WebMCPService extends Service {
           inputSchema: createFolderInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: false },
           execute: async (input, { signal: executionSignal }) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = createFolderParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "app-context",
                 parsed.data.expectedRevision
               ) &&
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The application context changed; inspect it again.",
                 "app-context",
@@ -1137,7 +841,7 @@ export class WebMCPService extends Service {
               pathSegments.some((n) => isNaN(n) || n < 0) ||
               !/^\d+(\/\d+)*$/.test(parsed.data.collectionPath)
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "Collection path must be a numeric index path (e.g. '0' or '0/1').",
                 "app-context"
@@ -1149,18 +853,18 @@ export class WebMCPService extends Service {
               pathSegments
             )
             if (!parent) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Collection/folder at path ${parsed.data.collectionPath} not found.`,
                 "app-context"
               )
             }
 
-            const envName = this.context.capture().environment.name
-            const workspaceType = this.context.capture().workspace.type
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
 
             return runWebMCPExecution({
-              approval: this.approval,
+              approval: this.runtime.approval,
               request: {
                 action: "CREATE folder",
                 method: "POST",
@@ -1171,7 +875,7 @@ export class WebMCPService extends Service {
                 grantKey: approvalIdentity({
                   operation: "create_folder",
                   environmentScope: getSelectedEnvironmentType(),
-                  workspaceID: this.workspace.currentWorkspace.value,
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
                   environmentID: getCurrentEnvironment().id,
                   revision: parsed.data.expectedRevision,
                   target: parsed.data.name,
@@ -1181,22 +885,25 @@ export class WebMCPService extends Service {
               signal: executionSignal,
               capture: () => ({
                 parent,
-                revision: this.context.revision("app-context"),
+                revision: this.runtime.context.revision("app-context"),
               }),
               revalidate: (snapshot) =>
-                this.context.matches("app-context", snapshot.revision) &&
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
                 navigateToFolderWithIndexPath(
                   restCollectionStore.value.state,
                   pathSegments
                 ) === snapshot.parent,
               denied: (cancelled) => {
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "create_folder",
                   outcome: cancelled ? "cancelled" : "denied",
                   summary: `Denied creating folder '${parsed.data.name}' in '${parent.name}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
-                return this.failure(
+                return this.runtime.failure(
                   cancelled ? "CANCELLED" : "APPROVAL_DENIED",
                   cancelled
                     ? "The creation was cancelled."
@@ -1205,14 +912,14 @@ export class WebMCPService extends Service {
                 )
               },
               stale: () =>
-                this.failure(
+                this.runtime.failure(
                   "STATE_CHANGED",
                   "The folder parent or application context changed while approval was open.",
                   "app-context",
                   true
                 ),
               error: (error) =>
-                this.failure(
+                this.runtime.failure(
                   "INVALID_INPUT",
                   error instanceof Error
                     ? error.message
@@ -1231,12 +938,12 @@ export class WebMCPService extends Service {
                   : 0
                 const newFolderPath = `${parsed.data.collectionPath}/${newFolderIndex}`
 
-                const activityId = this.activity.record(
+                const activityId = this.runtime.activity.record(
                   {
                     tool: "create_folder",
                     outcome: "changed",
                     summary: `Created folder '${parsed.data.name}' at path ${newFolderPath}`,
-                    revision: this.context.revision("app-context"),
+                    revision: this.runtime.context.revision("app-context"),
                   },
                   () => {
                     removeRESTFolder(newFolderPath)
@@ -1245,7 +952,7 @@ export class WebMCPService extends Service {
                 )
                 void activityId
 
-                return this.result("app-context", {
+                return this.runtime.result("app-context", {
                   success: true,
                   folderPath: newFolderPath,
                   name: parsed.data.name,
@@ -1256,7 +963,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "delete_environment",
           title: "Delete environment",
@@ -1265,30 +972,30 @@ export class WebMCPService extends Service {
           inputSchema: deleteEnvironmentInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input, { signal: executionSignal }) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = deleteEnvironmentParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "app-context",
                 parsed.data.expectedRevision
               ) &&
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The application context changed; inspect it again.",
                 "app-context",
@@ -1299,7 +1006,7 @@ export class WebMCPService extends Service {
             const envs = environmentsStore.value.environments
             const targetEnv = envs[parsed.data.environmentIndex]
             if (!targetEnv) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Environment at index ${parsed.data.environmentIndex} not found.`,
                 "app-context"
@@ -1307,18 +1014,19 @@ export class WebMCPService extends Service {
             }
 
             if (targetEnv.name !== parsed.data.confirmationName) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Confirmation name '${parsed.data.confirmationName}' does not match environment name '${targetEnv.name}'.`,
                 "app-context"
               )
             }
 
-            const currentEnvName = this.context.capture().environment.name
-            const workspaceType = this.context.capture().workspace.type
+            const currentEnvName =
+              this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
 
             return runWebMCPExecution({
-              approval: this.approval,
+              approval: this.runtime.approval,
               request: {
                 action: "DELETE environment",
                 method: "DELETE",
@@ -1328,9 +1036,9 @@ export class WebMCPService extends Service {
                 grantKey: approvalIdentity({
                   operation: "delete_environment",
                   environmentScope: getSelectedEnvironmentType(),
-                  workspaceID: this.workspace.currentWorkspace.value,
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
                   environmentID: targetEnv.id,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                   target: targetEnv.name,
                   allowSession: false,
                 }),
@@ -1339,22 +1047,25 @@ export class WebMCPService extends Service {
               signal: executionSignal,
               capture: () => ({
                 targetEnv,
-                revision: this.context.revision("app-context"),
+                revision: this.runtime.context.revision("app-context"),
               }),
               revalidate: (snapshot) =>
-                this.context.matches("app-context", snapshot.revision) &&
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
                 environmentsStore.value.environments[
                   parsed.data.environmentIndex
                 ] === snapshot.targetEnv &&
                 snapshot.targetEnv.name === parsed.data.confirmationName,
               denied: (cancelled) => {
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "delete_environment",
                   outcome: cancelled ? "cancelled" : "denied",
                   summary: `Denied deleting environment '${targetEnv.name}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
-                return this.failure(
+                return this.runtime.failure(
                   cancelled ? "CANCELLED" : "APPROVAL_DENIED",
                   cancelled
                     ? "The deletion was cancelled."
@@ -1363,14 +1074,14 @@ export class WebMCPService extends Service {
                 )
               },
               stale: () =>
-                this.failure(
+                this.runtime.failure(
                   "STATE_CHANGED",
                   "The environment or application context changed while approval was open.",
                   "app-context",
                   true
                 ),
               error: (error) =>
-                this.failure(
+                this.runtime.failure(
                   "INVALID_INPUT",
                   error instanceof Error
                     ? error.message
@@ -1384,18 +1095,22 @@ export class WebMCPService extends Service {
                   snapshot.targetEnv.id
                 )
                 if (snapshot.targetEnv.id) {
-                  this.currentValues.deleteEnvironment(snapshot.targetEnv.id)
-                  this.secrets.deleteSecretEnvironment(snapshot.targetEnv.id)
+                  this.runtime.currentValues.deleteEnvironment(
+                    snapshot.targetEnv.id
+                  )
+                  this.runtime.secrets.deleteSecretEnvironment(
+                    snapshot.targetEnv.id
+                  )
                 }
 
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "delete_environment",
                   outcome: "changed",
                   summary: `Permanently deleted environment '${deletedName}'`,
-                  revision: this.context.revision("app-context"),
+                  revision: this.runtime.context.revision("app-context"),
                 })
 
-                return this.result("app-context", {
+                return this.runtime.result("app-context", {
                   success: true,
                   deletedEnvironment: deletedName,
                 })
@@ -1410,7 +1125,7 @@ export class WebMCPService extends Service {
 
   private async registerRESTPack(signal: AbortSignal) {
     await Promise.all([
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_environments",
           title: "List available environments",
@@ -1419,35 +1134,37 @@ export class WebMCPService extends Service {
           inputSchema: listEnvironmentsInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = listEnvironmentsParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
-            const rest = this.visibleREST()
+            const rest = this.runtime.visibleREST()
             if ("ok" in rest) return rest
-            const listed = await this.environments.list(parsed.data.offset)
-            const current = this.visibleREST()
+            const listed = await this.runtime.environments.list(
+              parsed.data.offset
+            )
+            const current = this.runtime.visibleREST()
             if ("ok" in current) return current
-            const redactor = this.redactor()
+            const redactor = this.runtime.redactor()
             listed.environments = listed.environments.map((environment) => ({
               ...environment,
               name: redactor.scrub(environment.name, 64),
             }))
-            return this.result("app-context", listed)
+            return this.runtime.result("app-context", listed)
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_environment",
           title: "Inspect selected environment",
@@ -1460,7 +1177,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "select_environment",
           title: "Select an environment",
@@ -1473,7 +1190,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "create_environment",
           title: "Create an environment",
@@ -1486,7 +1203,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_environment_variables",
           title: "Edit environment variables and secrets",
@@ -1499,7 +1216,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_rest_exchange",
           title: "Inspect current REST exchange",
@@ -1508,8 +1225,11 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "This tool accepts an empty object only."
               )
@@ -1519,7 +1239,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "configure_rest_auth",
           title: "Configure REST authorization",
@@ -1532,7 +1252,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_rest_variables",
           title: "Edit REST request variables",
@@ -1545,7 +1265,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_rest_scripts",
           title: "Edit REST request scripts",
@@ -1558,7 +1278,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_rest_scripting",
           title: "Inspect REST scripting",
@@ -1567,16 +1287,16 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) =>
-            this.validBoundary(input) && Object.keys(input).length === 0
+            this.runtime.validBoundary(input) && Object.keys(input).length === 0
               ? this.inspectRESTScripting()
-              : this.failure(
+              : this.runtime.failure(
                   "INVALID_INPUT",
                   "This tool accepts an empty object only."
                 ),
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "read_rest_script",
           title: "Read approved REST script window",
@@ -1591,7 +1311,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_rest_body",
           title: "Edit structured REST body",
@@ -1604,7 +1324,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "read_rest_payload",
           title: "Read REST payload window",
@@ -1613,27 +1333,29 @@ export class WebMCPService extends Service {
           inputSchema: readRESTPayloadInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input: Record<string, unknown>) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = readRESTPayloadParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
-            const rest = this.visibleREST()
+            const rest = this.runtime.visibleREST()
             if ("ok" in rest) return rest
             const scope =
               parsed.data.source === "request"
                 ? "rest-document"
                 : "rest-response"
-            if (!this.context.matches(scope, parsed.data.expectedRevision)) {
-              return this.failure(
+            if (
+              !this.runtime.context.matches(scope, parsed.data.expectedRevision)
+            ) {
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The payload changed; inspect it again.",
                 scope,
@@ -1647,11 +1369,11 @@ export class WebMCPService extends Service {
                 parsed.data.offset,
                 parsed.data.maxChars,
                 parsed.data.partIndex,
-                this.redactor()
+                this.runtime.redactor()
               )
-              return this.result(scope, { payload })
+              return this.runtime.result(scope, { payload })
             } catch (error) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 error instanceof Error
                   ? error.message
@@ -1663,7 +1385,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_rest_request",
           title: "Edit current REST request",
@@ -1676,7 +1398,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "execute_rest_request",
           title: "Execute current REST request",
@@ -1691,7 +1413,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_tabs",
           title: "List open tabs",
@@ -1700,14 +1422,17 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "This tool accepts an empty object only."
               )
             }
-            const redactor = this.redactor()
-            const tabs = this.restTabs.getTabs().map((tab) => ({
+            const redactor = this.runtime.redactor()
+            const tabs = this.runtime.restTabs.getTabs().map((tab) => ({
               id: tab.id,
               title: redactor.scrub(
                 tab.document.type === "request"
@@ -1717,7 +1442,7 @@ export class WebMCPService extends Service {
               ),
               type: tab.document.type,
               isDirty: tab.document.isDirty,
-              isActive: tab.id === this.restTabs.currentTabID.value,
+              isActive: tab.id === this.runtime.restTabs.currentTabID.value,
               saveContext:
                 tab.document.type === "request" && tab.document.saveContext
                   ? {
@@ -1730,12 +1455,12 @@ export class WebMCPService extends Service {
                     }
                   : undefined,
             }))
-            return this.result("rest-document", { tabs })
+            return this.runtime.result("rest-document", { tabs })
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "switch_tab",
           title: "Switch active tab",
@@ -1743,55 +1468,55 @@ export class WebMCPService extends Service {
           inputSchema: switchTabInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = switchTabParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The tab state changed; inspect it again.",
                 "rest-document",
                 true
               )
             }
-            const tab = this.restTabs
+            const tab = this.runtime.restTabs
               .getTabs()
               .find((t) => t.id === parsed.data.tabID)
             if (!tab) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The requested tab was not found.",
                 "rest-document"
               )
             }
-            this.restTabs.setActiveTab(parsed.data.tabID)
-            this.activity.record({
+            this.runtime.restTabs.setActiveTab(parsed.data.tabID)
+            this.runtime.activity.record({
               tool: "switch_tab",
               outcome: "changed",
               summary: `Switched active tab to ${parsed.data.tabID}`,
-              revision: this.context.revision("rest-document"),
+              revision: this.runtime.context.revision("rest-document"),
             })
             return this.observation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "create_tab",
           title: "Create new tab",
@@ -1800,26 +1525,26 @@ export class WebMCPService extends Service {
           inputSchema: createTabInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = createTabParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The tab state changed; inspect it again.",
                 "rest-document",
@@ -1828,7 +1553,7 @@ export class WebMCPService extends Service {
             }
             const req = getDefaultRESTRequest()
             if (parsed.data.name) req.name = parsed.data.name
-            const newTab = this.restTabs.createNewTab(
+            const newTab = this.runtime.restTabs.createNewTab(
               {
                 type: "request",
                 request: req,
@@ -1837,18 +1562,18 @@ export class WebMCPService extends Service {
               },
               true
             )
-            this.activity.record({
+            this.runtime.activity.record({
               tool: "create_tab",
               outcome: "changed",
               summary: `Created new tab ${newTab.id}`,
-              revision: this.context.revision("rest-document"),
+              revision: this.runtime.context.revision("rest-document"),
             })
             return this.observation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "close_tab",
           title: "Close tab",
@@ -1857,69 +1582,69 @@ export class WebMCPService extends Service {
           inputSchema: closeTabInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = closeTabParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The tab state changed; inspect it again.",
                 "rest-document",
                 true
               )
             }
-            const tab = this.restTabs
+            const tab = this.runtime.restTabs
               .getTabs()
               .find((t) => t.id === parsed.data.tabID)
             if (!tab) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The requested tab was not found.",
                 "rest-document"
               )
             }
-            if (this.restTabs.getTabs().length <= 1) {
-              return this.failure(
+            if (this.runtime.restTabs.getTabs().length <= 1) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "Cannot close the only open tab.",
                 "rest-document"
               )
             }
             if (tab.document.isDirty && !parsed.data.force) {
-              return this.failure(
+              return this.runtime.failure(
                 "DIRTY_TAB_UNSAVED_CHANGES",
                 "The tab has unsaved changes. Save it to a collection or pass force: true to discard changes.",
                 "rest-document"
               )
             }
-            this.restTabs.closeTab(parsed.data.tabID)
-            this.activity.record({
+            this.runtime.restTabs.closeTab(parsed.data.tabID)
+            this.runtime.activity.record({
               tool: "close_tab",
               outcome: "changed",
               summary: `Closed tab ${parsed.data.tabID}`,
-              revision: this.context.revision("rest-document"),
+              revision: this.runtime.context.revision("rest-document"),
             })
             return this.observation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_collections",
           title: "List collections",
@@ -1928,13 +1653,16 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "This tool accepts an empty object only."
               )
             }
-            const redactor = this.redactor()
+            const redactor = this.runtime.redactor()
             const collections = restCollectionStore.value.state.map(
               (col, index) => ({
                 id: col.id,
@@ -1944,12 +1672,12 @@ export class WebMCPService extends Service {
                 requestsCount: col.requests.length,
               })
             )
-            return this.result("rest-document", { collections })
+            return this.runtime.result("rest-document", { collections })
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_collection",
           title: "Inspect collection or folder",
@@ -1958,15 +1686,15 @@ export class WebMCPService extends Service {
           inputSchema: inspectCollectionInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = inspectCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
@@ -1976,14 +1704,14 @@ export class WebMCPService extends Service {
               parsed.data.path.split("/").map((x) => parseInt(x, 10))
             )
             if (!target) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The requested collection or folder path was not found.",
                 "rest-document"
               )
             }
-            const redactor = this.redactor()
-            return this.result("rest-document", {
+            const redactor = this.runtime.redactor()
+            return this.runtime.result("rest-document", {
               collection: {
                 name: redactor.scrub(target.name, 64),
                 path: parsed.data.path,
@@ -2011,7 +1739,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "save_request_to_collection",
           title: "Save request to collection",
@@ -2020,28 +1748,28 @@ export class WebMCPService extends Service {
           inputSchema: saveRequestToCollectionInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = saveRequestToCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
-            const rest = this.visibleREST()
+            const rest = this.runtime.visibleREST()
             if ("ok" in rest) return rest
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The request draft changed; inspect it again.",
                 "rest-document",
@@ -2069,7 +1797,7 @@ export class WebMCPService extends Service {
               path.split("/").map((x) => parseInt(x, 10))
             )
             if (!target) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Collection path ${path} not found.`,
                 "rest-document"
@@ -2103,18 +1831,18 @@ export class WebMCPService extends Service {
                 cascadeParentCollectionForProperties(path, "rest")
             }
 
-            this.activity.record({
+            this.runtime.activity.record({
               tool: "save_request_to_collection",
               outcome: "changed",
               summary: `Saved request '${reqToSave.name}' to collection ${path}`,
-              revision: this.context.revision("rest-document"),
+              revision: this.runtime.context.revision("rest-document"),
             })
             return this.observation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_history",
           title: "List execution history",
@@ -2123,15 +1851,15 @@ export class WebMCPService extends Service {
           inputSchema: listHistoryInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = listHistoryParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
@@ -2141,7 +1869,7 @@ export class WebMCPService extends Service {
               parsed.data.offset,
               parsed.data.offset + parsed.data.limit
             )
-            const redactor = this.redactor()
+            const redactor = this.runtime.redactor()
             const entries = slice.map((entry, i) => ({
               index: parsed.data.offset + i,
               name: redactor.scrub(entry.request.name || "Untitled", 64),
@@ -2152,7 +1880,7 @@ export class WebMCPService extends Service {
               star: entry.star,
               updatedOn: entry.updatedOn ? entry.updatedOn.toISOString() : null,
             }))
-            return this.result("rest-document", {
+            return this.runtime.result("rest-document", {
               total: historyState.length,
               offset: parsed.data.offset,
               limit: parsed.data.limit,
@@ -2162,7 +1890,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "load_history_entry",
           title: "Load history entry into tab",
@@ -2171,26 +1899,26 @@ export class WebMCPService extends Service {
           inputSchema: loadHistoryEntryInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = loadHistoryEntryParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The editor state changed; inspect it again.",
                 "rest-document",
@@ -2199,7 +1927,7 @@ export class WebMCPService extends Service {
             }
             const historyEntry = restHistoryStore.value.state[parsed.data.index]
             if (!historyEntry) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `History entry at index ${parsed.data.index} not found.`,
                 "rest-document"
@@ -2207,7 +1935,7 @@ export class WebMCPService extends Service {
             }
             const reqToLoad = cloneDeep(historyEntry.request)
             if (parsed.data.targetTab === "new") {
-              this.restTabs.createNewTab(
+              this.runtime.restTabs.createNewTab(
                 {
                   type: "request",
                   request: reqToLoad,
@@ -2217,10 +1945,10 @@ export class WebMCPService extends Service {
                 true
               )
             } else {
-              const rest = this.visibleREST()
+              const rest = this.runtime.visibleREST()
               if ("ok" in rest) return rest
               if (rest.tab.document.isDirty) {
-                return this.failure(
+                return this.runtime.failure(
                   "DIRTY_TAB_UNSAVED_CHANGES",
                   "The active tab has unsaved changes. Save it or choose targetTab: 'new'.",
                   "rest-document"
@@ -2231,18 +1959,18 @@ export class WebMCPService extends Service {
               rest.tab.document.saveContext = undefined
               rest.tab.document.inheritedProperties = undefined
             }
-            this.activity.record({
+            this.runtime.activity.record({
               tool: "load_history_entry",
               outcome: "changed",
               summary: `Loaded history entry ${parsed.data.index}`,
-              revision: this.context.revision("rest-document"),
+              revision: this.runtime.context.revision("rest-document"),
             })
             return this.observation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "run_collection",
           title: "Run REST collection",
@@ -2251,27 +1979,30 @@ export class WebMCPService extends Service {
           inputSchema: runCollectionInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input, { signal }) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = runCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "rest-document",
                 parsed.data.expectedRevision
               ) &&
-              !this.context.matches("app-context", parsed.data.expectedRevision)
+              !this.runtime.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The application context changed; inspect it again.",
                 "app-context",
@@ -2279,7 +2010,8 @@ export class WebMCPService extends Service {
               )
             }
 
-            const collectionRevision = this.context.revision("rest-document")
+            const collectionRevision =
+              this.runtime.context.revision("rest-document")
             let collection: HoppCollection | undefined
             if (parsed.data.collectionPath) {
               collection =
@@ -2298,7 +2030,7 @@ export class WebMCPService extends Service {
             }
 
             if (!collection) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "Collection not found.",
                 "rest-document"
@@ -2308,18 +2040,18 @@ export class WebMCPService extends Service {
             const resolvedCollection = collection
             const totalReqs = countCollectionRequests(resolvedCollection)
             if (totalReqs === 0) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The collection contains no requests to run.",
                 "rest-document"
               )
             }
 
-            const envName = this.context.capture().environment.name
-            const workspaceType = this.context.capture().workspace.type
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
 
             return runWebMCPExecution({
-              approval: this.approval,
+              approval: this.runtime.approval,
               request: {
                 action: "Run REST collection",
                 method: "POST",
@@ -2329,7 +2061,7 @@ export class WebMCPService extends Service {
                 grantKey: approvalIdentity({
                   operation: "run_collection",
                   environmentScope: getSelectedEnvironmentType(),
-                  workspaceID: this.workspace.currentWorkspace.value,
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
                   environmentID: getCurrentEnvironment().id,
                   revision: collectionRevision,
                   target: resolvedCollection.name,
@@ -2344,18 +2076,21 @@ export class WebMCPService extends Service {
                 revision: collectionRevision,
               }),
               revalidate: (snapshot) =>
-                this.context.matches("rest-document", snapshot.revision) &&
+                this.runtime.context.matches(
+                  "rest-document",
+                  snapshot.revision
+                ) &&
                 restCollectionStore.value.state.some((item) =>
                   collectionHasIdentity(item, snapshot.collection)
                 ),
               denied: (cancelled) => {
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "run_collection",
                   outcome: cancelled ? "cancelled" : "denied",
                   summary: `Denied running collection '${resolvedCollection.name}'`,
-                  revision: this.context.revision("rest-document"),
+                  revision: this.runtime.context.revision("rest-document"),
                 })
-                return this.failure(
+                return this.runtime.failure(
                   cancelled ? "CANCELLED" : "APPROVAL_DENIED",
                   cancelled
                     ? "The collection run was cancelled."
@@ -2364,14 +2099,14 @@ export class WebMCPService extends Service {
                 )
               },
               stale: () =>
-                this.failure(
+                this.runtime.failure(
                   "STATE_CHANGED",
                   "The collection changed while approval was open.",
                   "rest-document",
                   true
                 ),
               error: (error) =>
-                this.failure(
+                this.runtime.failure(
                   "EXECUTION_FAILED",
                   error instanceof Error
                     ? error.message
@@ -2425,7 +2160,7 @@ export class WebMCPService extends Service {
                 })
 
                 try {
-                  await this.testRunner.runTests(
+                  await this.runtime.testRunner.runTests(
                     runnerTabRef,
                     executionCollection,
                     {
@@ -2446,7 +2181,7 @@ export class WebMCPService extends Service {
                   signal.removeEventListener("abort", abortHandler)
                 }
 
-                const redactor = this.redactor()
+                const redactor = this.runtime.redactor()
                 const results = extractRunnerResults(
                   runnerTabRef.value.document.resultCollection ??
                     executionCollection,
@@ -2458,14 +2193,14 @@ export class WebMCPService extends Service {
                   ? "stopped"
                   : runnerTabRef.value.document.status
 
-                this.activity.record({
+                this.runtime.activity.record({
                   tool: "run_collection",
                   outcome: "executed",
                   summary: `Ran collection '${executionCollection.name}': ${meta.completedRequests}/${totalReqs} completed (${meta.passedTests} passed, ${meta.failedTests} failed)`,
-                  revision: this.context.revision("rest-document"),
+                  revision: this.runtime.context.revision("rest-document"),
                 })
 
-                return this.result("rest-document", {
+                return this.runtime.result("rest-document", {
                   summary: {
                     status: outcomeStatus,
                     collectionName: redactor.scrub(
@@ -2488,7 +2223,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_collection_runner",
           title: "Inspect collection runner state",
@@ -2500,27 +2235,30 @@ export class WebMCPService extends Service {
           },
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "This tool accepts an empty object only."
               )
             }
-            const runnerTab = this.restTabs
+            const runnerTab = this.runtime.restTabs
               .getTabs()
               .find((t) => t.document.type === "test-runner") as
               | HoppTab<HoppTestRunnerDocument>
               | undefined
 
             if (!runnerTab) {
-              return this.result("rest-document", {
+              return this.runtime.result("rest-document", {
                 active: false,
                 message: "No test runner tab is currently open.",
               })
             }
 
-            const redactor = this.redactor()
-            return this.result("rest-document", {
+            const redactor = this.runtime.redactor()
+            return this.runtime.result("rest-document", {
               active: true,
               status: runnerTab.document.status,
               collectionName: redactor.scrub(
@@ -2537,21 +2275,8 @@ export class WebMCPService extends Service {
     ])
   }
 
-  private visibleGQL() {
-    const gql = this.context.captureVisibleGQL()
-    return (
-      gql ??
-      this.failure(
-        "NO_ACTIVE_GRAPHQL_REQUEST",
-        "The GraphQL request editor is no longer visible.",
-        "app-context",
-        true
-      )
-    )
-  }
-
   private gqlExchange(document: HoppGQLDocument) {
-    const redactor = this.redactor()
+    const redactor = this.runtime.redactor()
     const response = gqlMessageEvent.value
     const safeHeaders = document.request.headers.slice(0, 4).map((header) => ({
       key: redactor.scrub(header.key, 48),
@@ -2614,8 +2339,9 @@ export class WebMCPService extends Service {
         state: connection.state,
         schemaLoaded: Boolean(connection.schema),
         subscriptionState:
-          connection.subscriptionState.get(this.gqlTabs.currentTabID.value) ??
-          "UNSUBSCRIBED",
+          connection.subscriptionState.get(
+            this.runtime.gqlTabs.currentTabID.value
+          ) ?? "UNSUBSCRIBED",
       },
       response:
         response && response !== "reset"
@@ -2634,17 +2360,17 @@ export class WebMCPService extends Service {
   }
 
   private gqlObservation() {
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
-    return this.result("graphql-document", {
-      responseRevision: this.context.revision("graphql-response"),
+    return this.runtime.result("graphql-document", {
+      responseRevision: this.runtime.context.revision("graphql-response"),
       operation: this.gqlExchange(gql.tab.document),
     })
   }
 
   private async registerGraphQLPack(signal: AbortSignal) {
     await Promise.all([
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_graphql_operation",
           title: "Inspect current GraphQL operation",
@@ -2653,16 +2379,16 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) =>
-            this.validBoundary(input) && Object.keys(input).length === 0
+            this.runtime.validBoundary(input) && Object.keys(input).length === 0
               ? this.gqlObservation()
-              : this.failure(
+              : this.runtime.failure(
                   "INVALID_INPUT",
                   "This tool accepts an empty object only."
                 ),
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "read_graphql_payload",
           title: "Read GraphQL payload window",
@@ -2674,7 +2400,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "search_graphql_schema",
           title: "Search GraphQL schema",
@@ -2686,7 +2412,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_graphql_operation",
           title: "Edit current GraphQL operation",
@@ -2698,7 +2424,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_graphql_variables",
           title: "Edit structured GraphQL variables",
@@ -2710,7 +2436,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "configure_graphql_auth",
           title: "Configure GraphQL authorization",
@@ -2722,7 +2448,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "connect_graphql",
           title: "Connect GraphQL schema",
@@ -2735,7 +2461,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "disconnect_graphql",
           title: "Disconnect GraphQL schema",
@@ -2751,7 +2477,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "execute_graphql_operation",
           title: "Execute GraphQL operation",
@@ -2764,7 +2490,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "start_gql_subscription",
           title: "Start GraphQL subscription",
@@ -2777,7 +2503,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "stop_gql_subscription",
           title: "Stop GraphQL subscription",
@@ -2793,7 +2519,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_gql_tabs",
           title: "List open GraphQL tabs",
@@ -2802,21 +2528,24 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "This tool accepts an empty object only."
               )
             }
-            const redactor = this.redactor()
-            const tabs = this.gqlTabs.getTabs().map((tab) => ({
+            const redactor = this.runtime.redactor()
+            const tabs = this.runtime.gqlTabs.getTabs().map((tab) => ({
               id: tab.id,
               title: redactor.scrub(
                 tab.document.request.name || "Untitled",
                 64
               ),
               isDirty: tab.document.isDirty,
-              isActive: tab.id === this.gqlTabs.currentTabID.value,
+              isActive: tab.id === this.runtime.gqlTabs.currentTabID.value,
               saveContext: tab.document.saveContext
                 ? {
                     originLocation: tab.document.saveContext.originLocation,
@@ -2828,12 +2557,12 @@ export class WebMCPService extends Service {
                   }
                 : undefined,
             }))
-            return this.result("graphql-document", { tabs })
+            return this.runtime.result("graphql-document", { tabs })
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "switch_gql_tab",
           title: "Switch active GraphQL tab",
@@ -2841,55 +2570,55 @@ export class WebMCPService extends Service {
           inputSchema: switchTabInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = switchTabParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "graphql-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The tab state changed; inspect it again.",
                 "graphql-document",
                 true
               )
             }
-            const tab = this.gqlTabs
+            const tab = this.runtime.gqlTabs
               .getTabs()
               .find((t) => t.id === parsed.data.tabID)
             if (!tab) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The requested tab was not found.",
                 "graphql-document"
               )
             }
-            this.gqlTabs.setActiveTab(parsed.data.tabID)
-            this.activity.record({
+            this.runtime.gqlTabs.setActiveTab(parsed.data.tabID)
+            this.runtime.activity.record({
               tool: "switch_gql_tab",
               outcome: "changed",
               summary: `Switched active GraphQL tab to ${parsed.data.tabID}`,
-              revision: this.context.revision("graphql-document"),
+              revision: this.runtime.context.revision("graphql-document"),
             })
             return this.gqlObservation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "create_gql_tab",
           title: "Create new GraphQL tab",
@@ -2898,26 +2627,26 @@ export class WebMCPService extends Service {
           inputSchema: createTabInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = createTabParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "graphql-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The tab state changed; inspect it again.",
                 "graphql-document",
@@ -2926,7 +2655,7 @@ export class WebMCPService extends Service {
             }
             const req = getDefaultGQLRequest()
             if (parsed.data.name) req.name = parsed.data.name
-            const newTab = this.gqlTabs.createNewTab(
+            const newTab = this.runtime.gqlTabs.createNewTab(
               {
                 type: "graphql",
                 request: req,
@@ -2936,18 +2665,18 @@ export class WebMCPService extends Service {
               } as any,
               true
             )
-            this.activity.record({
+            this.runtime.activity.record({
               tool: "create_gql_tab",
               outcome: "changed",
               summary: `Created new GraphQL tab ${newTab.id}`,
-              revision: this.context.revision("graphql-document"),
+              revision: this.runtime.context.revision("graphql-document"),
             })
             return this.gqlObservation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "close_gql_tab",
           title: "Close GraphQL tab",
@@ -2956,69 +2685,69 @@ export class WebMCPService extends Service {
           inputSchema: closeTabInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = closeTabParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "graphql-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The tab state changed; inspect it again.",
                 "graphql-document",
                 true
               )
             }
-            const tab = this.gqlTabs
+            const tab = this.runtime.gqlTabs
               .getTabs()
               .find((t) => t.id === parsed.data.tabID)
             if (!tab) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The requested tab was not found.",
                 "graphql-document"
               )
             }
-            if (this.gqlTabs.getTabs().length <= 1) {
-              return this.failure(
+            if (this.runtime.gqlTabs.getTabs().length <= 1) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "Cannot close the only open tab.",
                 "graphql-document"
               )
             }
             if (tab.document.isDirty && !parsed.data.force) {
-              return this.failure(
+              return this.runtime.failure(
                 "DIRTY_TAB_UNSAVED_CHANGES",
                 "The tab has unsaved changes. Save it to a collection or pass force: true to discard changes.",
                 "graphql-document"
               )
             }
-            this.gqlTabs.closeTab(parsed.data.tabID)
-            this.activity.record({
+            this.runtime.gqlTabs.closeTab(parsed.data.tabID)
+            this.runtime.activity.record({
               tool: "close_gql_tab",
               outcome: "changed",
               summary: `Closed GraphQL tab ${parsed.data.tabID}`,
-              revision: this.context.revision("graphql-document"),
+              revision: this.runtime.context.revision("graphql-document"),
             })
             return this.gqlObservation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_gql_collections",
           title: "List GraphQL collections",
@@ -3027,13 +2756,16 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input) || Object.keys(input).length !== 0) {
-              return this.failure(
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "This tool accepts an empty object only."
               )
             }
-            const redactor = this.redactor()
+            const redactor = this.runtime.redactor()
             const collections = graphqlCollectionStore.value.state.map(
               (col, index) => ({
                 id: col.id,
@@ -3043,12 +2775,12 @@ export class WebMCPService extends Service {
                 requestsCount: col.requests.length,
               })
             )
-            return this.result("graphql-document", { collections })
+            return this.runtime.result("graphql-document", { collections })
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_gql_collection",
           title: "Inspect GraphQL collection or folder",
@@ -3057,15 +2789,15 @@ export class WebMCPService extends Service {
           inputSchema: inspectCollectionInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = inspectCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
@@ -3075,14 +2807,14 @@ export class WebMCPService extends Service {
               parsed.data.path.split("/").map((x) => parseInt(x, 10))
             )
             if (!target) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The requested collection or folder path was not found.",
                 "graphql-document"
               )
             }
-            const redactor = this.redactor()
-            return this.result("graphql-document", {
+            const redactor = this.runtime.redactor()
+            return this.runtime.result("graphql-document", {
               collection: {
                 name: redactor.scrub(target.name, 64),
                 path: parsed.data.path,
@@ -3105,7 +2837,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "save_gql_request_to_collection",
           title: "Save GraphQL request to collection",
@@ -3114,28 +2846,28 @@ export class WebMCPService extends Service {
           inputSchema: saveRequestToCollectionInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = saveRequestToCollectionParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
-            const gql = this.visibleGQL()
+            const gql = this.runtime.visibleGQL()
             if ("ok" in gql) return gql
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "graphql-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The request draft changed; inspect it again.",
                 "graphql-document",
@@ -3163,7 +2895,7 @@ export class WebMCPService extends Service {
               path.split("/").map((x) => parseInt(x, 10))
             )
             if (!target) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `Collection path ${path} not found.`,
                 "graphql-document"
@@ -3196,18 +2928,18 @@ export class WebMCPService extends Service {
                 cascadeParentCollectionForProperties(path, "graphql")
             }
 
-            this.activity.record({
+            this.runtime.activity.record({
               tool: "save_gql_request_to_collection",
               outcome: "changed",
               summary: `Saved GraphQL request '${reqToSave.name}' to collection ${path}`,
-              revision: this.context.revision("graphql-document"),
+              revision: this.runtime.context.revision("graphql-document"),
             })
             return this.gqlObservation()
           },
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "list_gql_history",
           title: "List GraphQL execution history",
@@ -3215,15 +2947,15 @@ export class WebMCPService extends Service {
           inputSchema: listHistoryInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = listHistoryParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
@@ -3233,7 +2965,7 @@ export class WebMCPService extends Service {
               parsed.data.offset,
               parsed.data.offset + parsed.data.limit
             )
-            const redactor = this.redactor()
+            const redactor = this.runtime.redactor()
             const entries = slice.map((entry, i) => ({
               index: parsed.data.offset + i,
               name: redactor.scrub(entry.request.name || "Untitled", 64),
@@ -3241,7 +2973,7 @@ export class WebMCPService extends Service {
               star: entry.star,
               updatedOn: entry.updatedOn ? entry.updatedOn.toISOString() : null,
             }))
-            return this.result("graphql-document", {
+            return this.runtime.result("graphql-document", {
               total: historyState.length,
               offset: parsed.data.offset,
               limit: parsed.data.limit,
@@ -3251,7 +2983,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "load_gql_history_entry",
           title: "Load GraphQL history entry into tab",
@@ -3260,26 +2992,26 @@ export class WebMCPService extends Service {
           inputSchema: loadHistoryEntryInputSchema,
           annotations: { readOnlyHint: false, untrustedContentHint: true },
           execute: async (input) => {
-            if (!this.validBoundary(input)) {
-              return this.failure(
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 "The input is not safe JSON data."
               )
             }
             const parsed = loadHistoryEntryParser.safeParse(input)
             if (!parsed.success) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 parsed.error.issues[0]?.message ?? "Invalid input"
               )
             }
             if (
-              !this.context.matches(
+              !this.runtime.context.matches(
                 "graphql-document",
                 parsed.data.expectedRevision
               )
             ) {
-              return this.failure(
+              return this.runtime.failure(
                 "STATE_CHANGED",
                 "The editor state changed; inspect it again.",
                 "graphql-document",
@@ -3289,7 +3021,7 @@ export class WebMCPService extends Service {
             const historyEntry =
               graphqlHistoryStore.value.state[parsed.data.index]
             if (!historyEntry) {
-              return this.failure(
+              return this.runtime.failure(
                 "INVALID_INPUT",
                 `GraphQL history entry at index ${parsed.data.index} not found.`,
                 "graphql-document"
@@ -3297,7 +3029,7 @@ export class WebMCPService extends Service {
             }
             const reqToLoad = cloneDeep(historyEntry.request)
             if (parsed.data.targetTab === "new") {
-              this.gqlTabs.createNewTab(
+              this.runtime.gqlTabs.createNewTab(
                 {
                   type: "graphql",
                   request: reqToLoad,
@@ -3308,10 +3040,10 @@ export class WebMCPService extends Service {
                 true
               )
             } else {
-              const gql = this.visibleGQL()
+              const gql = this.runtime.visibleGQL()
               if ("ok" in gql) return gql
               if (gql.tab.document.isDirty) {
-                return this.failure(
+                return this.runtime.failure(
                   "DIRTY_TAB_UNSAVED_CHANGES",
                   "The active tab has unsaved changes. Save it or choose targetTab: 'new'.",
                   "graphql-document"
@@ -3322,11 +3054,11 @@ export class WebMCPService extends Service {
               gql.tab.document.saveContext = undefined
               gql.tab.document.inheritedProperties = undefined
             }
-            this.activity.record({
+            this.runtime.activity.record({
               tool: "load_gql_history_entry",
               outcome: "changed",
               summary: `Loaded GraphQL history entry ${parsed.data.index}`,
-              revision: this.context.revision("graphql-document"),
+              revision: this.runtime.context.revision("graphql-document"),
             })
             return this.gqlObservation()
           },
@@ -3337,22 +3069,25 @@ export class WebMCPService extends Service {
   }
 
   private async readGraphQLPayload(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = graphqlPayloadParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
     const scope =
       parsed.data.source === "response"
         ? "graphql-response"
         : "graphql-document"
-    if (!this.context.matches(scope, parsed.data.expectedRevision)) {
-      return this.failure(
+    if (!this.runtime.context.matches(scope, parsed.data.expectedRevision)) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The payload changed; inspect it again.",
         scope,
@@ -3370,12 +3105,12 @@ export class WebMCPService extends Service {
             : ""
     const window = readSafeTextWindow(
       value,
-      this.redactor(),
+      this.runtime.redactor(),
       parsed.data.offset,
       parsed.data.maxChars,
       "redacted-utf16"
     )
-    return this.result(scope, {
+    return this.runtime.result(scope, {
       payload: {
         source: parsed.data.source,
         offset: window.offset,
@@ -3388,15 +3123,18 @@ export class WebMCPService extends Service {
   }
 
   private async searchGraphQLSchema(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = graphqlSchemaSearchParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
     const needle = parsed.data.query.toLocaleLowerCase()
     const matches = connection.schema
@@ -3408,27 +3146,33 @@ export class WebMCPService extends Service {
             kind: item.astNode?.kind ?? "type",
           }))
       : []
-    return this.result("graphql-document", {
+    return this.runtime.result("graphql-document", {
       schemaLoaded: Boolean(connection.schema),
       matches,
     })
   }
 
   private async editGraphQLOperation(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = editGraphQLOperationParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
     if (
-      !this.context.matches("graphql-document", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "graphql-document",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The GraphQL draft changed; inspect it again.",
         "graphql-document",
@@ -3452,15 +3196,15 @@ export class WebMCPService extends Service {
       }))
     const validated = HoppGQLRequest.safeParse(candidate)
     if (validated.type !== "ok")
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         "The patch does not produce a valid GraphQL request.",
         "graphql-document"
       )
     gql.tab.document.request = validated.value
     gql.tab.document.isDirty = true
-    const revision = this.context.revision("graphql-document")
-    this.activity.record({
+    const revision = this.runtime.context.revision("graphql-document")
+    this.runtime.activity.record({
       tool: "edit_graphql_operation",
       outcome: "changed",
       summary:
@@ -3471,7 +3215,7 @@ export class WebMCPService extends Service {
       revision,
     })
     const changedFields = Object.keys(parsed.data.patch)
-    return this.result("graphql-document", {
+    return this.runtime.result("graphql-document", {
       updated: true,
       changedFields,
       draft: {
@@ -3482,18 +3226,26 @@ export class WebMCPService extends Service {
   }
 
   private async editGraphQLVariables(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = editGraphQLVariablesParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
-    if (!this.context.matches("graphql-document", parsed.data.expectedRevision))
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "graphql-document",
+        parsed.data.expectedRevision
+      )
+    )
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The GraphQL draft changed; inspect it again.",
         "graphql-document",
@@ -3515,16 +3267,16 @@ export class WebMCPService extends Service {
       }
       const validated = HoppGQLRequest.safeParse(candidate)
       if (validated.type !== "ok")
-        return this.failure(
+        return this.runtime.failure(
           "INVALID_INPUT",
           "The variables edit does not produce a valid GraphQL request.",
           "graphql-document"
         )
       gql.tab.document.request = validated.value
       gql.tab.document.isDirty = true
-      const revision = this.context.revision("graphql-document")
+      const revision = this.runtime.context.revision("graphql-document")
       const token = gql.token
-      this.activity.record(
+      this.runtime.activity.record(
         {
           tool: "edit_graphql_variables",
           outcome: "changed",
@@ -3532,11 +3284,11 @@ export class WebMCPService extends Service {
           revision,
         },
         () => {
-          const current = this.context.captureVisibleGQL()
+          const current = this.runtime.context.captureVisibleGQL()
           if (
             !current ||
             current.token !== token ||
-            !this.context.matches("graphql-document", revision)
+            !this.runtime.context.matches("graphql-document", revision)
           )
             return false
           current.tab.document.request = original
@@ -3544,7 +3296,7 @@ export class WebMCPService extends Service {
           return true
         }
       )
-      return this.result("graphql-document", {
+      return this.runtime.result("graphql-document", {
         updated: true,
         changedFields: ["variables"],
         draft: {
@@ -3553,7 +3305,7 @@ export class WebMCPService extends Service {
         },
       })
     } catch (error) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         error instanceof Error
           ? error.message
@@ -3564,22 +3316,28 @@ export class WebMCPService extends Service {
   }
 
   private async configureGraphQLAuth(input: Record<string, unknown>) {
-    if (!this.validBoundary(input)) {
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input)) {
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     }
     const parsed = configureRESTAuthParser.safeParse(input)
     if (!parsed.success) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
     }
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
     if (
-      !this.context.matches("graphql-document", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "graphql-document",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The GraphQL draft changed; inspect it again.",
         "graphql-document",
@@ -3593,13 +3351,13 @@ export class WebMCPService extends Service {
         auth: configureGQLAuth(gql.tab.document.request.auth, configuration),
       }
       gql.tab.document.isDirty = true
-      this.activity.record({
+      this.runtime.activity.record({
         tool: "configure_graphql_auth",
         outcome: "changed",
         summary: `Configured GraphQL ${configuration.authType} authorization`,
-        revision: this.context.revision("graphql-document"),
+        revision: this.runtime.context.revision("graphql-document"),
       })
-      return this.result("graphql-document", {
+      return this.runtime.result("graphql-document", {
         updated: true,
         changedFields: ["auth"],
         draft: {
@@ -3608,7 +3366,7 @@ export class WebMCPService extends Service {
         },
       })
     } catch (error) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         error instanceof Error ? error.message : "Invalid authorization",
         "graphql-document"
@@ -3621,20 +3379,26 @@ export class WebMCPService extends Service {
     signal: AbortSignal,
     action: "connect" | "disconnect" | "execute" | "subscribe" | "unsubscribe"
   ) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = executeRESTRequestParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const gql = this.visibleGQL()
+    const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
     if (
-      !this.context.matches("graphql-document", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "graphql-document",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The GraphQL draft changed; inspect it again.",
         "graphql-document",
@@ -3643,24 +3407,28 @@ export class WebMCPService extends Service {
     }
     const consequential =
       action === "connect" || action === "execute" || action === "subscribe"
-    const appContext = this.context.capture()
-    const appContextRevision = this.context.revision("app-context")
-    const dependencyRevision = this.context.revision("rest-document")
+    const appContext = this.runtime.context.capture()
+    const appContextRevision = this.runtime.context.revision("app-context")
+    const dependencyRevision = this.runtime.context.revision("rest-document")
     const executeAction = async () => {
       try {
         if (action === "connect")
-          await this.gqlExecution.connect(gql.tab, signal)
-        else if (action === "disconnect") this.gqlExecution.disconnect()
+          await this.runtime.gqlExecution.connect(gql.tab, signal)
+        else if (action === "disconnect") this.runtime.gqlExecution.disconnect()
         else if (action === "execute")
-          await this.gqlExecution.executeConnected(gql.tab, null, signal)
+          await this.runtime.gqlExecution.executeConnected(
+            gql.tab,
+            null,
+            signal
+          )
         else if (action === "subscribe")
-          this.gqlExecution.startSubscriptionConnected(gql.tab, signal)
-        else this.gqlExecution.stopSubscription()
-        this.activity.record({
+          this.runtime.gqlExecution.startSubscriptionConnected(gql.tab, signal)
+        else this.runtime.gqlExecution.stopSubscription()
+        this.runtime.activity.record({
           tool: `${action}_graphql`,
           outcome: action === "execute" ? "executed" : "changed",
           summary: `GraphQL ${action}`,
-          revision: this.context.revision("graphql-document"),
+          revision: this.runtime.context.revision("graphql-document"),
         })
         return this.gqlObservation()
       } catch (error) {
@@ -3669,13 +3437,13 @@ export class WebMCPService extends Service {
           (error instanceof Error &&
             error.message.toLowerCase().includes("cancelled"))
         ) {
-          return this.failure(
+          return this.runtime.failure(
             "CANCELLED",
             "The GraphQL action was cancelled.",
             "graphql-document"
           )
         }
-        return this.failure(
+        return this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "GraphQL action failed.",
           "graphql-document"
@@ -3684,20 +3452,19 @@ export class WebMCPService extends Service {
     }
     if (!consequential) return executeAction()
     return runWebMCPExecution({
-      approval: this.approval,
+      approval: this.runtime.approval,
       request: {
         action: `${action === "execute" ? "Execute" : action === "subscribe" ? "Start" : "Connect"} GraphQL`,
         method: "POST",
-        target: this.redactor().scrub(
-          safeTarget(gql.tab.document.request.url),
-          256
-        ),
+        target: this.runtime
+          .redactor()
+          .scrub(safeTarget(gql.tab.document.request.url), 256),
         environment: appContext.environment.name,
         workspace: appContext.workspace.type,
         grantKey: approvalIdentity({
           operation: "graphql",
           environmentScope: getSelectedEnvironmentType(),
-          workspaceID: this.workspace.currentWorkspace.value,
+          workspaceID: this.runtime.workspace.currentWorkspace.value,
           environmentID: getCurrentEnvironment().id,
           scope: action,
           revision: parsed.data.expectedRevision,
@@ -3709,21 +3476,28 @@ export class WebMCPService extends Service {
       signal,
       capture: () => ({
         token: gql.token,
-        revision: this.context.revision("graphql-document"),
+        revision: this.runtime.context.revision("graphql-document"),
         appContextRevision,
         dependencyRevision,
         environment: appContext.environment.name,
         workspace: appContext.workspace.type,
       }),
       revalidate: (snapshot) =>
-        this.context.matches("graphql-document", snapshot.revision) &&
-        this.context.matches("app-context", snapshot.appContextRevision) &&
-        this.context.matches("rest-document", snapshot.dependencyRevision) &&
-        this.context.captureVisibleGQL()?.token === snapshot.token &&
-        this.context.capture().environment.name === snapshot.environment &&
-        this.context.capture().workspace.type === snapshot.workspace,
+        this.runtime.context.matches("graphql-document", snapshot.revision) &&
+        this.runtime.context.matches(
+          "app-context",
+          snapshot.appContextRevision
+        ) &&
+        this.runtime.context.matches(
+          "rest-document",
+          snapshot.dependencyRevision
+        ) &&
+        this.runtime.context.captureVisibleGQL()?.token === snapshot.token &&
+        this.runtime.context.capture().environment.name ===
+          snapshot.environment &&
+        this.runtime.context.capture().workspace.type === snapshot.workspace,
       denied: (cancelled) =>
-        this.failure(
+        this.runtime.failure(
           cancelled ? "CANCELLED" : "APPROVAL_DENIED",
           cancelled
             ? "The action was cancelled."
@@ -3731,14 +3505,14 @@ export class WebMCPService extends Service {
           "graphql-document"
         ),
       stale: () =>
-        this.failure(
+        this.runtime.failure(
           "STATE_CHANGED",
           "The GraphQL draft changed while approval was open.",
           "graphql-document",
           true
         ),
       error: (error) =>
-        this.failure(
+        this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "GraphQL action failed.",
           "graphql-document"
@@ -3747,22 +3521,11 @@ export class WebMCPService extends Service {
     })
   }
 
-  private visibleRealtime(mode: RealtimeMode) {
-    return this.context.realtimeMode() === mode
-      ? true
-      : this.failure(
-          "NO_ACTIVE_REALTIME_SESSION",
-          "The requested realtime session is no longer visible.",
-          "app-context",
-          true
-        )
-  }
-
   private async realtimeObservation(mode: RealtimeMode) {
-    const visible = this.visibleRealtime(mode)
+    const visible = this.runtime.visibleRealtime(mode)
     if (visible !== true) return visible
-    const snapshot = await this.realtime.snapshot(mode)
-    const redactor = this.redactor()
+    const snapshot = await this.runtime.realtime.snapshot(mode)
+    const redactor = this.runtime.redactor()
     const configurationDiagnostics: Array<Record<string, unknown>> = []
     try {
       new URL(snapshot.endpoint)
@@ -3811,7 +3574,7 @@ export class WebMCPService extends Service {
               : ""
       }
     }
-    return this.result("realtime-session", {
+    return this.runtime.result("realtime-session", {
       session: {
         mode,
         endpoint: redactor.scrub(snapshot.endpoint, 128),
@@ -3833,7 +3596,7 @@ export class WebMCPService extends Service {
 
   private async registerRealtimePack(mode: RealtimeMode, signal: AbortSignal) {
     const common = [
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "inspect_realtime_session",
           title: "Inspect realtime session",
@@ -3842,16 +3605,16 @@ export class WebMCPService extends Service {
           inputSchema: emptyInputSchema,
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) =>
-            this.validBoundary(input) && Object.keys(input).length === 0
+            this.runtime.validBoundary(input) && Object.keys(input).length === 0
               ? this.realtimeObservation(mode)
-              : this.failure(
+              : this.runtime.failure(
                   "INVALID_INPUT",
                   "This tool accepts an empty object only."
                 ),
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "edit_realtime_session",
           title: "Edit realtime session",
@@ -3863,7 +3626,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "connect_realtime",
           title: "Connect realtime session",
@@ -3876,7 +3639,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "disconnect_realtime",
           title: "Disconnect realtime session",
@@ -3893,7 +3656,7 @@ export class WebMCPService extends Service {
         },
         signal
       ),
-      this.adapter.register(
+      this.runtime.adapter.register(
         {
           name: "read_realtime_log",
           title: "Read realtime log window",
@@ -3908,7 +3671,7 @@ export class WebMCPService extends Service {
     ]
     if (mode === "websocket" || mode === "socketio") {
       common.push(
-        this.adapter.register(
+        this.runtime.adapter.register(
           {
             name: "send_realtime_message",
             title: "Send realtime message",
@@ -3942,7 +3705,7 @@ export class WebMCPService extends Service {
         ],
       ] as const) {
         common.push(
-          this.adapter.register(
+          this.runtime.adapter.register(
             {
               name,
               title: description.slice(0, 48),
@@ -3964,20 +3727,26 @@ export class WebMCPService extends Service {
     mode: RealtimeMode,
     input: Record<string, unknown>
   ) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = editRealtimeSessionParser(mode).safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const visible = this.visibleRealtime(mode)
+    const visible = this.runtime.visibleRealtime(mode)
     if (visible !== true) return visible
     if (
-      !this.context.matches("realtime-session", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "realtime-session",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The realtime session changed; inspect it again.",
         "realtime-session",
@@ -3985,14 +3754,14 @@ export class WebMCPService extends Service {
       )
     }
     const fields = Object.keys(parsed.data.patch)
-    await this.realtime.edit(mode, parsed.data.patch)
-    this.activity.record({
+    await this.runtime.realtime.edit(mode, parsed.data.patch)
+    this.runtime.activity.record({
       tool: "edit_realtime_session",
       outcome: "changed",
       summary: `Changed ${mode} ${fields.join(", ")}`.slice(0, 256),
-      revision: this.context.revision("realtime-session"),
+      revision: this.runtime.context.revision("realtime-session"),
     })
-    return this.result("realtime-session", {
+    return this.runtime.result("realtime-session", {
       updated: true,
       changedFields: fields,
     })
@@ -4002,28 +3771,34 @@ export class WebMCPService extends Service {
     mode: RealtimeMode,
     input: Record<string, unknown>
   ) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = realtimeLogParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const visible = this.visibleRealtime(mode)
+    const visible = this.runtime.visibleRealtime(mode)
     if (visible !== true) return visible
     if (
-      !this.context.matches("realtime-session", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "realtime-session",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The realtime log changed; inspect it again.",
         "realtime-session",
         true
       )
     }
-    const snapshot = await this.realtime.snapshot(mode)
-    const redactor = this.redactor()
+    const snapshot = await this.runtime.realtime.snapshot(mode)
+    const redactor = this.runtime.redactor()
     const entries = snapshot.log
       .slice(parsed.data.offset, parsed.data.offset + parsed.data.limit)
       .map((line) => ({
@@ -4032,7 +3807,7 @@ export class WebMCPService extends Service {
         payload: redactor.scrub(line.payload, 256),
         timestamp: line.ts,
       }))
-    return this.result("realtime-session", {
+    return this.runtime.result("realtime-session", {
       log: {
         offset: parsed.data.offset,
         entries,
@@ -4054,8 +3829,11 @@ export class WebMCPService extends Service {
     input: Record<string, unknown>,
     signal: AbortSignal
   ) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parser =
       action === "send"
         ? realtimeMessageParser
@@ -4066,16 +3844,19 @@ export class WebMCPService extends Service {
           : executeRESTRequestParser
     const parsed = parser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const visible = this.visibleRealtime(mode)
+    const visible = this.runtime.visibleRealtime(mode)
     if (visible !== true) return visible
     if (
-      !this.context.matches("realtime-session", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "realtime-session",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The realtime session changed; inspect it again.",
         "realtime-session",
@@ -4083,11 +3864,11 @@ export class WebMCPService extends Service {
       )
     }
     const consequential = action !== "disconnect"
-    const appContext = this.context.capture()
-    const appContextRevision = this.context.revision("app-context")
-    const dependencyRevision = this.context.revision("rest-document")
-    const realtimeRevision = this.context.revision("realtime-session")
-    const snapshot = await this.realtime.snapshot(mode)
+    const appContext = this.runtime.context.capture()
+    const appContextRevision = this.runtime.context.revision("app-context")
+    const dependencyRevision = this.runtime.context.revision("rest-document")
+    const realtimeRevision = this.runtime.context.revision("realtime-session")
+    const snapshot = await this.runtime.realtime.snapshot(mode)
     const typedMessage =
       action === "send" ? realtimeMessageParser.parse(input) : null
     const typedTopic =
@@ -4105,7 +3886,7 @@ export class WebMCPService extends Service {
             JSON.parse(message)
           } catch (error) {
             actionDiagnostics.push({
-              ...diagnosticForError(error, this.redactor(), {
+              ...diagnosticForError(error, this.runtime.redactor(), {
                 code: "MALFORMED_JSON_MESSAGE",
                 phase: "payload",
                 location: "message",
@@ -4115,11 +3896,12 @@ export class WebMCPService extends Service {
           }
         }
         if (action === "connect") {
-          await this.realtime.connect(mode, signal)
-        } else if (action === "disconnect") await this.realtime.disconnect(mode)
+          await this.runtime.realtime.connect(mode, signal)
+        } else if (action === "disconnect")
+          await this.runtime.realtime.disconnect(mode)
         else if (action === "send") {
           const message = realtimeMessageParser.parse(input)
-          await this.realtime.send(
+          await this.runtime.realtime.send(
             mode as "websocket" | "socketio",
             message.message,
             message.eventName
@@ -4127,23 +3909,26 @@ export class WebMCPService extends Service {
         } else {
           const topic = mqttTopicParser.parse(input)
           if (action === "publish")
-            await this.realtime.publish(topic.topic, topic.message ?? "")
+            await this.runtime.realtime.publish(
+              topic.topic,
+              topic.message ?? ""
+            )
           else if (action === "subscribe")
-            await this.realtime.subscribe(topic.topic, topic.qos)
-          else await this.realtime.unsubscribe(topic.topic)
+            await this.runtime.realtime.subscribe(topic.topic, topic.qos)
+          else await this.runtime.realtime.unsubscribe(topic.topic)
         }
-        this.activity.record({
+        this.runtime.activity.record({
           tool: `${action}_${mode}`,
           outcome: consequential ? "executed" : "changed",
           summary: `${action} ${mode}`.slice(0, 256),
-          revision: this.context.revision("realtime-session"),
+          revision: this.runtime.context.revision("realtime-session"),
         })
         const observation = await this.realtimeObservation(mode)
         return observation.ok
           ? { ...observation, actionDiagnostics }
           : observation
       } catch (error) {
-        return this.failure(
+        return this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "Realtime action failed.",
           "realtime-session"
@@ -4152,17 +3937,19 @@ export class WebMCPService extends Service {
     }
     if (!consequential) return executeAction()
     return runWebMCPExecution({
-      approval: this.approval,
+      approval: this.runtime.approval,
       request: {
         action: `${action[0].toUpperCase()}${action.slice(1)} ${mode}`,
         method: action.toUpperCase(),
-        target: this.redactor().scrub(safeTarget(snapshot.endpoint), 256),
+        target: this.runtime
+          .redactor()
+          .scrub(safeTarget(snapshot.endpoint), 256),
         environment: appContext.environment.name,
         workspace: appContext.workspace.type,
         grantKey: approvalIdentity({
           operation: "realtime",
           environmentScope: getSelectedEnvironmentType(),
-          workspaceID: this.workspace.currentWorkspace.value,
+          workspaceID: this.runtime.workspace.currentWorkspace.value,
           environmentID: getCurrentEnvironment().id,
           scope: mode,
           revision: parsed.data.expectedRevision,
@@ -4188,14 +3975,21 @@ export class WebMCPService extends Service {
         workspace: appContext.workspace.type,
       }),
       revalidate: (captured) =>
-        this.context.matches("realtime-session", captured.revision) &&
-        this.context.matches("app-context", captured.appContextRevision) &&
-        this.context.matches("rest-document", captured.dependencyRevision) &&
-        this.visibleRealtime(mode) === true &&
-        this.context.capture().environment.name === captured.environment &&
-        this.context.capture().workspace.type === captured.workspace,
+        this.runtime.context.matches("realtime-session", captured.revision) &&
+        this.runtime.context.matches(
+          "app-context",
+          captured.appContextRevision
+        ) &&
+        this.runtime.context.matches(
+          "rest-document",
+          captured.dependencyRevision
+        ) &&
+        this.runtime.visibleRealtime(mode) === true &&
+        this.runtime.context.capture().environment.name ===
+          captured.environment &&
+        this.runtime.context.capture().workspace.type === captured.workspace,
       denied: (cancelled) =>
-        this.failure(
+        this.runtime.failure(
           cancelled ? "CANCELLED" : "APPROVAL_DENIED",
           cancelled
             ? "The action was cancelled."
@@ -4203,14 +3997,14 @@ export class WebMCPService extends Service {
           "realtime-session"
         ),
       stale: () =>
-        this.failure(
+        this.runtime.failure(
           "STATE_CHANGED",
           "The realtime session changed while approval was open.",
           "realtime-session",
           true
         ),
       error: (error) =>
-        this.failure(
+        this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "Realtime action failed.",
           "realtime-session"
@@ -4220,15 +4014,18 @@ export class WebMCPService extends Service {
   }
 
   private async inspectEnvironment(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = inspectEnvironmentParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
     const referencedNames = parsed.data.referencedOnly
       ? new Set(
@@ -4239,29 +4036,35 @@ export class WebMCPService extends Service {
           ].map((match) => match[1])
         )
       : undefined
-    const environment = this.environments.inspectSelected(referencedNames)
-    const redactor = this.redactor()
+    const environment =
+      this.runtime.environments.inspectSelected(referencedNames)
+    const redactor = this.runtime.redactor()
     environment.name = redactor.scrub(environment.name, 64)
     environment.variables = environment.variables.map((variable) => ({
       ...variable,
       name: redactor.scrub(variable.name, 64),
     }))
-    return this.result("rest-document", { environment })
+    return this.runtime.result("rest-document", { environment })
   }
 
   private async selectEnvironment(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = selectEnvironmentParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("app-context", parsed.data.expectedRevision)) {
-      return this.failure(
+    if (
+      !this.runtime.context.matches("app-context", parsed.data.expectedRevision)
+    ) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The app context changed; list environments again.",
         "app-context",
@@ -4270,21 +4073,20 @@ export class WebMCPService extends Service {
     }
 
     const original = cloneDeep(getSelectedEnvironmentIndex())
-    if (!this.environments.select(parsed.data.environmentHandle)) {
-      return this.failure(
+    if (!this.runtime.environments.select(parsed.data.environmentHandle)) {
+      return this.runtime.failure(
         "ENVIRONMENT_NOT_FOUND",
         "The environment handle is no longer available; list environments again.",
         "app-context",
         true
       )
     }
-    const resultingRevision = this.context.revision("app-context")
+    const resultingRevision = this.runtime.context.revision("app-context")
     const token = rest.token
-    const selectedName = this.redactor().scrub(
-      this.context.capture().environment.name,
-      64
-    )
-    this.activity.record(
+    const selectedName = this.runtime
+      .redactor()
+      .scrub(this.runtime.context.capture().environment.name, 64)
+    this.runtime.activity.record(
       {
         tool: "select_environment",
         outcome: "changed",
@@ -4293,38 +4095,47 @@ export class WebMCPService extends Service {
       },
       () => {
         if (
-          this.context.captureVisibleREST()?.token !== token ||
-          !this.context.matches("app-context", resultingRevision)
+          this.runtime.context.captureVisibleREST()?.token !== token ||
+          !this.runtime.context.matches("app-context", resultingRevision)
         )
           return false
         setSelectedEnvironmentIndex(original)
         return true
       }
     )
-    return this.result("app-context", { selected: true })
+    return this.runtime.result("app-context", { selected: true })
   }
 
   private async createEnvironment(
     input: Record<string, unknown>,
     executionSignal?: AbortSignal
   ) {
-    if (!this.validBoundary(input)) {
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input)) {
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     }
     const parsed = createEnvironmentParser.safeParse(input)
     if (!parsed.success) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
     }
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
     if (
-      !this.context.matches("app-context", parsed.data.expectedRevision) &&
-      !this.context.matches("rest-document", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "app-context",
+        parsed.data.expectedRevision
+      ) &&
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The application context changed; inspect it again.",
         "app-context",
@@ -4334,8 +4145,8 @@ export class WebMCPService extends Service {
 
     const hasSecrets = parsed.data.variables.some((v) => v.secret)
     const isTeam = parsed.data.scope === "team"
-    const currentEnvName = this.context.capture().environment.name
-    const workspaceType = this.context.capture().workspace.type
+    const currentEnvName = this.runtime.context.capture().environment.name
+    const workspaceType = this.runtime.context.capture().workspace.type
 
     const executeCreation = async () => {
       let created: {
@@ -4347,24 +4158,24 @@ export class WebMCPService extends Service {
       }
 
       if (parsed.data.scope === "personal") {
-        created = this.environments.createPersonal(
+        created = this.runtime.environments.createPersonal(
           parsed.data.name,
           parsed.data.variables
         )
       } else {
-        const res = await this.environments.createTeam(
+        const res = await this.runtime.environments.createTeam(
           parsed.data.name,
           parsed.data.variables
         )
         if ("error" in res) {
           if (res.error === "PERMISSION_DENIED") {
-            return this.failure(
+            return this.runtime.failure(
               "PERMISSION_DENIED",
               "You do not have permission to create team environments.",
               "app-context"
             )
           }
-          return this.failure(
+          return this.runtime.failure(
             "INVALID_INPUT",
             `Failed to create team environment: ${res.error}`,
             "app-context"
@@ -4373,17 +4184,17 @@ export class WebMCPService extends Service {
         created = res
       }
 
-      const resultingRevision = this.context.revision("app-context")
-      this.activity.record({
+      const resultingRevision = this.runtime.context.revision("app-context")
+      this.runtime.activity.record({
         tool: "create_environment",
         outcome: "changed",
         summary: `Created ${parsed.data.scope} environment '${created.name}' with ${created.variableCount} variables`,
         revision: resultingRevision,
       })
 
-      return this.result("app-context", {
+      return this.runtime.result("app-context", {
         environmentHandle: created.handle,
-        name: this.redactor().scrub(created.name, 64),
+        name: this.runtime.redactor().scrub(created.name, 64),
         scope: parsed.data.scope,
         variableCount: created.variableCount,
         secretVariableCount: created.secretVariableCount,
@@ -4392,27 +4203,29 @@ export class WebMCPService extends Service {
     }
     if (!isTeam && !hasSecrets)
       return runWebMCPExecution({
-        approval: this.approval,
+        approval: this.runtime.approval,
         request: null,
         signal: executionSignal ?? new AbortController().signal,
-        capture: () => ({ revision: this.context.revision("app-context") }),
+        capture: () => ({
+          revision: this.runtime.context.revision("app-context"),
+        }),
         revalidate: (snapshot) =>
-          this.context.matches("app-context", snapshot.revision),
+          this.runtime.context.matches("app-context", snapshot.revision),
         denied: (cancelled) =>
-          this.failure(
+          this.runtime.failure(
             cancelled ? "CANCELLED" : "APPROVAL_DENIED",
             cancelled ? "The action was cancelled." : "The action was denied.",
             "app-context"
           ),
         stale: () =>
-          this.failure(
+          this.runtime.failure(
             "STATE_CHANGED",
             "The application context changed.",
             "app-context",
             true
           ),
         error: (error) =>
-          this.failure(
+          this.runtime.failure(
             "EXECUTION_FAILED",
             error instanceof Error
               ? error.message
@@ -4422,7 +4235,7 @@ export class WebMCPService extends Service {
         execute: () => executeCreation(),
       })
     return runWebMCPExecution({
-      approval: this.approval,
+      approval: this.runtime.approval,
       request: {
         action: isTeam
           ? "CREATE team environment"
@@ -4434,9 +4247,9 @@ export class WebMCPService extends Service {
         grantKey: approvalIdentity({
           operation: "create_environment",
           environmentScope: getSelectedEnvironmentType(),
-          workspaceID: this.workspace.currentWorkspace.value,
+          workspaceID: this.runtime.workspace.currentWorkspace.value,
           scope: parsed.data.scope,
-          revision: this.context.revision("app-context"),
+          revision: this.runtime.context.revision("app-context"),
           target: parsed.data.name,
         }),
         description: hasSecrets
@@ -4444,11 +4257,13 @@ export class WebMCPService extends Service {
           : `Create team environment '${parsed.data.name}' in team workspace`,
       },
       signal: executionSignal ?? new AbortController().signal,
-      capture: () => ({ revision: this.context.revision("app-context") }),
+      capture: () => ({
+        revision: this.runtime.context.revision("app-context"),
+      }),
       revalidate: (snapshot) =>
-        this.context.matches("app-context", snapshot.revision),
+        this.runtime.context.matches("app-context", snapshot.revision),
       denied: (cancelled) =>
-        this.failure(
+        this.runtime.failure(
           cancelled ? "CANCELLED" : "APPROVAL_DENIED",
           cancelled
             ? "The action was cancelled."
@@ -4456,14 +4271,14 @@ export class WebMCPService extends Service {
           "app-context"
         ),
       stale: () =>
-        this.failure(
+        this.runtime.failure(
           "STATE_CHANGED",
           "The application context changed while approval was open.",
           "app-context",
           true
         ),
       error: (error) =>
-        this.failure(
+        this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error
             ? error.message
@@ -4478,23 +4293,32 @@ export class WebMCPService extends Service {
     input: Record<string, unknown>,
     executionSignal?: AbortSignal
   ) {
-    if (!this.validBoundary(input)) {
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input)) {
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     }
     const parsed = editEnvironmentVariablesParser.safeParse(input)
     if (!parsed.success) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
     }
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
     if (
-      !this.context.matches("app-context", parsed.data.expectedRevision) &&
-      !this.context.matches("rest-document", parsed.data.expectedRevision)
+      !this.runtime.context.matches(
+        "app-context",
+        parsed.data.expectedRevision
+      ) &&
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
     ) {
-      return this.failure(
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The application context changed; inspect it again.",
         "app-context",
@@ -4502,13 +4326,13 @@ export class WebMCPService extends Service {
       )
     }
 
-    const appContextRevision = this.context.revision("app-context")
-    const dependencyRevision = this.context.revision("rest-document")
-    const choice = await this.environments.resolveHandle(
+    const appContextRevision = this.runtime.context.revision("app-context")
+    const dependencyRevision = this.runtime.context.revision("rest-document")
+    const choice = await this.runtime.environments.resolveHandle(
       parsed.data.environmentHandle
     )
     if (!choice || !choice.environment) {
-      return this.failure(
+      return this.runtime.failure(
         "ENVIRONMENT_NOT_FOUND",
         "The environment handle is no longer available; list environments again.",
         "app-context",
@@ -4517,7 +4341,7 @@ export class WebMCPService extends Service {
     }
 
     if (!choice.editable) {
-      return this.failure(
+      return this.runtime.failure(
         "PERMISSION_DENIED",
         "You do not have permission to edit this environment.",
         "app-context"
@@ -4532,25 +4356,29 @@ export class WebMCPService extends Service {
           choice.environment?.variables.find((v) => v.key === op.key)?.secret)
     )
     const isTeam = choice.scope === "team"
-    const currentEnvName = this.context.capture().environment.name
-    const workspaceType = this.context.capture().workspace.type
+    const currentEnvName = this.runtime.context.capture().environment.name
+    const workspaceType = this.runtime.context.capture().workspace.type
 
     const executeEdit = async () => {
-      const res = await this.environments.mutateVariables(
+      const res = await this.runtime.environments.mutateVariables(
         parsed.data.environmentHandle,
         parsed.data.operations
       )
 
       if (!res.ok) {
         if (res.code === "PERMISSION_DENIED") {
-          return this.failure("PERMISSION_DENIED", res.error, "app-context")
+          return this.runtime.failure(
+            "PERMISSION_DENIED",
+            res.error,
+            "app-context"
+          )
         }
-        return this.failure("INVALID_INPUT", res.error, "app-context")
+        return this.runtime.failure("INVALID_INPUT", res.error, "app-context")
       }
 
-      const resultingRevision = this.context.revision("app-context")
-      const envName = this.redactor().scrub(res.environmentName, 64)
-      this.activity.record(
+      const resultingRevision = this.runtime.context.revision("app-context")
+      const envName = this.runtime.redactor().scrub(res.environmentName, 64)
+      this.runtime.activity.record(
         {
           tool: "edit_environment_variables",
           outcome: "changed",
@@ -4563,10 +4391,12 @@ export class WebMCPService extends Service {
         }
       )
 
-      return this.result("app-context", {
+      return this.runtime.result("app-context", {
         environmentHandle: parsed.data.environmentHandle,
         environmentName: envName,
-        updatedKeys: res.updatedKeys.map((k) => this.redactor().scrub(k, 64)),
+        updatedKeys: res.updatedKeys.map((k) =>
+          this.runtime.redactor().scrub(k, 64)
+        ),
         variableCount: res.variableCount,
         secretVariableCount: res.secretVariableCount,
         valuesOmitted: true,
@@ -4574,7 +4404,7 @@ export class WebMCPService extends Service {
     }
     if (!isTeam && !hasSecretOps)
       return runWebMCPExecution({
-        approval: this.approval,
+        approval: this.runtime.approval,
         request: null,
         signal: executionSignal ?? new AbortController().signal,
         capture: () => ({
@@ -4583,24 +4413,27 @@ export class WebMCPService extends Service {
           dependencyRevision,
         }),
         revalidate: (snapshot) =>
-          this.context.matches("app-context", snapshot.revision) &&
-          this.context.matches("rest-document", snapshot.dependencyRevision) &&
+          this.runtime.context.matches("app-context", snapshot.revision) &&
+          this.runtime.context.matches(
+            "rest-document",
+            snapshot.dependencyRevision
+          ) &&
           snapshot.choice.environment?.id === choice.environment?.id,
         denied: (cancelled) =>
-          this.failure(
+          this.runtime.failure(
             cancelled ? "CANCELLED" : "APPROVAL_DENIED",
             cancelled ? "The action was cancelled." : "The action was denied.",
             "app-context"
           ),
         stale: () =>
-          this.failure(
+          this.runtime.failure(
             "STATE_CHANGED",
             "The environment changed.",
             "app-context",
             true
           ),
         error: (error) =>
-          this.failure(
+          this.runtime.failure(
             "EXECUTION_FAILED",
             error instanceof Error ? error.message : "Environment edit failed",
             "app-context"
@@ -4609,7 +4442,7 @@ export class WebMCPService extends Service {
       })
     const keysAffected = parsed.data.operations.map((o) => o.key).join(", ")
     return runWebMCPExecution({
-      approval: this.approval,
+      approval: this.runtime.approval,
       request: {
         action: isTeam
           ? "EDIT team environment variables"
@@ -4621,7 +4454,7 @@ export class WebMCPService extends Service {
         grantKey: approvalIdentity({
           operation: "edit_environment_variables",
           environmentScope: getSelectedEnvironmentType(),
-          workspaceID: this.workspace.currentWorkspace.value,
+          workspaceID: this.runtime.workspace.currentWorkspace.value,
           environmentID: choice.environment.id,
           revision: appContextRevision,
           details: { keys: keysAffected },
@@ -4637,11 +4470,14 @@ export class WebMCPService extends Service {
         dependencyRevision,
       }),
       revalidate: (snapshot) =>
-        this.context.matches("app-context", snapshot.revision) &&
-        this.context.matches("rest-document", snapshot.dependencyRevision) &&
+        this.runtime.context.matches("app-context", snapshot.revision) &&
+        this.runtime.context.matches(
+          "rest-document",
+          snapshot.dependencyRevision
+        ) &&
         snapshot.choice.environment?.id === choice.environment?.id,
       denied: (cancelled) =>
-        this.failure(
+        this.runtime.failure(
           cancelled ? "CANCELLED" : "APPROVAL_DENIED",
           cancelled
             ? "The action was cancelled."
@@ -4649,14 +4485,14 @@ export class WebMCPService extends Service {
           "app-context"
         ),
       stale: () =>
-        this.failure(
+        this.runtime.failure(
           "STATE_CHANGED",
           "The environment changed while approval was open.",
           "app-context",
           true
         ),
       error: (error) =>
-        this.failure(
+        this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "Environment edit failed",
           "app-context"
@@ -4666,20 +4502,28 @@ export class WebMCPService extends Service {
   }
 
   private async editRESTRequest(input: Record<string, unknown>) {
-    if (!this.validBoundary(input)) {
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input)) {
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     }
     const parsed = editRESTRequestParser.safeParse(input)
     if (!parsed.success) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
     }
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    ) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -4710,7 +4554,7 @@ export class WebMCPService extends Service {
 
     const validated = HoppRESTRequest.safeParse(candidate)
     if (validated.type !== "ok") {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         "The patch does not produce a valid REST request.",
         "rest-document"
@@ -4720,9 +4564,9 @@ export class WebMCPService extends Service {
     rest.tab.document.request = validated.value
     rest.tab.document.isDirty = true
     const changedFields = Object.keys(patch)
-    const resultingRevision = this.context.revision("rest-document")
+    const resultingRevision = this.runtime.context.revision("rest-document")
     const token = rest.token
-    this.activity.record(
+    this.runtime.activity.record(
       {
         tool: "edit_rest_request",
         outcome: "changed",
@@ -4730,11 +4574,11 @@ export class WebMCPService extends Service {
         revision: resultingRevision,
       },
       () => {
-        const current = this.context.captureVisibleREST()
+        const current = this.runtime.context.captureVisibleREST()
         if (
           !current ||
           current.token !== token ||
-          !this.context.matches("rest-document", resultingRevision)
+          !this.runtime.context.matches("rest-document", resultingRevision)
         )
           return false
         current.tab.document.request = originalRequest
@@ -4743,7 +4587,7 @@ export class WebMCPService extends Service {
       }
     )
 
-    return this.result("rest-document", {
+    return this.runtime.result("rest-document", {
       updated: true,
       changedFields,
       draft: {
@@ -4754,18 +4598,26 @@ export class WebMCPService extends Service {
   }
 
   private async configureRESTAuth(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = configureRESTAuthParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    ) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -4790,7 +4642,7 @@ export class WebMCPService extends Service {
         ["auth"]
       )
     } catch (error) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         error instanceof Error ? error.message : "Invalid authorization",
         "rest-document"
@@ -4799,18 +4651,26 @@ export class WebMCPService extends Service {
   }
 
   private async editRESTVariables(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = editRESTVariablesParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    ) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -4830,7 +4690,7 @@ export class WebMCPService extends Service {
         ["requestVariables"]
       )
     } catch (error) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         error instanceof Error ? error.message : "Invalid request variables",
         "rest-document"
@@ -4839,18 +4699,26 @@ export class WebMCPService extends Service {
   }
 
   private async editRESTScripts(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = editRESTScriptsParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    ) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -4872,7 +4740,7 @@ export class WebMCPService extends Service {
         [field]
       )
     } catch (error) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         error instanceof Error ? error.message : "Invalid request script",
         "rest-document"
@@ -4971,7 +4839,7 @@ export class WebMCPService extends Service {
         new Function(source)
       } catch (error) {
         result.push({
-          ...diagnosticForError(error, this.redactor(), {
+          ...diagnosticForError(error, this.runtime.redactor(), {
             code: "JAVASCRIPT_SYNTAX",
             phase: "script",
             sourceHandle,
@@ -4983,46 +4851,11 @@ export class WebMCPService extends Service {
     return result
   }
 
-  private async getSkill(input: Record<string, unknown>) {
-    if (!this.validBoundary(input)) {
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
-    }
-    const parsed = getSkillParser.safeParse(input)
-    if (!parsed.success) {
-      return this.failure(
-        "INVALID_INPUT",
-        parsed.error.issues[0]?.message ?? "Invalid input"
-      )
-    }
-
-    if (!parsed.data.name || parsed.data.name.toLowerCase() === "list") {
-      return this.result("app-context", {
-        skills: listSkills(),
-      })
-    }
-
-    const skill = findSkill(parsed.data.name)
-    if (!skill) {
-      const available = listSkills()
-        .map((s) => `'${s.name}'`)
-        .join(", ")
-      return this.failure(
-        "INVALID_INPUT",
-        `Skill '${parsed.data.name}' not found. Available skills: ${available}.`,
-        "app-context"
-      )
-    }
-
-    return this.result("app-context", {
-      skill,
-    })
-  }
-
   private async inspectRESTScripting() {
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
     const sources = this.scriptSources(rest)
-    return this.result("rest-document", {
+    return this.runtime.result("rest-document", {
       executionMode: "javascript",
       scripts: sources.map(({ handle, origin, phase, source }) => ({
         sourceHandle: handle,
@@ -5040,18 +4873,26 @@ export class WebMCPService extends Service {
     input: Record<string, unknown>,
     signal: AbortSignal
   ) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = readRESTScriptParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision))
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    )
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -5061,23 +4902,23 @@ export class WebMCPService extends Service {
       ({ handle }) => handle === parsed.data.sourceHandle
     )
     if (!source)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         "The script source handle is no longer available.",
         "rest-document"
       )
     return runWebMCPExecution({
-      approval: this.approval,
+      approval: this.runtime.approval,
       request: {
         action: "Allow script source read",
         method: "READ",
         target: source.handle,
-        environment: this.context.capture().environment.name,
-        workspace: this.context.capture().workspace.type,
+        environment: this.runtime.context.capture().environment.name,
+        workspace: this.runtime.context.capture().workspace.type,
         grantKey: approvalIdentity({
           operation: "read_rest_script",
           environmentScope: getSelectedEnvironmentType(),
-          workspaceID: this.workspace.currentWorkspace.value,
+          workspaceID: this.runtime.workspace.currentWorkspace.value,
           revision: parsed.data.expectedRevision,
           target: source.handle,
           details: {
@@ -5093,22 +4934,25 @@ export class WebMCPService extends Service {
       signal,
       capture: () => ({
         source,
-        revision: this.context.revision("rest-document"),
+        revision: this.runtime.context.revision("rest-document"),
       }),
       revalidate: (snapshot) =>
-        this.context.matches("rest-document", snapshot.revision) &&
-        this.context.matches("rest-document", parsed.data.expectedRevision) &&
+        this.runtime.context.matches("rest-document", snapshot.revision) &&
+        this.runtime.context.matches(
+          "rest-document",
+          parsed.data.expectedRevision
+        ) &&
         this.scriptSources(rest).some(
           (candidate) => candidate.handle === snapshot.source.handle
         ),
       denied: (cancelled) => {
-        this.activity.record({
+        this.runtime.activity.record({
           tool: "read_rest_script",
           outcome: cancelled ? "cancelled" : "denied",
           summary: `Script disclosure ${source.handle}`,
-          revision: this.context.revision("rest-document"),
+          revision: this.runtime.context.revision("rest-document"),
         })
-        return this.failure(
+        return this.runtime.failure(
           cancelled ? "CANCELLED" : "APPROVAL_DENIED",
           cancelled
             ? "The script disclosure was cancelled."
@@ -5117,14 +4961,14 @@ export class WebMCPService extends Service {
         )
       },
       stale: () =>
-        this.failure(
+        this.runtime.failure(
           "STATE_CHANGED",
           "The REST draft changed while approval was open.",
           "rest-document",
           true
         ),
       error: (error) =>
-        this.failure(
+        this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "Script disclosure failed.",
           "rest-document"
@@ -5132,18 +4976,18 @@ export class WebMCPService extends Service {
       execute: (snapshot) => {
         const window = readSafeTextWindow(
           snapshot.source.source,
-          this.redactor(),
+          this.runtime.redactor(),
           parsed.data.offset,
           parsed.data.maxChars,
           "redacted-utf16"
         )
-        this.activity.record({
+        this.runtime.activity.record({
           tool: "read_rest_script",
           outcome: "executed",
           summary: `Disclosed script window ${snapshot.source.handle}`,
-          revision: this.context.revision("rest-document"),
+          revision: this.runtime.context.revision("rest-document"),
         })
-        return this.result("rest-document", {
+        return this.runtime.result("rest-document", {
           sourceHandle: snapshot.source.handle,
           offset: window.offset,
           text: window.text,
@@ -5156,18 +5000,26 @@ export class WebMCPService extends Service {
   }
 
   private async editRESTBody(input: Record<string, unknown>) {
-    if (!this.validBoundary(input))
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input))
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     const parsed = editRESTBodyParser.safeParse(input)
     if (!parsed.success)
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision))
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    )
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -5227,7 +5079,7 @@ export class WebMCPService extends Service {
         ["body"]
       )
     } catch (error) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         error instanceof Error
           ? error.message
@@ -5252,9 +5104,9 @@ export class WebMCPService extends Service {
     const originalDirty = rest.tab.document.isDirty
     rest.tab.document.request = request
     rest.tab.document.isDirty = true
-    const resultingRevision = this.context.revision("rest-document")
+    const resultingRevision = this.runtime.context.revision("rest-document")
     const token = rest.token
-    this.activity.record(
+    this.runtime.activity.record(
       {
         tool,
         outcome: "changed",
@@ -5262,11 +5114,11 @@ export class WebMCPService extends Service {
         revision: resultingRevision,
       },
       () => {
-        const current = this.context.captureVisibleREST()
+        const current = this.runtime.context.captureVisibleREST()
         if (
           !current ||
           current.token !== token ||
-          !this.context.matches("rest-document", resultingRevision)
+          !this.runtime.context.matches("rest-document", resultingRevision)
         )
           return false
         current.tab.document.request = originalRequest
@@ -5274,7 +5126,7 @@ export class WebMCPService extends Service {
         return true
       }
     )
-    return this.result("rest-document", {
+    return this.runtime.result("rest-document", {
       updated: true,
       changedFields,
       draft: {
@@ -5288,20 +5140,28 @@ export class WebMCPService extends Service {
     input: Record<string, unknown>,
     signal: AbortSignal
   ) {
-    if (!this.validBoundary(input)) {
-      return this.failure("INVALID_INPUT", "The input is not safe JSON data.")
+    if (!this.runtime.validBoundary(input)) {
+      return this.runtime.failure(
+        "INVALID_INPUT",
+        "The input is not safe JSON data."
+      )
     }
     const parsed = executeRESTRequestParser.safeParse(input)
     if (!parsed.success) {
-      return this.failure(
+      return this.runtime.failure(
         "INVALID_INPUT",
         parsed.error.issues[0]?.message ?? "Invalid input"
       )
     }
-    const rest = this.visibleREST()
+    const rest = this.runtime.visibleREST()
     if ("ok" in rest) return rest
-    if (!this.context.matches("rest-document", parsed.data.expectedRevision)) {
-      return this.failure(
+    if (
+      !this.runtime.context.matches(
+        "rest-document",
+        parsed.data.expectedRevision
+      )
+    ) {
+      return this.runtime.failure(
         "STATE_CHANGED",
         "The REST draft changed; inspect it again.",
         "rest-document",
@@ -5310,17 +5170,17 @@ export class WebMCPService extends Service {
     }
 
     const endpoint = rest.tab.document.request.endpoint
-    const redactor = this.redactor()
+    const redactor = this.runtime.redactor()
     const target = redactor.scrub(safeTarget(endpoint), 512)
     const safeMethod = redactor.scrub(rest.tab.document.request.method, 32)
-    const environment = this.context.capture().environment.name
-    const workspace = this.context.capture().workspace.type
+    const environment = this.runtime.context.capture().environment.name
+    const workspace = this.runtime.context.capture().workspace.type
     // Authorization identity must not use the redacted display target. Bind
     // grants to the inspected draft and stable context, including method/query.
     const grantKey = approvalIdentity({
       operation: "execute_rest",
       environmentScope: getSelectedEnvironmentType(),
-      workspaceID: this.workspace.currentWorkspace.value,
+      workspaceID: this.runtime.workspace.currentWorkspace.value,
       environmentID: getCurrentEnvironment().id,
       revision: parsed.data.expectedRevision,
       target: endpoint,
@@ -5328,7 +5188,7 @@ export class WebMCPService extends Service {
       details: { query: endpoint },
     })
     return runWebMCPExecution({
-      approval: this.approval,
+      approval: this.runtime.approval,
       request: {
         action: "Execute REST request",
         method: safeMethod,
@@ -5344,21 +5204,21 @@ export class WebMCPService extends Service {
         revision: parsed.data.expectedRevision,
       }),
       revalidate: (snapshot) => {
-        const current = this.context.captureVisibleREST()
+        const current = this.runtime.context.captureVisibleREST()
         return Boolean(
           current &&
           current.token === snapshot.token &&
-          this.context.matches("rest-document", snapshot.revision)
+          this.runtime.context.matches("rest-document", snapshot.revision)
         )
       },
       denied: (cancelled) => {
-        this.activity.record({
+        this.runtime.activity.record({
           tool: "execute_rest_request",
           outcome: cancelled ? "cancelled" : "denied",
           summary: `${safeMethod} ${target}`.slice(0, 256),
-          revision: this.context.revision("rest-document"),
+          revision: this.runtime.context.revision("rest-document"),
         })
-        return this.failure(
+        return this.runtime.failure(
           cancelled ? "CANCELLED" : "APPROVAL_DENIED",
           cancelled
             ? "The execution was cancelled."
@@ -5367,72 +5227,75 @@ export class WebMCPService extends Service {
         )
       },
       stale: () =>
-        this.failure(
+        this.runtime.failure(
           "STATE_CHANGED",
           "The REST draft changed while approval was open.",
           "rest-document",
           true
         ),
       execute: async () => {
-        const tabRef = this.restTabs.getTabRef(rest.tab.id) as Ref<
+        const tabRef = this.runtime.restTabs.getTabRef(rest.tab.id) as Ref<
           HoppTab<HoppRequestDocument>
         >
-        const outcome = await this.execution.send(tabRef, {
+        const outcome = await this.runtime.execution.send(tabRef, {
           initiator: "webmcp",
           signal: signal,
         })
         const activityBase = {
           tool: "execute_rest_request",
           summary: `${safeMethod} ${target}`.slice(0, 256),
-          revision: this.context.revision("rest-document"),
+          revision: this.runtime.context.revision("rest-document"),
         }
         if (outcome.type === "cancelled") {
-          this.activity.record({ ...activityBase, outcome: "cancelled" })
-          return this.failure(
+          this.runtime.activity.record({
+            ...activityBase,
+            outcome: "cancelled",
+          })
+          return this.runtime.failure(
             "CANCELLED",
             "The REST execution was cancelled.",
             "rest-document"
           )
         }
         if (outcome.type === "script_failed") {
-          this.activity.record({ ...activityBase, outcome: "failed" })
-          return this.failure(
+          this.runtime.activity.record({ ...activityBase, outcome: "failed" })
+          return this.runtime.failure(
             "SCRIPT_FAILED",
             "A request script failed.",
             "rest-document"
           )
         }
         if (outcome.type === "failed") {
-          this.activity.record({ ...activityBase, outcome: "failed" })
-          return this.failure(
+          this.runtime.activity.record({ ...activityBase, outcome: "failed" })
+          return this.runtime.failure(
             "EXECUTION_FAILED",
             outcome.error.message,
             "rest-document"
           )
         }
-        this.activity.record({ ...activityBase, outcome: "executed" })
+        this.runtime.activity.record({ ...activityBase, outcome: "executed" })
         const exchange = await projectRESTExchange(
           rest.tab.document,
-          this.redactor(),
-          this.interceptor
+          this.runtime.redactor(),
+          this.runtime.interceptor
         )
-        return this.result("rest-document", {
-          responseRevision: this.context.revision("rest-response"),
+        return this.runtime.result("rest-document", {
+          responseRevision: this.runtime.context.revision("rest-response"),
           isStillCurrent:
-            this.context.captureVisibleREST()?.token === rest.token,
+            this.runtime.context.captureVisibleREST()?.token === rest.token,
           exchange,
         })
       },
       error: (error) => {
         if (error instanceof RESTRequestAlreadyRunningError) {
-          return this.failure(
+          return this.runtime.failure(
             "REQUEST_ALREADY_RUNNING",
             error.message,
             "rest-document",
             true
           )
         }
-        return this.failure(
+        return this.runtime.failure(
           "EXECUTION_FAILED",
           error instanceof Error ? error.message : "REST execution failed.",
           "rest-document"
