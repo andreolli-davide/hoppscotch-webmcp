@@ -1,12 +1,5 @@
 import { HoppGQLRequest, getDefaultGQLRequest } from "@hoppscotch/data"
 import { cloneDeep } from "lodash-es"
-import {
-  graphqlCollectionStore,
-  navigateToFolderWithIndexPath,
-  saveGraphqlRequestAs,
-  editGraphqlRequest,
-  cascadeParentCollectionForProperties,
-} from "~/newstore/collections"
 import { graphqlHistoryStore } from "~/newstore/history"
 import { HoppGQLDocument } from "~/helpers/graphql/document"
 import { connection, gqlMessageEvent } from "~/helpers/graphql/connection"
@@ -39,10 +32,6 @@ import {
   createTabParser,
   closeTabInputSchema,
   closeTabParser,
-  inspectCollectionInputSchema,
-  inspectCollectionParser,
-  saveRequestToCollectionInputSchema,
-  saveRequestToCollectionParser,
   listHistoryInputSchema,
   listHistoryParser,
   loadHistoryEntryInputSchema,
@@ -138,7 +127,7 @@ export class GraphQLCapability {
     }
   }
 
-  private gqlObservation() {
+  public async observation() {
     const gql = this.runtime.visibleGQL()
     if ("ok" in gql) return gql
     return this.runtime.result("graphql-document", {
@@ -159,7 +148,7 @@ export class GraphQLCapability {
           annotations: { readOnlyHint: true, untrustedContentHint: true },
           execute: async (input) =>
             this.runtime.validBoundary(input) && Object.keys(input).length === 0
-              ? this.gqlObservation()
+              ? this.observation()
               : this.runtime.failure(
                   "INVALID_INPUT",
                   "This tool accepts an empty object only."
@@ -392,7 +381,7 @@ export class GraphQLCapability {
               summary: `Switched active GraphQL tab to ${parsed.data.tabID}`,
               revision: this.runtime.context.revision("graphql-document"),
             })
-            return this.gqlObservation()
+            return this.observation()
           },
         },
         signal
@@ -450,7 +439,7 @@ export class GraphQLCapability {
               summary: `Created new GraphQL tab ${newTab.id}`,
               revision: this.runtime.context.revision("graphql-document"),
             })
-            return this.gqlObservation()
+            return this.observation()
           },
         },
         signal
@@ -521,199 +510,7 @@ export class GraphQLCapability {
               summary: `Closed GraphQL tab ${parsed.data.tabID}`,
               revision: this.runtime.context.revision("graphql-document"),
             })
-            return this.gqlObservation()
-          },
-        },
-        signal
-      ),
-      this.runtime.adapter.register(
-        {
-          name: "list_gql_collections",
-          title: "List GraphQL collections",
-          description:
-            "List top-level GraphQL collections with folder counts, request counts, and paths.",
-          inputSchema: emptyInputSchema,
-          annotations: { readOnlyHint: true, untrustedContentHint: true },
-          execute: async (input) => {
-            if (
-              !this.runtime.validBoundary(input) ||
-              Object.keys(input).length !== 0
-            ) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                "This tool accepts an empty object only."
-              )
-            }
-            const redactor = this.runtime.redactor()
-            const collections = graphqlCollectionStore.value.state.map(
-              (col, index) => ({
-                id: col.id,
-                name: redactor.scrub(col.name, 64),
-                path: String(index),
-                foldersCount: col.folders.length,
-                requestsCount: col.requests.length,
-              })
-            )
-            return this.runtime.result("graphql-document", { collections })
-          },
-        },
-        signal
-      ),
-      this.runtime.adapter.register(
-        {
-          name: "inspect_gql_collection",
-          title: "Inspect GraphQL collection or folder",
-          description:
-            "Inspect the structure of a specific GraphQL collection or folder by path.",
-          inputSchema: inspectCollectionInputSchema,
-          annotations: { readOnlyHint: true, untrustedContentHint: true },
-          execute: async (input) => {
-            if (!this.runtime.validBoundary(input)) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                "The input is not safe JSON data."
-              )
-            }
-            const parsed = inspectCollectionParser.safeParse(input)
-            if (!parsed.success) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                parsed.error.issues[0]?.message ?? "Invalid input"
-              )
-            }
-            const target = navigateToFolderWithIndexPath(
-              graphqlCollectionStore.value.state,
-              parsed.data.path.split("/").map((x) => parseInt(x, 10))
-            )
-            if (!target) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                "The requested collection or folder path was not found.",
-                "graphql-document"
-              )
-            }
-            const redactor = this.runtime.redactor()
-            return this.runtime.result("graphql-document", {
-              collection: {
-                name: redactor.scrub(target.name, 64),
-                path: parsed.data.path,
-                authType: target.auth?.authType ?? "inherit",
-                headersCount: target.headers?.length ?? 0,
-                variablesCount: target.variables?.length ?? 0,
-                folders: target.folders.map((f, i) => ({
-                  name: redactor.scrub(f.name, 64),
-                  path: `${parsed.data.path}/${i}`,
-                  foldersCount: f.folders.length,
-                  requestsCount: f.requests.length,
-                })),
-                requests: target.requests.map((r, i) => ({
-                  name: redactor.scrub(r.name, 64),
-                  index: i,
-                })),
-              },
-            })
-          },
-        },
-        signal
-      ),
-      this.runtime.adapter.register(
-        {
-          name: "save_gql_request_to_collection",
-          title: "Save GraphQL request to collection",
-          description:
-            "Save the visible GraphQL request draft into a collection/folder or update it in place.",
-          inputSchema: saveRequestToCollectionInputSchema,
-          annotations: { readOnlyHint: false, untrustedContentHint: true },
-          execute: async (input) => {
-            if (!this.runtime.validBoundary(input)) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                "The input is not safe JSON data."
-              )
-            }
-            const parsed = saveRequestToCollectionParser.safeParse(input)
-            if (!parsed.success) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                parsed.error.issues[0]?.message ?? "Invalid input"
-              )
-            }
-            const gql = this.runtime.visibleGQL()
-            if ("ok" in gql) return gql
-            if (
-              !this.runtime.context.matches(
-                "graphql-document",
-                parsed.data.expectedRevision
-              )
-            ) {
-              return this.runtime.failure(
-                "STATE_CHANGED",
-                "The request draft changed; inspect it again.",
-                "graphql-document",
-                true
-              )
-            }
-            const activeTab = gql.tab
-            const currentDoc = activeTab.document
-            const reqToSave = cloneDeep(currentDoc.request)
-            if (parsed.data.name) reqToSave.name = parsed.data.name
-
-            let path = parsed.data.collectionPath
-            if (
-              !path &&
-              currentDoc.saveContext?.originLocation === "user-collection"
-            ) {
-              path = currentDoc.saveContext.folderPath
-            }
-            if (!path) {
-              path = "0"
-            }
-
-            const target = navigateToFolderWithIndexPath(
-              graphqlCollectionStore.value.state,
-              path.split("/").map((x) => parseInt(x, 10))
-            )
-            if (!target) {
-              return this.runtime.failure(
-                "INVALID_INPUT",
-                `Collection path ${path} not found.`,
-                "graphql-document"
-              )
-            }
-
-            if (
-              !parsed.data.collectionPath &&
-              currentDoc.saveContext?.originLocation === "user-collection" &&
-              currentDoc.saveContext.requestIndex !== undefined
-            ) {
-              editGraphqlRequest(
-                path,
-                currentDoc.saveContext.requestIndex,
-                reqToSave
-              )
-              activeTab.document.isDirty = false
-              activeTab.document.request = reqToSave
-            } else {
-              const insertionIndex = saveGraphqlRequestAs(path, reqToSave)
-              activeTab.document.request = reqToSave
-              activeTab.document.isDirty = false
-              activeTab.document.saveContext = {
-                originLocation: "user-collection",
-                folderPath: path,
-                requestIndex: insertionIndex,
-                requestRefID: reqToSave._ref_id,
-              }
-              activeTab.document.inheritedProperties =
-                cascadeParentCollectionForProperties(path, "graphql")
-            }
-
-            this.runtime.activity.record({
-              tool: "save_gql_request_to_collection",
-              outcome: "changed",
-              summary: `Saved GraphQL request '${reqToSave.name}' to collection ${path}`,
-              revision: this.runtime.context.revision("graphql-document"),
-            })
-            return this.gqlObservation()
+            return this.observation()
           },
         },
         signal
@@ -839,7 +636,7 @@ export class GraphQLCapability {
               summary: `Loaded GraphQL history entry ${parsed.data.index}`,
               revision: this.runtime.context.revision("graphql-document"),
             })
-            return this.gqlObservation()
+            return this.observation()
           },
         },
         signal
@@ -1209,7 +1006,7 @@ export class GraphQLCapability {
           summary: `GraphQL ${action}`,
           revision: this.runtime.context.revision("graphql-document"),
         })
-        return this.gqlObservation()
+        return this.observation()
       } catch (error) {
         if (
           signal.aborted ||

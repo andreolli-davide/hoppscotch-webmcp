@@ -1,0 +1,1450 @@
+import {
+  HoppCollection,
+  HoppRESTRequest,
+  makeCollection,
+} from "@hoppscotch/data"
+import { cloneDeep } from "lodash-es"
+import { ref } from "vue"
+import {
+  graphqlCollectionStore,
+  navigateToFolderWithIndexPath,
+  saveGraphqlRequestAs,
+  editGraphqlRequest,
+  cascadeParentCollectionForProperties,
+  restCollectionStore,
+  getRESTCollectionByRefId,
+  saveRESTRequestAs,
+  editRESTRequest,
+  removeRESTCollection,
+  removeRESTFolder,
+  addRESTCollection,
+  addRESTFolder,
+} from "~/newstore/collections"
+import {
+  getCurrentEnvironment,
+  getSelectedEnvironmentType,
+} from "~/newstore/environments"
+import { HoppTestRunnerDocument } from "~/helpers/rest/document"
+import { HoppTab } from "~/services/tab"
+import { TestRunnerRequest } from "~/services/test-runner/test-runner.service"
+import { approvalIdentity } from "../approval-scope"
+import { runWebMCPExecution } from "../execution-lifecycle"
+import { SecretRedactor } from "../projections"
+import { WebMCPRuntime } from "../runtime"
+import type { WebMCPToolResult } from "../types"
+import {
+  emptyInputSchema,
+  inspectCollectionInputSchema,
+  inspectCollectionParser,
+  saveRequestToCollectionInputSchema,
+  saveRequestToCollectionParser,
+  runCollectionInputSchema,
+  runCollectionParser,
+  deleteCollectionInputSchema,
+  deleteCollectionParser,
+  deleteFolderInputSchema,
+  deleteFolderParser,
+  createCollectionInputSchema,
+  createCollectionParser,
+  createFolderInputSchema,
+  createFolderParser,
+} from "../schemas"
+
+export type ObservationCallback = () =>
+  | WebMCPToolResult<object>
+  | Promise<WebMCPToolResult<object>>
+
+const countCollectionRequests = (collection: HoppCollection): number => {
+  let count = collection.requests.length
+  for (const folder of collection.folders)
+    count += countCollectionRequests(folder)
+  return count
+}
+const collectionHasIdentity = (
+  root: HoppCollection,
+  target: HoppCollection
+): boolean => {
+  const targetIdentity = target._ref_id || target.id
+  if (
+    root === target ||
+    (targetIdentity && (root._ref_id || root.id) === targetIdentity)
+  )
+    return true
+  return root.folders.some((folder) => collectionHasIdentity(folder, target))
+}
+const extractRunnerResults = (
+  collection: HoppCollection,
+  redactor: SecretRedactor,
+  results: Array<{
+    name: string
+    method: string
+    endpoint: string
+    statusCode: number | null
+    duration: number | null
+    passedTests: number
+    failedTests: number
+    error?: string
+  }> = []
+) => {
+  for (const request of collection.requests as TestRunnerRequest[]) {
+    if (results.length >= 50) break
+    const response = request.response
+    const statusCode = response && "status" in response ? response.status : null
+    const duration =
+      response && "meta" in response && response.meta?.responseDuration
+        ? response.meta.responseDuration
+        : null
+    results.push({
+      name: redactor.scrub(request.name || "Untitled", 64),
+      method: request.method,
+      endpoint: redactor.scrub(request.endpoint || "", 128),
+      statusCode,
+      duration,
+      passedTests: request.passedTests ?? 0,
+      failedTests: request.failedTests ?? 0,
+      error: request.error ? redactor.scrub(request.error, 128) : undefined,
+    })
+  }
+  for (const folder of collection.folders) {
+    if (results.length >= 50) break
+    extractRunnerResults(folder, redactor, results)
+  }
+  return results
+}
+
+export class CollectionCapability {
+  public constructor(private readonly runtime: WebMCPRuntime) {}
+  public async registerDurable(signal: AbortSignal) {
+    await Promise.all([
+      this.runtime.adapter.register(
+        {
+          name: "delete_collection",
+          title: "Delete collection",
+          description:
+            "Permanently delete a collection from user storage. Requires exact collection confirmation name.",
+          inputSchema: deleteCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = deleteCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.runtime.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.runtime.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            if (!/^\d+$/.test(parsed.data.collectionPath)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "Collection path must be a top-level collection index (e.g. '0'). For subfolders, use delete_folder.",
+                "app-context"
+              )
+            }
+
+            const pathIndex = parseInt(parsed.data.collectionPath, 10)
+            const collection = restCollectionStore.value.state[pathIndex]
+            if (!collection) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Collection at path ${parsed.data.collectionPath} not found.`,
+                "app-context"
+              )
+            }
+
+            if (collection.name !== parsed.data.confirmationName) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Confirmation name '${parsed.data.confirmationName}' does not match collection name '${collection.name}'.`,
+                "app-context"
+              )
+            }
+
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
+
+            return runWebMCPExecution({
+              approval: this.runtime.approval,
+              request: {
+                action: "DELETE collection",
+                method: "DELETE",
+                target: collection.name,
+                environment: envName,
+                workspace: workspaceType,
+                grantKey: approvalIdentity({
+                  operation: "delete_collection",
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
+                  environmentScope: getSelectedEnvironmentType(),
+                  revision: this.runtime.context.revision("app-context"),
+                  target: collection.name,
+                  allowSession: false,
+                }),
+                allowSession: false,
+              },
+              signal: executionSignal,
+              capture: () => ({
+                collection,
+                revision: this.runtime.context.revision("app-context"),
+              }),
+              revalidate: (snapshot) =>
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
+                restCollectionStore.value.state[pathIndex] ===
+                  snapshot.collection &&
+                snapshot.collection.name === parsed.data.confirmationName,
+              denied: (cancelled) => {
+                this.runtime.activity.record({
+                  tool: "delete_collection",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied deleting collection '${collection.name}'`,
+                  revision: this.runtime.context.revision("app-context"),
+                })
+                return this.runtime.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The deletion was cancelled."
+                    : "The user rejected deleting the collection.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.runtime.failure(
+                  "STATE_CHANGED",
+                  "The collection or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.runtime.failure(
+                  "EXECUTION_FAILED",
+                  error instanceof Error
+                    ? error.message
+                    : "Collection deletion failed",
+                  "app-context"
+                ),
+              execute: (snapshot) => {
+                const deletedName = snapshot.collection.name
+                removeRESTCollection(
+                  pathIndex,
+                  snapshot.collection._ref_id || snapshot.collection.id
+                )
+
+                this.runtime.activity.record({
+                  tool: "delete_collection",
+                  outcome: "changed",
+                  summary: `Permanently deleted collection '${deletedName}'`,
+                  revision: this.runtime.context.revision("app-context"),
+                })
+
+                return this.runtime.result("app-context", {
+                  success: true,
+                  deletedCollection: deletedName,
+                })
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "delete_folder",
+          title: "Delete collection folder",
+          description:
+            "Permanently delete a subfolder from a collection. Requires exact folder confirmation name.",
+          inputSchema: deleteFolderInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = deleteFolderParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.runtime.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.runtime.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const pathSegments = parsed.data.folderPath
+              .split("/")
+              .map((x) => parseInt(x, 10))
+            if (
+              pathSegments.length < 2 ||
+              pathSegments.some((n) => isNaN(n) || n < 0) ||
+              !/^\d+(\/\d+)+$/.test(parsed.data.folderPath)
+            ) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "Folder path must specify both parent collection and subfolder index (e.g. '0/0').",
+                "app-context"
+              )
+            }
+
+            const target = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              pathSegments
+            )
+            if (!target) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Folder at path ${parsed.data.folderPath} not found.`,
+                "app-context"
+              )
+            }
+
+            if (target.name !== parsed.data.confirmationName) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Confirmation name '${parsed.data.confirmationName}' does not match folder name '${target.name}'.`,
+                "app-context"
+              )
+            }
+
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
+
+            return runWebMCPExecution({
+              approval: this.runtime.approval,
+              request: {
+                action: "DELETE folder",
+                method: "DELETE",
+                target: target.name,
+                environment: envName,
+                workspace: workspaceType,
+                grantKey: approvalIdentity({
+                  operation: "delete_folder",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
+                  revision: this.runtime.context.revision("app-context"),
+                  target: parsed.data.folderPath,
+                  allowSession: false,
+                }),
+                allowSession: false,
+              },
+              signal: executionSignal,
+              capture: () => ({
+                target,
+                revision: this.runtime.context.revision("app-context"),
+              }),
+              revalidate: (snapshot) =>
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
+                navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  pathSegments
+                ) === snapshot.target &&
+                snapshot.target.name === parsed.data.confirmationName,
+              denied: (cancelled) => {
+                this.runtime.activity.record({
+                  tool: "delete_folder",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied deleting folder '${target.name}'`,
+                  revision: this.runtime.context.revision("app-context"),
+                })
+                return this.runtime.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The deletion was cancelled."
+                    : "The user rejected deleting the folder.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.runtime.failure(
+                  "STATE_CHANGED",
+                  "The folder or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.runtime.failure(
+                  "INVALID_INPUT",
+                  error instanceof Error
+                    ? error.message
+                    : "Folder deletion failed",
+                  "app-context"
+                ),
+              execute: (snapshot) => {
+                const deletedName = snapshot.target.name
+                removeRESTFolder(parsed.data.folderPath, snapshot.target.id)
+
+                this.runtime.activity.record({
+                  tool: "delete_folder",
+                  outcome: "changed",
+                  summary: `Permanently deleted folder '${deletedName}'`,
+                  revision: this.runtime.context.revision("app-context"),
+                })
+
+                return this.runtime.result("app-context", {
+                  success: true,
+                  deletedFolder: deletedName,
+                })
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "create_collection",
+          title: "Create collection",
+          description:
+            "Create a new top-level REST collection. Use this when the collection list is empty or when the user asks to create a collection before saving requests.",
+          inputSchema: createCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: false },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = createCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.runtime.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.runtime.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
+
+            return runWebMCPExecution({
+              approval: this.runtime.approval,
+              request: {
+                action: "CREATE collection",
+                method: "POST",
+                target: parsed.data.name,
+                environment: envName,
+                workspace: workspaceType,
+                allowSession: true,
+                grantKey: approvalIdentity({
+                  operation: "create_collection",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
+                  environmentID: getCurrentEnvironment().id,
+                  revision: parsed.data.expectedRevision,
+                  target: parsed.data.name,
+                }),
+              },
+              signal: executionSignal,
+              capture: () => ({
+                revision: this.runtime.context.revision("app-context"),
+              }),
+              revalidate: (snapshot) =>
+                this.runtime.context.matches("app-context", snapshot.revision),
+              denied: (cancelled) => {
+                this.runtime.activity.record({
+                  tool: "create_collection",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied creating collection '${parsed.data.name}'`,
+                  revision: this.runtime.context.revision("app-context"),
+                })
+                return this.runtime.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The creation was cancelled."
+                    : "The user rejected creating the collection.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.runtime.failure(
+                  "STATE_CHANGED",
+                  "The application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.runtime.failure(
+                  "EXECUTION_FAILED",
+                  error instanceof Error
+                    ? error.message
+                    : "Collection creation failed",
+                  "app-context"
+                ),
+              execute: () => {
+                const newCollection = makeCollection({
+                  name: parsed.data.name,
+                  folders: [],
+                  requests: [],
+                  headers: [],
+                  variables: [],
+                  description: null,
+                  preRequestScript: "",
+                  testScript: "",
+                  auth: { authType: "inherit", authActive: false },
+                })
+                addRESTCollection(newCollection)
+
+                const newIndex = restCollectionStore.value.state.length - 1
+
+                const activityId = this.runtime.activity.record(
+                  {
+                    tool: "create_collection",
+                    outcome: "changed",
+                    summary: `Created collection '${parsed.data.name}' at path ${newIndex}`,
+                    revision: this.runtime.context.revision("app-context"),
+                  },
+                  () => {
+                    removeRESTCollection(
+                      newIndex,
+                      newCollection._ref_id || newCollection.id
+                    )
+                    return true
+                  }
+                )
+                void activityId
+
+                return this.runtime.result("app-context", {
+                  success: true,
+                  collectionPath: String(newIndex),
+                  name: parsed.data.name,
+                })
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "create_folder",
+          title: "Create collection folder",
+          description:
+            "Create a new subfolder inside an existing collection or folder. The new folder's path will be collectionPath/N where N is the appended index.",
+          inputSchema: createFolderInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: false },
+          execute: async (input, { signal: executionSignal }) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = createFolderParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.runtime.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              ) &&
+              !this.runtime.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const pathSegments = parsed.data.collectionPath
+              .split("/")
+              .map((x) => parseInt(x, 10))
+            if (
+              pathSegments.some((n) => isNaN(n) || n < 0) ||
+              !/^\d+(\/\d+)*$/.test(parsed.data.collectionPath)
+            ) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "Collection path must be a numeric index path (e.g. '0' or '0/1').",
+                "app-context"
+              )
+            }
+
+            const parent = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              pathSegments
+            )
+            if (!parent) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Collection/folder at path ${parsed.data.collectionPath} not found.`,
+                "app-context"
+              )
+            }
+
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
+
+            return runWebMCPExecution({
+              approval: this.runtime.approval,
+              request: {
+                action: "CREATE folder",
+                method: "POST",
+                target: `${parsed.data.name} inside ${parent.name}`,
+                environment: envName,
+                workspace: workspaceType,
+                allowSession: true,
+                grantKey: approvalIdentity({
+                  operation: "create_folder",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
+                  environmentID: getCurrentEnvironment().id,
+                  revision: parsed.data.expectedRevision,
+                  target: parsed.data.name,
+                  details: { parent: parsed.data.collectionPath },
+                }),
+              },
+              signal: executionSignal,
+              capture: () => ({
+                parent,
+                revision: this.runtime.context.revision("app-context"),
+              }),
+              revalidate: (snapshot) =>
+                this.runtime.context.matches(
+                  "app-context",
+                  snapshot.revision
+                ) &&
+                navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  pathSegments
+                ) === snapshot.parent,
+              denied: (cancelled) => {
+                this.runtime.activity.record({
+                  tool: "create_folder",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied creating folder '${parsed.data.name}' in '${parent.name}'`,
+                  revision: this.runtime.context.revision("app-context"),
+                })
+                return this.runtime.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The creation was cancelled."
+                    : "The user rejected creating the folder.",
+                  "app-context"
+                )
+              },
+              stale: () =>
+                this.runtime.failure(
+                  "STATE_CHANGED",
+                  "The folder parent or application context changed while approval was open.",
+                  "app-context",
+                  true
+                ),
+              error: (error) =>
+                this.runtime.failure(
+                  "INVALID_INPUT",
+                  error instanceof Error
+                    ? error.message
+                    : "Folder creation failed",
+                  "app-context"
+                ),
+              execute: () => {
+                addRESTFolder(parsed.data.name, parsed.data.collectionPath)
+
+                const updatedParent = navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  pathSegments
+                )
+                const newFolderIndex = updatedParent
+                  ? updatedParent.folders.length - 1
+                  : 0
+                const newFolderPath = `${parsed.data.collectionPath}/${newFolderIndex}`
+
+                const activityId = this.runtime.activity.record(
+                  {
+                    tool: "create_folder",
+                    outcome: "changed",
+                    summary: `Created folder '${parsed.data.name}' at path ${newFolderPath}`,
+                    revision: this.runtime.context.revision("app-context"),
+                  },
+                  () => {
+                    removeRESTFolder(newFolderPath)
+                    return true
+                  }
+                )
+                void activityId
+
+                return this.runtime.result("app-context", {
+                  success: true,
+                  folderPath: newFolderPath,
+                  name: parsed.data.name,
+                })
+              },
+            })
+          },
+        },
+        signal
+      ),
+    ])
+  }
+  public async registerREST(signal: AbortSignal, observe: ObservationCallback) {
+    await Promise.all([
+      this.runtime.adapter.register(
+        {
+          name: "list_collections",
+          title: "List collections",
+          description:
+            "List top-level collections with folder counts, request counts, and paths.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const redactor = this.runtime.redactor()
+            const collections = restCollectionStore.value.state.map(
+              (col, index) => ({
+                id: col.id,
+                name: redactor.scrub(col.name, 64),
+                path: String(index),
+                foldersCount: col.folders.length,
+                requestsCount: col.requests.length,
+              })
+            )
+            return this.runtime.result("rest-document", { collections })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "inspect_collection",
+          title: "Inspect collection or folder",
+          description:
+            "Inspect the structure of a specific collection or folder by path.",
+          inputSchema: inspectCollectionInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = inspectCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const target = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              parsed.data.path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The requested collection or folder path was not found.",
+                "rest-document"
+              )
+            }
+            const redactor = this.runtime.redactor()
+            return this.runtime.result("rest-document", {
+              collection: {
+                name: redactor.scrub(target.name, 64),
+                path: parsed.data.path,
+                authType: target.auth?.authType ?? "inherit",
+                headersCount: target.headers?.length ?? 0,
+                variablesCount: target.variables?.length ?? 0,
+                folders: target.folders.map((f, i) => ({
+                  name: redactor.scrub(f.name, 64),
+                  path: `${parsed.data.path}/${i}`,
+                  foldersCount: f.folders.length,
+                  requestsCount: f.requests.length,
+                })),
+                requests: target.requests.map((r, i) => ({
+                  name: redactor.scrub(r.name, 64),
+                  method: (r as HoppRESTRequest).method,
+                  endpoint: redactor.scrub(
+                    (r as HoppRESTRequest).endpoint || "",
+                    128
+                  ),
+                  index: i,
+                })),
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "save_request_to_collection",
+          title: "Save request to collection",
+          description:
+            "Save the visible request draft into a collection/folder or update it in place.",
+          inputSchema: saveRequestToCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = saveRequestToCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const rest = this.runtime.visibleREST()
+            if ("ok" in rest) return rest
+            if (
+              !this.runtime.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The request draft changed; inspect it again.",
+                "rest-document",
+                true
+              )
+            }
+            const activeTab = rest.tab
+            const currentDoc = activeTab.document
+            const reqToSave = cloneDeep(currentDoc.request)
+            if (parsed.data.name) reqToSave.name = parsed.data.name
+
+            let path = parsed.data.collectionPath
+            if (
+              !path &&
+              currentDoc.saveContext?.originLocation === "user-collection"
+            ) {
+              path = currentDoc.saveContext.folderPath
+            }
+            if (!path) {
+              path = "0"
+            }
+
+            const target = navigateToFolderWithIndexPath(
+              restCollectionStore.value.state,
+              path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Collection path ${path} not found.`,
+                "rest-document"
+              )
+            }
+
+            if (
+              !parsed.data.collectionPath &&
+              currentDoc.saveContext?.originLocation === "user-collection" &&
+              currentDoc.saveContext.requestIndex !== undefined
+            ) {
+              editRESTRequest(
+                path,
+                currentDoc.saveContext.requestIndex,
+                reqToSave
+              )
+              activeTab.document.isDirty = false
+              activeTab.document.request = reqToSave
+            } else {
+              const insertionIndex = saveRESTRequestAs(path, reqToSave)
+              activeTab.document.request = reqToSave
+              activeTab.document.isDirty = false
+              activeTab.document.saveContext = {
+                originLocation: "user-collection",
+                folderPath: path,
+                requestIndex: insertionIndex,
+                exampleID: undefined,
+                requestRefID: reqToSave._ref_id,
+              }
+              activeTab.document.inheritedProperties =
+                cascadeParentCollectionForProperties(path, "rest")
+            }
+
+            this.runtime.activity.record({
+              tool: "save_request_to_collection",
+              outcome: "changed",
+              summary: `Saved request '${reqToSave.name}' to collection ${path}`,
+              revision: this.runtime.context.revision("rest-document"),
+            })
+            return observe()
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "run_collection",
+          title: "Run REST collection",
+          description:
+            "Run all requests in a REST collection or folder subtree as an automated test run with approval and cancellation support.",
+          inputSchema: runCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input, { signal }) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = runCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            if (
+              !this.runtime.context.matches(
+                "rest-document",
+                parsed.data.expectedRevision
+              ) &&
+              !this.runtime.context.matches(
+                "app-context",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The application context changed; inspect it again.",
+                "app-context",
+                true
+              )
+            }
+
+            const collectionRevision =
+              this.runtime.context.revision("rest-document")
+            let collection: HoppCollection | undefined
+            if (parsed.data.collectionPath) {
+              collection =
+                navigateToFolderWithIndexPath(
+                  restCollectionStore.value.state,
+                  parsed.data.collectionPath
+                    .split("/")
+                    .map((x) => parseInt(x, 10))
+                ) ?? undefined
+            } else if (parsed.data.collectionID) {
+              collection =
+                (await getRESTCollectionByRefId(parsed.data.collectionID)) ??
+                undefined
+            } else {
+              collection = restCollectionStore.value.state[0]
+            }
+
+            if (!collection) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "Collection not found.",
+                "rest-document"
+              )
+            }
+
+            const resolvedCollection = collection
+            const totalReqs = countCollectionRequests(resolvedCollection)
+            if (totalReqs === 0) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The collection contains no requests to run.",
+                "rest-document"
+              )
+            }
+
+            const envName = this.runtime.context.capture().environment.name
+            const workspaceType = this.runtime.context.capture().workspace.type
+
+            return runWebMCPExecution({
+              approval: this.runtime.approval,
+              request: {
+                action: "Run REST collection",
+                method: "POST",
+                target: `${resolvedCollection.name} (${totalReqs} requests)`,
+                environment: envName,
+                workspace: workspaceType,
+                grantKey: approvalIdentity({
+                  operation: "run_collection",
+                  environmentScope: getSelectedEnvironmentType(),
+                  workspaceID: this.runtime.workspace.currentWorkspace.value,
+                  environmentID: getCurrentEnvironment().id,
+                  revision: collectionRevision,
+                  target: resolvedCollection.name,
+                  details: {
+                    collectionID: resolvedCollection._ref_id ?? undefined,
+                  },
+                }),
+              },
+              signal,
+              capture: () => ({
+                collection: resolvedCollection,
+                revision: collectionRevision,
+              }),
+              revalidate: (snapshot) =>
+                this.runtime.context.matches(
+                  "rest-document",
+                  snapshot.revision
+                ) &&
+                restCollectionStore.value.state.some((item) =>
+                  collectionHasIdentity(item, snapshot.collection)
+                ),
+              denied: (cancelled) => {
+                this.runtime.activity.record({
+                  tool: "run_collection",
+                  outcome: cancelled ? "cancelled" : "denied",
+                  summary: `Denied running collection '${resolvedCollection.name}'`,
+                  revision: this.runtime.context.revision("rest-document"),
+                })
+                return this.runtime.failure(
+                  cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                  cancelled
+                    ? "The collection run was cancelled."
+                    : "The user rejected running the collection.",
+                  "rest-document"
+                )
+              },
+              stale: () =>
+                this.runtime.failure(
+                  "STATE_CHANGED",
+                  "The collection changed while approval was open.",
+                  "rest-document",
+                  true
+                ),
+              error: (error) =>
+                this.runtime.failure(
+                  "EXECUTION_FAILED",
+                  error instanceof Error
+                    ? error.message
+                    : "Collection run failed",
+                  "rest-document"
+                ),
+              execute: async (snapshot) => {
+                const executionCollection = snapshot.collection
+
+                const stopRef = ref(false)
+                const abortHandler = () => {
+                  stopRef.value = true
+                }
+                if (signal.aborted) {
+                  stopRef.value = true
+                } else {
+                  signal.addEventListener("abort", abortHandler, {
+                    once: true,
+                  })
+                }
+
+                const runnerDoc: HoppTestRunnerDocument = {
+                  type: "test-runner",
+                  collectionType: "my-collections",
+                  collectionID:
+                    executionCollection._ref_id || executionCollection.id || "",
+                  collection: cloneDeep(executionCollection),
+                  isDirty: false,
+                  config: {
+                    iterations: 1,
+                    delay: parsed.data.delay,
+                    stopOnError: parsed.data.stopOnError,
+                    persistResponses: parsed.data.persistResponses,
+                    keepVariableValues: parsed.data.keepVariableValues,
+                  },
+                  status: "idle",
+                  request: null,
+                  testRunnerMeta: {
+                    completedRequests: 0,
+                    totalRequests: totalReqs,
+                    totalTime: 0,
+                    failedTests: 0,
+                    passedTests: 0,
+                    totalTests: 0,
+                  },
+                }
+
+                const runnerTabRef = ref<HoppTab<HoppTestRunnerDocument>>({
+                  id: "webmcp-runner-tab",
+                  document: runnerDoc,
+                })
+
+                try {
+                  await this.runtime.testRunner.runTests(
+                    runnerTabRef,
+                    executionCollection,
+                    {
+                      ...runnerDoc.config,
+                      stopRef,
+                    }
+                  )
+                } catch (err) {
+                  if (
+                    !(
+                      err instanceof Error &&
+                      err.message === "Test execution stopped"
+                    )
+                  ) {
+                    console.error("Collection runner error:", err)
+                  }
+                } finally {
+                  signal.removeEventListener("abort", abortHandler)
+                }
+
+                const redactor = this.runtime.redactor()
+                const results = extractRunnerResults(
+                  runnerTabRef.value.document.resultCollection ??
+                    executionCollection,
+                  redactor
+                )
+
+                const meta = runnerTabRef.value.document.testRunnerMeta
+                const outcomeStatus = stopRef.value
+                  ? "stopped"
+                  : runnerTabRef.value.document.status
+
+                this.runtime.activity.record({
+                  tool: "run_collection",
+                  outcome: "executed",
+                  summary: `Ran collection '${executionCollection.name}': ${meta.completedRequests}/${totalReqs} completed (${meta.passedTests} passed, ${meta.failedTests} failed)`,
+                  revision: this.runtime.context.revision("rest-document"),
+                })
+
+                return this.runtime.result("rest-document", {
+                  summary: {
+                    status: outcomeStatus,
+                    collectionName: redactor.scrub(
+                      executionCollection.name,
+                      64
+                    ),
+                    metrics: {
+                      totalRequests: totalReqs,
+                      completedRequests: meta.completedRequests,
+                      passedTests: meta.passedTests,
+                      failedTests: meta.failedTests,
+                      totalTime: meta.totalTime,
+                    },
+                    results,
+                  },
+                })
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "inspect_collection_runner",
+          title: "Inspect collection runner state",
+          description: "Inspect the current test runner status and metrics.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const runnerTab = this.runtime.restTabs
+              .getTabs()
+              .find((t) => t.document.type === "test-runner") as
+              | HoppTab<HoppTestRunnerDocument>
+              | undefined
+
+            if (!runnerTab) {
+              return this.runtime.result("rest-document", {
+                active: false,
+                message: "No test runner tab is currently open.",
+              })
+            }
+
+            const redactor = this.runtime.redactor()
+            return this.runtime.result("rest-document", {
+              active: true,
+              status: runnerTab.document.status,
+              collectionName: redactor.scrub(
+                runnerTab.document.collection.name,
+                64
+              ),
+              metrics: runnerTab.document.testRunnerMeta,
+              config: runnerTab.document.config,
+            })
+          },
+        },
+        signal
+      ),
+    ])
+  }
+  public async registerGraphQL(
+    signal: AbortSignal,
+    observe: ObservationCallback
+  ) {
+    await Promise.all([
+      this.runtime.adapter.register(
+        {
+          name: "list_gql_collections",
+          title: "List GraphQL collections",
+          description:
+            "List top-level GraphQL collections with folder counts, request counts, and paths.",
+          inputSchema: emptyInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (
+              !this.runtime.validBoundary(input) ||
+              Object.keys(input).length !== 0
+            ) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "This tool accepts an empty object only."
+              )
+            }
+            const redactor = this.runtime.redactor()
+            const collections = graphqlCollectionStore.value.state.map(
+              (col, index) => ({
+                id: col.id,
+                name: redactor.scrub(col.name, 64),
+                path: String(index),
+                foldersCount: col.folders.length,
+                requestsCount: col.requests.length,
+              })
+            )
+            return this.runtime.result("graphql-document", { collections })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "inspect_gql_collection",
+          title: "Inspect GraphQL collection or folder",
+          description:
+            "Inspect the structure of a specific GraphQL collection or folder by path.",
+          inputSchema: inspectCollectionInputSchema,
+          annotations: { readOnlyHint: true, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = inspectCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const target = navigateToFolderWithIndexPath(
+              graphqlCollectionStore.value.state,
+              parsed.data.path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The requested collection or folder path was not found.",
+                "graphql-document"
+              )
+            }
+            const redactor = this.runtime.redactor()
+            return this.runtime.result("graphql-document", {
+              collection: {
+                name: redactor.scrub(target.name, 64),
+                path: parsed.data.path,
+                authType: target.auth?.authType ?? "inherit",
+                headersCount: target.headers?.length ?? 0,
+                variablesCount: target.variables?.length ?? 0,
+                folders: target.folders.map((f, i) => ({
+                  name: redactor.scrub(f.name, 64),
+                  path: `${parsed.data.path}/${i}`,
+                  foldersCount: f.folders.length,
+                  requestsCount: f.requests.length,
+                })),
+                requests: target.requests.map((r, i) => ({
+                  name: redactor.scrub(r.name, 64),
+                  index: i,
+                })),
+              },
+            })
+          },
+        },
+        signal
+      ),
+      this.runtime.adapter.register(
+        {
+          name: "save_gql_request_to_collection",
+          title: "Save GraphQL request to collection",
+          description:
+            "Save the visible GraphQL request draft into a collection/folder or update it in place.",
+          inputSchema: saveRequestToCollectionInputSchema,
+          annotations: { readOnlyHint: false, untrustedContentHint: true },
+          execute: async (input) => {
+            if (!this.runtime.validBoundary(input)) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                "The input is not safe JSON data."
+              )
+            }
+            const parsed = saveRequestToCollectionParser.safeParse(input)
+            if (!parsed.success) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                parsed.error.issues[0]?.message ?? "Invalid input"
+              )
+            }
+            const gql = this.runtime.visibleGQL()
+            if ("ok" in gql) return gql
+            if (
+              !this.runtime.context.matches(
+                "graphql-document",
+                parsed.data.expectedRevision
+              )
+            ) {
+              return this.runtime.failure(
+                "STATE_CHANGED",
+                "The request draft changed; inspect it again.",
+                "graphql-document",
+                true
+              )
+            }
+            const activeTab = gql.tab
+            const currentDoc = activeTab.document
+            const reqToSave = cloneDeep(currentDoc.request)
+            if (parsed.data.name) reqToSave.name = parsed.data.name
+
+            let path = parsed.data.collectionPath
+            if (
+              !path &&
+              currentDoc.saveContext?.originLocation === "user-collection"
+            ) {
+              path = currentDoc.saveContext.folderPath
+            }
+            if (!path) {
+              path = "0"
+            }
+
+            const target = navigateToFolderWithIndexPath(
+              graphqlCollectionStore.value.state,
+              path.split("/").map((x) => parseInt(x, 10))
+            )
+            if (!target) {
+              return this.runtime.failure(
+                "INVALID_INPUT",
+                `Collection path ${path} not found.`,
+                "graphql-document"
+              )
+            }
+
+            if (
+              !parsed.data.collectionPath &&
+              currentDoc.saveContext?.originLocation === "user-collection" &&
+              currentDoc.saveContext.requestIndex !== undefined
+            ) {
+              editGraphqlRequest(
+                path,
+                currentDoc.saveContext.requestIndex,
+                reqToSave
+              )
+              activeTab.document.isDirty = false
+              activeTab.document.request = reqToSave
+            } else {
+              const insertionIndex = saveGraphqlRequestAs(path, reqToSave)
+              activeTab.document.request = reqToSave
+              activeTab.document.isDirty = false
+              activeTab.document.saveContext = {
+                originLocation: "user-collection",
+                folderPath: path,
+                requestIndex: insertionIndex,
+                requestRefID: reqToSave._ref_id,
+              }
+              activeTab.document.inheritedProperties =
+                cascadeParentCollectionForProperties(path, "graphql")
+            }
+
+            this.runtime.activity.record({
+              tool: "save_gql_request_to_collection",
+              outcome: "changed",
+              summary: `Saved GraphQL request '${reqToSave.name}' to collection ${path}`,
+              revision: this.runtime.context.revision("graphql-document"),
+            })
+            return observe()
+          },
+        },
+        signal
+      ),
+    ])
+  }
+}

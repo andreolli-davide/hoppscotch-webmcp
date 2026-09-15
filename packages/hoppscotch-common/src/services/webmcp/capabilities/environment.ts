@@ -4,6 +4,8 @@ import {
   getSelectedEnvironmentIndex,
   getSelectedEnvironmentType,
   setSelectedEnvironmentIndex,
+  deleteEnvironment,
+  environmentsStore,
 } from "~/newstore/environments"
 
 import { approvalIdentity } from "../approval-scope"
@@ -19,11 +21,166 @@ import {
   listEnvironmentsParser,
   selectEnvironmentInputSchema,
   selectEnvironmentParser,
+  deleteEnvironmentInputSchema,
+  deleteEnvironmentParser,
 } from "../schemas"
 import type { WebMCPRuntime } from "../runtime"
 
 export class EnvironmentCapability {
   public constructor(private readonly runtime: WebMCPRuntime) {}
+
+  public async registerDurable(signal: AbortSignal) {
+    const { runtime } = this
+    await runtime.adapter.register(
+      {
+        name: "delete_environment",
+        title: "Delete environment",
+        description:
+          "Permanently delete a custom environment definition. Requires exact environment confirmation name.",
+        inputSchema: deleteEnvironmentInputSchema,
+        annotations: { readOnlyHint: false, untrustedContentHint: true },
+        execute: async (input, { signal: executionSignal }) => {
+          if (!runtime.validBoundary(input)) {
+            return runtime.failure(
+              "INVALID_INPUT",
+              "The input is not safe JSON data."
+            )
+          }
+          const parsed = deleteEnvironmentParser.safeParse(input)
+          if (!parsed.success) {
+            return runtime.failure(
+              "INVALID_INPUT",
+              parsed.error.issues[0]?.message ?? "Invalid input"
+            )
+          }
+          if (
+            !runtime.context.matches(
+              "app-context",
+              parsed.data.expectedRevision
+            ) &&
+            !runtime.context.matches(
+              "rest-document",
+              parsed.data.expectedRevision
+            )
+          ) {
+            return runtime.failure(
+              "STATE_CHANGED",
+              "The application context changed; inspect it again.",
+              "app-context",
+              true
+            )
+          }
+
+          const envs = environmentsStore.value.environments
+          const targetEnv = envs[parsed.data.environmentIndex]
+          if (!targetEnv) {
+            return runtime.failure(
+              "INVALID_INPUT",
+              `Environment at index ${parsed.data.environmentIndex} not found.`,
+              "app-context"
+            )
+          }
+
+          if (targetEnv.name !== parsed.data.confirmationName) {
+            return runtime.failure(
+              "INVALID_INPUT",
+              `Confirmation name '${parsed.data.confirmationName}' does not match environment name '${targetEnv.name}'.`,
+              "app-context"
+            )
+          }
+
+          const currentEnvName = runtime.context.capture().environment.name
+          const workspaceType = runtime.context.capture().workspace.type
+
+          return runWebMCPExecution({
+            approval: runtime.approval,
+            request: {
+              action: "DELETE environment",
+              method: "DELETE",
+              target: targetEnv.name,
+              environment: currentEnvName,
+              workspace: workspaceType,
+              grantKey: approvalIdentity({
+                operation: "delete_environment",
+                environmentScope: getSelectedEnvironmentType(),
+                workspaceID: runtime.workspace.currentWorkspace.value,
+                environmentID: targetEnv.id,
+                revision: runtime.context.revision("app-context"),
+                target: targetEnv.name,
+                allowSession: false,
+              }),
+              allowSession: false,
+            },
+            signal: executionSignal,
+            capture: () => ({
+              targetEnv,
+              revision: runtime.context.revision("app-context"),
+            }),
+            revalidate: (snapshot) =>
+              runtime.context.matches("app-context", snapshot.revision) &&
+              environmentsStore.value.environments[
+                parsed.data.environmentIndex
+              ] === snapshot.targetEnv &&
+              snapshot.targetEnv.name === parsed.data.confirmationName,
+            denied: (cancelled) => {
+              runtime.activity.record({
+                tool: "delete_environment",
+                outcome: cancelled ? "cancelled" : "denied",
+                summary: `Denied deleting environment '${targetEnv.name}'`,
+                revision: runtime.context.revision("app-context"),
+              })
+              return runtime.failure(
+                cancelled ? "CANCELLED" : "APPROVAL_DENIED",
+                cancelled
+                  ? "The deletion was cancelled."
+                  : "The user rejected deleting the environment.",
+                "app-context"
+              )
+            },
+            stale: () =>
+              runtime.failure(
+                "STATE_CHANGED",
+                "The environment or application context changed while approval was open.",
+                "app-context",
+                true
+              ),
+            error: (error) =>
+              runtime.failure(
+                "INVALID_INPUT",
+                error instanceof Error
+                  ? error.message
+                  : "Environment deletion failed",
+                "app-context"
+              ),
+            execute: (snapshot) => {
+              const deletedName = snapshot.targetEnv.name
+              deleteEnvironment(
+                parsed.data.environmentIndex,
+                snapshot.targetEnv.id
+              )
+              if (snapshot.targetEnv.id) {
+                runtime.currentValues.deleteEnvironment(snapshot.targetEnv.id)
+                runtime.secrets.deleteSecretEnvironment(snapshot.targetEnv.id)
+              }
+
+              runtime.activity.record({
+                tool: "delete_environment",
+                outcome: "changed",
+                summary: `Permanently deleted environment '${deletedName}'`,
+                revision: runtime.context.revision("app-context"),
+              })
+
+              return runtime.result("app-context", {
+                success: true,
+                deletedEnvironment: deletedName,
+              })
+            },
+          })
+        },
+      },
+      signal
+    )
+  }
 
   public async register(signal: AbortSignal) {
     const { runtime } = this
