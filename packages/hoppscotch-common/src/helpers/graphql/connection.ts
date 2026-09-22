@@ -206,22 +206,27 @@ export const connect = async (
   const poll = async () => {
     if (signal?.aborted) {
       disconnect()
-      return
+      throw new Error("The connection was cancelled.")
     }
     try {
       await getSchema(options, signal)
       if (signal?.aborted) {
         disconnect()
-        return
+        throw new Error("The connection was cancelled.")
       }
       if (connection.state !== "CONNECTED") connection.state = "CONNECTED"
       timeoutSubscription = setTimeout(() => {
-        poll()
+        void poll().catch((error) => {
+          // A scheduled poll has no caller to receive its rejection. Keep
+          // cancellation observable to the initiating connect() call while
+          // preventing an unhandled rejection from the timer callback.
+          if (!signal?.aborted) console.error(error)
+        })
       }, GQL_SCHEMA_POLL_INTERVAL)
     } catch (error) {
       if (signal?.aborted) {
         disconnect()
-        return
+        throw error
       }
       connection.state = "ERROR"
 
@@ -368,6 +373,7 @@ const getSchema = async (
     }
   } catch (e: any) {
     console.error(e)
+    if (connection.state === "CONNECTED" && !signal?.aborted) return
     disconnect()
     throw e
   }

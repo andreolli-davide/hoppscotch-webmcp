@@ -56,9 +56,11 @@ import {
 import { HoppTab } from "~/services/tab"
 import { updateTeamEnvironment } from "./backend/mutations/TeamEnvironment"
 import { createRESTNetworkRequestStream } from "./network"
-import { HoppRequestDocument } from "./rest/document"
+import { HoppRequestDocument } from "./tab/document"
+import { stripIterationVarsFromEnvs } from "./runner/iteration-vars"
 import {
   getTemporaryVariables,
+  scriptEnvsToTemporaryVariables,
   setTemporaryVariables,
 } from "./runner/temp_envs"
 import { HoppRESTResponse } from "./types/HoppRESTResponse"
@@ -68,6 +70,7 @@ import {
   getCombinedEnvVariables,
   filterNonEmptyEnvironmentVariables,
 } from "./utils/environments"
+export { filterNonEmptyEnvironmentVariables }
 import {
   nonSecretKeysOf,
   frozenInitialValueForWire,
@@ -120,6 +123,13 @@ export const waitForBrowserPaint = (): Promise<void> => {
     })
   })
 }
+
+export const emptyInitialEnvironmentState = (): InitialEnvironmentState => ({
+  initialGlobalEnvs: [], initialEnvID: "", initialSelectedEnvs: [],
+  initialEnvironmentIndex: { type: "NO_ENV_SELECTED" }, initialEnvName: "",
+  initialEnvs: { global: [], selected: [], temp: [] },
+  initialEnvsForComparison: { global: [], selected: [] },
+})
 
 /**
  * Captures the initial environment state before request execution
@@ -351,7 +361,7 @@ const getEnvironmentVariableValue = (
   )
 }
 
-const delegatePreRequestScriptRunner = (
+export const delegatePreRequestScriptRunner = (
   request: HoppRESTRequest,
   envs: {
     global: Environment["variables"]
@@ -399,12 +409,13 @@ const delegatePreRequestScriptRunner = (
   })
 }
 
-const runPostRequestScript = (
+export const runPostRequestScript = (
   envs: TestResult["envs"],
   request: HoppRESTRequest,
   response: HoppRESTResponse,
   cookies: Cookie[] | null,
-  inheritedTestScripts: string[] = []
+  inheritedTestScripts: string[] = [],
+  iterationVars: Environment["variables"] = []
 ): Promise<E.Either<string, SandboxTestResult>> => {
   const { testScript } = request
   const experimentalScriptingSandbox = EXPERIMENTAL_SCRIPTING_SANDBOX.value
@@ -449,7 +460,8 @@ const runPostRequestScript = (
 }
 
 export function runRESTRequest$(
-  tab: Ref<HoppTab<HoppRequestDocument>>
+  tab: Ref<HoppTab<HoppRequestDocument>>,
+  runOptions?: { isolatedEnvs?: boolean }
 ): [
   () => void,
   Promise<
@@ -476,7 +488,7 @@ export function runRESTRequest$(
     cancelFunc?.()
   }
 
-  const cookieJarEntries = getCookieJarEntries()
+  const cookieJarEntries = runOptions?.isolatedEnvs ? null : getCookieJarEntries()
 
   const { request, inheritedProperties } = tab.value.document
 
@@ -508,7 +520,9 @@ export function runRESTRequest$(
     initialEnvName,
     initialEnvs,
     initialEnvsForComparison,
-  } = captureInitialEnvironmentState()
+  } = runOptions?.isolatedEnvs
+    ? emptyInitialEnvironmentState()
+    : captureInitialEnvironmentState()
 
   // Extract inherited scripts from collection hierarchy, filtering out empty/module-prefix-only scripts
   const inheritedScripts = inheritedProperties?.scripts ?? []
@@ -579,15 +593,18 @@ export function runRESTRequest$(
       combineEnvVariables(finalEnvs)
     )
 
-    const effectiveRequest = await getEffectiveRESTRequest(finalRequest, {
-      id: "env-id",
-      v: 2,
-      name: "Env",
-      variables: finalEnvsWithNonEmptyValues,
-    })
+    const effectiveRequest = await getEffectiveRESTRequest(
+      finalRequest,
+      { id: "env-id", v: 2, name: "Env", variables: finalEnvsWithNonEmptyValues },
+      false,
+      false,
+      !runOptions?.isolatedEnvs
+    )
 
-    const [stream, cancelRun] =
-      await createRESTNetworkRequestStream(effectiveRequest)
+    const [stream, cancelRun] = await createRESTNetworkRequestStream(
+      effectiveRequest,
+      { noCookieJar: runOptions?.isolatedEnvs }
+    )
     cancelFunc = cancelRun
     let terminalProcessingStarted = false
 
@@ -604,7 +621,7 @@ export function runRESTRequest$(
         if (res.type === "success" || res.type === "fail") {
           terminalProcessingStarted = true
           try {
-            executedResponses$.next(res)
+            if (!runOptions?.isolatedEnvs) executedResponses$.next(res)
 
             const postRequestScriptResult = await runPostRequestScript(
               preRequestScriptResult.right.updatedEnvs,
@@ -644,6 +661,7 @@ export function runRESTRequest$(
 
               // Check if scripts actually modified environment variables
               if (
+                !runOptions?.isolatedEnvs &&
                 hasEnvironmentChanges(
                   initialEnvsForComparison, // Initial environment when request started
                   postRequestScriptResult.right.envs // Final script environment after test script execution
@@ -735,13 +753,14 @@ export function runRESTRequest$(
   return [cancel, res, completion]
 }
 
-function updateEnvsAfterTestScript(
-  runResult: E.Right<SandboxTestResult>,
+export function updateEnvsAfterTestScript(
+  runResult: E.Right<SandboxTestResult> | TestResult["envs"],
   initialEnvironmentIndex: SelectedEnvironmentIndex,
   initialEnvName: string,
   initialEnvsForComparison: TestResult["envs"],
   initialEnvID?: string
 ) {
+  const envs = "_tag" in runResult ? runResult.right.envs : runResult
   // Gate each writeback on whether its own scope actually changed. The outer
   // `hasEnvironmentChanges` guard is an OR across both scopes, so without
   // these per-scope checks a script that touched only the selected env would
@@ -749,16 +768,16 @@ function updateEnvsAfterTestScript(
   // globals (and the same happens the other way for TEAM_ENV).
   const globalChanged = hasScopeChanges(
     initialEnvsForComparison.global,
-    runResult.right.envs.global
+    envs.global
   )
   const selectedChanged = hasScopeChanges(
     initialEnvsForComparison.selected,
-    runResult.right.envs.selected
+    envs.selected
   )
 
   if (globalChanged) {
     const globalEnvVariables = updateEnvironments(
-      runResult.right.envs.global,
+      envs.global,
       "global",
       undefined,
       nonSecretKeysOf(initialEnvsForComparison.global)
@@ -772,7 +791,7 @@ function updateEnvsAfterTestScript(
 
   if (selectedChanged) {
     const selectedEnvVariables = updateEnvironments(
-      cloneDeep(runResult.right.envs.selected),
+      cloneDeep(envs.selected),
       "selected",
       initialEnvID,
       nonSecretKeysOf(initialEnvsForComparison.selected)
@@ -833,7 +852,7 @@ const hasScopeChanges = (
   getRemovedEnvVariables(initial, final).length > 0 ||
   getUpdatedEnvVariables(initial, final).length > 0
 
-const hasEnvironmentChanges = (
+export const hasEnvironmentChanges = (
   initialEnvs: TestResult["envs"],
   finalEnvs: TestResult["envs"]
 ): boolean =>
@@ -936,6 +955,7 @@ export async function runTestRunnerRequest(
     initialEnvs,
     initialEnvsForComparison,
   } = initialEnvironmentState
+  const iterationVarKeys = new Set(iterationVars.map(({ key }) => key))
 
   // Wait for browser to paint the loading state (Send -> Cancel button)
   // Adds ~32ms latency but ensures immediate visual feedback
@@ -1023,17 +1043,22 @@ export async function runTestRunnerRequest(
               initialGlobalEnvs,
               initialSelectedEnvs
             )
+            const persistedEnvs = stripIterationVarsFromEnvs(
+              postRequestScriptResult.right.envs,
+              iterationVarKeys,
+              initialSelectedEnvs
+            )
 
             // Update the environment variables after running the test script when persistEnv is true. else store the updated environment variables in the store as a temporary variable.
             if (persistEnv) {
               if (
                 hasEnvironmentChanges(
                   initialEnvsForComparison, // Initial script environment when requests started
-                  postRequestScriptResult.right.envs // Final script environment after test script execution
+                  persistedEnvs // Final script environment after test script execution
                 )
               ) {
                 updateEnvsAfterTestScript(
-                  postRequestScriptResult,
+                  { ...postRequestScriptResult, right: { ...postRequestScriptResult.right, envs: persistedEnvs } },
                   initialEnvironmentIndex,
                   initialEnvName,
                   initialEnvsForComparison,
@@ -1042,12 +1067,7 @@ export async function runTestRunnerRequest(
               }
             } else {
               // Combine global and selected environment changes
-              const allChanges = [
-                ...postRequestScriptResult.right.envs.global,
-                ...postRequestScriptResult.right.envs.selected,
-              ]
-
-              setTemporaryVariables(allChanges)
+              setTemporaryVariables(scriptEnvsToTemporaryVariables(persistedEnvs))
             }
 
             return E.right({
@@ -1163,7 +1183,7 @@ const resolveEnvVars = (
     }
   })
 
-function translateToSandboxTestResults(
+export function translateToSandboxTestResults(
   testDesc: SandboxTestResult,
   initialGlobalEnvs: Environment["variables"],
   initialSelectedEnvs: Environment["variables"]

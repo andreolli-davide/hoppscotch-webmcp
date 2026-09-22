@@ -227,7 +227,7 @@
     />
     <CollectionsSaveRequest
       v-if="showSaveRequestModal"
-      mode="rest"
+      mode="workspace"
       :show="showSaveRequestModal"
       :request="request"
       @hide-modal="showSaveRequestModal = false"
@@ -261,8 +261,8 @@ import { HoppRESTRequest } from "@hoppscotch/data"
 import { useService } from "dioc/vue"
 import { InspectionService } from "~/services/inspection"
 import { HoppTab } from "~/services/tab"
-import { HoppRequestDocument } from "~/helpers/rest/document"
-import { RESTTabService } from "~/services/tab/rest"
+import { HoppRequestDocument } from "~/helpers/tab/document"
+import { WorkspaceTabsService } from "~/services/tab/workspace-tabs"
 import { getMethodLabelColor } from "~/helpers/rest/labelColoring"
 import { handleTokenValidation } from "~/helpers/handleTokenValidation"
 import { RESTRequestExecutionService } from "~/services/rest-request-execution.service"
@@ -326,7 +326,7 @@ const userHistories = computed(() => {
 
 const inspectionService = useService(InspectionService)
 
-const tabs = useService(RESTTabService)
+const tabs = useService(WorkspaceTabsService)
 
 const newSendRequest = async () => {
   if (newEndpoint.value === "" || /^\s+$/.test(newEndpoint.value)) {
@@ -452,6 +452,10 @@ const saveRequest = async () => {
         // requestIndex missing; prompt user to resave properly
         showSaveRequestModal.value = true
         return
+      }
+      // Ensure requestRefID is set in save context for active indicator
+      if (!saveCtx.requestRefID && req._ref_id) {
+        saveCtx.requestRefID = req._ref_id
       }
       editRESTRequest(saveCtx.folderPath, saveCtx.requestIndex, req)
 
